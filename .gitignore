@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Output files
+output/
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models
+models/*.pth
+models/*.pt
+models/*.onnx
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build artifacts
+build/
+dist/
+*.exe
+*.app
+*.dmg
+*.msi
+__pycache__/
+*.pyc
+# Keep pyinstaller.spec (it's a config file, not a build artifact)
+!pyinstaller.spec
+
+# Installer artifacts
+venv/
+env/
+.venv
+Stitch2Stitch.bat
+Stitch2Stitch.sh
+
+Archive.zip
