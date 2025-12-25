@@ -74,8 +74,10 @@ class ImageAligner:
         )
         
         if not relative_transforms:
-            logger.warning("No valid transforms found, returning images at origin")
+            logger.warning(f"No valid transforms found from {len(matches)} matches - placing images in grid")
             return self._place_images_at_origin(images_data)
+        
+        logger.info(f"Found {len(relative_transforms)} valid transforms from {len(matches)} matches")
         
         # Build connectivity graph
         graph = self._build_graph(images_data, matches)
@@ -118,20 +120,21 @@ class ImageAligner:
             
             kp_i = features_data[i]['keypoints']
             kp_j = features_data[j]['keypoints']
-        
-        # Extract matched points
+            
+            # Extract matched points
             pts_i = []
             pts_j = []
             
             for m in match_list:
                 idx_i = m.queryIdx
                 idx_j = m.trainIdx
-            
+                
                 if idx_i < len(kp_i) and idx_j < len(kp_j):
                     pts_i.append([kp_i[idx_i][0], kp_i[idx_i][1]])
                     pts_j.append([kp_j[idx_j][0], kp_j[idx_j][1]])
-        
+            
             if len(pts_i) < 4:
+                logger.debug(f"Match ({i}, {j}): only {len(pts_i)} valid points, skipping")
                 continue
             
             pts_i = np.float32(pts_i)
@@ -233,17 +236,19 @@ class ImageAligner:
         if abs(rotation_deg) > 45:
             logger.info(f"Large rotation detected: {rotation_deg:.1f}°")
         
-        # Check inlier ratio
+        # Check inlier ratio - be lenient to avoid rejecting valid transforms
         if inliers is not None:
             inlier_count = np.sum(inliers)
             inlier_ratio = inlier_count / len(pts1)  # Use original point count
-            if inlier_ratio < 0.25:  # Stricter threshold (was 0.3)
-                logger.warning(f"Low inlier ratio {inlier_ratio:.1%} ({inlier_count}/{len(pts1)}), rejecting transform")
+            
+            # Only reject if both ratio is very low AND we have few absolute inliers
+            if inlier_ratio < 0.15 and inlier_count < 10:
+                logger.warning(f"Very low inlier ratio {inlier_ratio:.1%} ({inlier_count}/{len(pts1)}), rejecting transform")
                 return None
             
             logger.debug(f"Transform validated: scale={scale:.3f}, rotation={rotation_deg:.1f}°, inliers={inlier_count}/{len(pts1)} ({inlier_ratio:.1%})")
         
-        # Compute reprojection error for quality assessment
+        # Compute reprojection error for quality assessment (informational only, don't reject)
         if inliers is not None:
             inlier_mask = inliers.ravel().astype(bool)
             if np.any(inlier_mask):
@@ -258,12 +263,15 @@ class ImageAligner:
                     mean_error = np.mean(errors)
                     max_error = np.max(errors)
                     
-                    # Reject if error is too high
-                    if mean_error > 10.0:  # pixels
-                        logger.warning(f"High reprojection error: mean={mean_error:.1f}px, max={max_error:.1f}px")
+                    # Only reject for extremely high error (indicates wrong transform)
+                    if mean_error > 50.0:  # Very high threshold - only reject clearly wrong transforms
+                        logger.warning(f"Very high reprojection error: mean={mean_error:.1f}px, rejecting")
                         return None
                     
-                    logger.debug(f"Reprojection error: mean={mean_error:.2f}px, max={max_error:.2f}px")
+                    if mean_error > 15.0:
+                        logger.warning(f"High reprojection error: mean={mean_error:.1f}px, max={max_error:.1f}px (accepting anyway)")
+                    else:
+                        logger.debug(f"Reprojection error: mean={mean_error:.2f}px, max={max_error:.2f}px")
         
         # Convert 2x3 to 3x3
         transform = np.vstack([similarity, [0, 0, 1]])
@@ -495,15 +503,38 @@ class ImageAligner:
         return warped, (x_min, y_min, x_max, y_max)
     
     def _place_images_at_origin(self, images_data: List[Dict]) -> List[Dict]:
-        """Place all images at origin when no matches found"""
+        """Place images in a grid when no matches found (fallback)"""
+        logger.warning("No valid transforms - placing images in grid layout")
         aligned_images = []
+        
+        # Calculate grid layout
+        n_images = len(images_data)
+        cols = int(np.ceil(np.sqrt(n_images)))
+        
+        # Get max dimensions for spacing
+        max_w = max(img['image'].shape[1] for img in images_data) if images_data else 100
+        max_h = max(img['image'].shape[0] for img in images_data) if images_data else 100
+        spacing = 50
+        
         for i, img_data in enumerate(images_data):
             h, w = img_data['image'].shape[:2]
+            
+            # Calculate grid position
+            row = i // cols
+            col = i % cols
+            x = col * (max_w + spacing)
+            y = row * (max_h + spacing)
+            
             aligned_data = img_data.copy()
-            aligned_data['transform'] = np.eye(3, dtype=np.float32)
-            aligned_data['bbox'] = (0, 0, w, h)
+            aligned_data['transform'] = np.array([
+                [1, 0, x],
+                [0, 1, y],
+                [0, 0, 1]
+            ], dtype=np.float32)
+            aligned_data['bbox'] = (x, y, x + w, y + h)
             aligned_data['warped'] = False
             aligned_images.append(aligned_data)
+            
         return aligned_images
     
     def create_grid_layout(

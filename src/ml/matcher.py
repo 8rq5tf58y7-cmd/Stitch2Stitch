@@ -17,7 +17,7 @@ class AdvancedMatcher:
         self,
         use_gpu: bool = False,
         method: str = 'flann',
-        ratio_threshold: float = 0.70,
+        ratio_threshold: float = 0.75,
         geometric_verify: bool = True
     ):
         """
@@ -30,8 +30,8 @@ class AdvancedMatcher:
             geometric_verify: Apply geometric verification to filter bad matches
         """
         self.use_gpu = use_gpu
-        # Stricter default ratio threshold (0.70 instead of 0.75)
-        self.ratio_threshold = ratio_threshold if ratio_threshold > 0 else 0.70
+        # Standard ratio threshold (0.75 is the classic Lowe's ratio)
+        self.ratio_threshold = ratio_threshold if ratio_threshold > 0 else 0.75
         self.geometric_verify = geometric_verify
         
         if method == 'flann':
@@ -45,7 +45,7 @@ class AdvancedMatcher:
             # Brute force matcher
             self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
         
-        logger.info(f"Advanced matcher initialized (method: {method}, ratio: {self.ratio_threshold}, geo_verify: {geometric_verify})")
+        logger.info(f"Advanced matcher initialized (method: {method}, ratio: {self.ratio_threshold})")
     
     def match(
         self,
@@ -219,17 +219,18 @@ class AdvancedMatcher:
         
         # Use RANSAC to find inliers via similarity transform
         # This filters out matches that don't fit the geometric model
+        # Use a more lenient threshold to avoid rejecting valid matches
         transform, inliers = cv2.estimateAffinePartial2D(
             pts1, pts2,
             method=cv2.RANSAC,
-            ransacReprojThreshold=2.5,  # Stricter threshold (default is 3.0)
-            confidence=0.995,
+            ransacReprojThreshold=5.0,  # More lenient threshold for larger images
+            confidence=0.99,
             maxIters=2000
         )
         
         if inliers is None:
-            logger.warning("Geometric verification failed - no inliers found")
-            return basic_result
+            logger.debug("Geometric verification found no inliers, returning basic matches")
+            return basic_result  # Fall back to unverified matches
         
         # Filter matches to keep only inliers
         inlier_mask = inliers.ravel().astype(bool)
@@ -241,47 +242,40 @@ class AdvancedMatcher:
         
         logger.debug(f"Geometric verification: {inlier_count}/{total_matches} inliers ({inlier_ratio:.1%})")
         
-        # Reject if inlier ratio is too low (indicates bad match)
-        if inlier_ratio < 0.35:
-            logger.info(f"Rejecting match: low inlier ratio {inlier_ratio:.1%}")
-            return {
-                'matches': [],
-                'num_matches': 0,
-                'confidence': 0.0,
-                'homography': None,
-                'inliers': 0,
-                'rejected_reason': f'low_inlier_ratio:{inlier_ratio:.2f}'
-            }
+        # Only reject if inlier ratio is very low AND we have few inliers
+        # This avoids rejecting valid matches in difficult cases
+        if inlier_ratio < 0.20 and inlier_count < 15:
+            logger.info(f"Low inlier ratio {inlier_ratio:.1%} with only {inlier_count} inliers - returning basic matches")
+            return basic_result  # Fall back rather than reject entirely
         
-        # Check transform validity
+        # Check transform validity - but only warn, don't reject
         if transform is not None:
             scale = np.sqrt(transform[0, 0]**2 + transform[0, 1]**2)
             rotation = np.abs(np.degrees(np.arctan2(transform[1, 0], transform[0, 0])))
             
-            # Reject extreme transforms
-            if scale < 0.3 or scale > 3.0:
-                logger.info(f"Rejecting match: extreme scale {scale:.2f}")
-                return {
-                    'matches': [],
-                    'num_matches': 0,
-                    'confidence': 0.0,
-                    'homography': None,
-                    'inliers': 0,
-                    'rejected_reason': f'extreme_scale:{scale:.2f}'
-                }
+            # Only reject truly extreme transforms (likely wrong)
+            if scale < 0.2 or scale > 5.0:
+                logger.info(f"Extreme scale {scale:.2f} detected - returning basic matches")
+                return basic_result  # Fall back rather than reject
         
-        # Update confidence based on verified matches
-        max_descriptors = max(len(descriptors1), len(descriptors2))
-        confidence = inlier_count / max_descriptors if max_descriptors > 0 else 0.0
-        
-        return {
-            'matches': verified_matches,
-            'num_matches': inlier_count,
-            'confidence': confidence,
-            'homography': transform,
-            'inliers': inlier_count,
-            'inlier_ratio': inlier_ratio
-        }
+        # Return verified matches if we have enough
+        if inlier_count >= 8:
+            # Update confidence based on verified matches
+            max_descriptors = max(len(descriptors1), len(descriptors2))
+            confidence = inlier_count / max_descriptors if max_descriptors > 0 else 0.0
+            
+            return {
+                'matches': verified_matches,
+                'num_matches': inlier_count,
+                'confidence': confidence,
+                'homography': transform,
+                'inliers': inlier_count,
+                'inlier_ratio': inlier_ratio
+            }
+        else:
+            # Too few inliers, fall back to basic matches
+            logger.debug(f"Only {inlier_count} inliers, returning basic matches")
+            return basic_result
     
     def filter_spatial_outliers(
         self,

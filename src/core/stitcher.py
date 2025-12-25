@@ -1116,8 +1116,9 @@ class ImageStitcher:
                 if num_matches > 0:
                     logger.debug(f"Pair ({i}, {j}): {num_matches} matches, confidence: {match_result.get('confidence', 0.0):.4f}, inlier ratio: {inlier_ratio:.1%}")
                 
-                # Require at least 15 matches (or 12 if geometric verified with high inlier ratio)
-                min_matches = 12 if inlier_ratio > 0.6 else 15
+                # Accept matches with at least 10 good matches
+                # Be lenient to avoid rejecting valid connections
+                min_matches = 10
                 if match_result and num_matches >= min_matches:
                     matches.append({
                         'image_i': i,
