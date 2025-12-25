@@ -13,13 +13,27 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from gui.main_window import MainWindow
 from core.stitcher import ImageStitcher
-from utils.logger import setup_logger
+from utils.logger import setup_logger, get_log_file_path
 
 logger = setup_logger(__name__)
+
+# Print log file location at startup
+log_path = get_log_file_path()
+if log_path:
+    print(f"Log file location: {log_path.absolute()}", file=sys.stderr)
 
 
 def main():
     """Main entry point"""
+    logger.info("=" * 60)
+    logger.info("Stitch2Stitch starting...")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Working directory: {Path.cwd()}")
+    log_path = get_log_file_path()
+    if log_path:
+        logger.info(f"Log file: {log_path.absolute()}")
+    logger.info("=" * 60)
+    
     parser = argparse.ArgumentParser(
         description="Stitch2Stitch - Advanced Panoramic Image Stitching"
     )
@@ -119,16 +133,53 @@ def main():
         return 0
     else:
         # GUI mode
-        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtWidgets import QApplication, QMessageBox
         
-        app = QApplication(sys.argv)
-        app.setApplicationName("Stitch2Stitch")
-        app.setOrganizationName("Stitch2Stitch")
-        
-        window = MainWindow()
-        window.show()
-        
-        return app.exec()
+        try:
+            app = QApplication(sys.argv)
+            app.setApplicationName("Stitch2Stitch")
+            app.setOrganizationName("Stitch2Stitch")
+            
+            try:
+                logger.info("Creating main window...")
+                window = MainWindow()
+                logger.info("Main window created successfully")
+                window.show()
+                window.raise_()
+                window.activateWindow()
+                logger.info("Main window displayed")
+                
+                logger.info("Starting application event loop...")
+                return app.exec()
+            except Exception as e:
+                logger.error(f"Failed to create window: {e}", exc_info=True)
+                # Try to show error in a message box if QApplication is available
+                try:
+                    msg = QMessageBox()
+                    msg.setIcon(QMessageBox.Icon.Critical)
+                    msg.setWindowTitle("Error")
+                    msg.setText("Failed to start application")
+                    log_path = get_log_file_path()
+                    if log_path:
+                        error_details = f"{str(e)}\n\nCheck the log file for details:\n{log_path.absolute()}"
+                    else:
+                        error_details = f"{str(e)}\n\nCheck the console for details."
+                    msg.setDetailedText(error_details)
+                    msg.exec()
+                except:
+                    pass
+                print(f"ERROR: Failed to create window: {e}", file=sys.stderr)
+                if log_path:
+                    print(f"Check log file: {log_path.absolute()}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+                return 1
+        except Exception as e:
+            logger.error(f"Failed to start GUI: {e}", exc_info=True)
+            print(f"ERROR: Failed to start GUI: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
 
 
 if __name__ == "__main__":

@@ -39,13 +39,16 @@ class LP_SIFTDetector:
     
     def detect_and_compute(
         self,
-        image: np.ndarray
+        image: np.ndarray,
+        max_dimension: int = 4000
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Detect features and compute descriptors
         
         Args:
             image: Input image (BGR or grayscale)
+            max_dimension: Maximum image dimension for feature detection.
+                           Larger images are scaled down for speed, keypoints scaled back up.
             
         Returns:
             Tuple of (keypoints, descriptors)
@@ -55,6 +58,15 @@ class LP_SIFTDetector:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
+        
+        # Scale down very large images for faster feature detection
+        h, w = gray.shape[:2]
+        scale = 1.0
+        if max(h, w) > max_dimension:
+            scale = max_dimension / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            logger.debug(f"Scaled image from {w}x{h} to {new_w}x{new_h} for feature detection")
         
         # Apply preprocessing for better feature detection
         gray = self._preprocess(gray)
@@ -68,9 +80,16 @@ class LP_SIFTDetector:
                 keypoints, descriptors, gray
             )
         
+        # Scale keypoints back to original image coordinates
+        if scale != 1.0 and len(keypoints) > 0:
+            inv_scale = 1.0 / scale
+            for kp in keypoints:
+                kp.pt = (kp.pt[0] * inv_scale, kp.pt[1] * inv_scale)
+                kp.size *= inv_scale
+        
         # Convert keypoints to numpy array format
         kp_array = np.array([[kp.pt[0], kp.pt[1], kp.size, kp.angle] 
-                             for kp in keypoints])
+                             for kp in keypoints]) if len(keypoints) > 0 else np.array([])
         
         return kp_array, descriptors
     
@@ -133,7 +152,9 @@ class ORBDetector:
 class AKAZEDetector:
     """AKAZE detector as alternative"""
     
-    def __init__(self):
+    def __init__(self, n_features: int = 5000):
+        self.n_features = n_features
+        # AKAZE doesn't have nfeatures parameter, but we'll limit after detection
         self.akaze = cv2.AKAZE_create()
     
     def detect_and_compute(self, image: np.ndarray):
@@ -143,6 +164,16 @@ class AKAZEDetector:
             gray = image
         
         keypoints, descriptors = self.akaze.detectAndCompute(gray, None)
+        
+        # Limit to max features by response strength
+        if len(keypoints) > self.n_features:
+            responses = np.array([kp.response for kp in keypoints])
+            sorted_indices = np.argsort(responses)[::-1]
+            keep_indices = sorted_indices[:self.n_features]
+            keypoints = [keypoints[i] for i in keep_indices]
+            if descriptors is not None:
+                descriptors = descriptors[keep_indices]
+        
         kp_array = np.array([[kp.pt[0], kp.pt[1], kp.size, kp.angle] 
                              for kp in keypoints])
         

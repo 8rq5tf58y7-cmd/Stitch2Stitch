@@ -5,7 +5,7 @@ Based on: "PixelStitch: Structure-Preserving Pixel-Wise Bidirectional Warps"
 
 import cv2
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,20 @@ class PixelStitchBlender:
         output_h = y_max - y_min
         output_w = x_max - x_min
         
+        # Validate dimensions
+        if output_h <= 0 or output_w <= 0:
+            logger.error(f"Invalid bounding box dimensions: {bbox}")
+            # Use first image as fallback
+            return aligned_images[0]['image'].copy()
+        
+        # Limit maximum size to prevent memory issues (e.g., 50MP)
+        max_pixels = 50000000
+        if output_h * output_w > max_pixels:
+            scale = np.sqrt(max_pixels / (output_h * output_w))
+            output_h = int(output_h * scale)
+            output_w = int(output_w * scale)
+            logger.warning(f"Panorama too large, scaling down to {output_w}x{output_h}")
+        
         # Create output canvas
         panorama = np.zeros((output_h, output_w, 3), dtype=np.float32)
         weight_sum = np.zeros((output_h, output_w), dtype=np.float32)
@@ -80,18 +94,36 @@ class PixelStitchBlender:
             y_end = min(y_off + h, output_h)
             
             if x_off >= 0 and y_off >= 0:
-                img_crop = img[:y_end-y_off, :x_end-x_off]
-                weight_crop = weight[:y_end-y_off, :x_end-x_off]
-                alpha_crop = alpha[:y_end-y_off, :x_end-x_off]
+                # Ensure we don't go out of bounds
+                x_end = min(x_end, output_w)
+                y_end = min(y_end, output_h)
                 
-                # Apply alpha and weight
-                weight_crop = weight_crop * alpha_crop
-                
-                for c in range(3):
-                    panorama[y_off:y_end, x_off:x_end, c] += \
-                        img_crop[:, :, c] * weight_crop
-                
-                weight_sum[y_off:y_end, x_off:x_end] += weight_crop
+                if x_end > x_off and y_end > y_off:
+                    img_crop = img[:y_end-y_off, :x_end-x_off]
+                    weight_crop = weight[:y_end-y_off, :x_end-x_off]
+                    alpha_crop = alpha[:y_end-y_off, :x_end-x_off]
+                    
+                    # Ensure crop sizes match
+                    crop_h, crop_w = img_crop.shape[:2]
+                    if crop_h > 0 and crop_w > 0:
+                        # Apply alpha and weight
+                        weight_crop = weight_crop * alpha_crop
+                        
+                        # Final bounds check
+                        actual_y_end = min(y_off + crop_h, output_h)
+                        actual_x_end = min(x_off + crop_w, output_w)
+                        actual_crop_h = actual_y_end - y_off
+                        actual_crop_w = actual_x_end - x_off
+                        
+                        if actual_crop_h > 0 and actual_crop_w > 0:
+                            img_crop = img_crop[:actual_crop_h, :actual_crop_w]
+                            weight_crop = weight_crop[:actual_crop_h, :actual_crop_w]
+                            
+                            for c in range(3):
+                                panorama[y_off:actual_y_end, x_off:actual_x_end, c] += \
+                                    img_crop[:, :, c] * weight_crop
+                            
+                            weight_sum[y_off:actual_y_end, x_off:actual_x_end] += weight_crop
         
         # Normalize by weight sum
         weight_sum[weight_sum == 0] = 1
@@ -165,8 +197,11 @@ class PixelStitchBlender:
         )
         max_dist = np.sqrt(center_y**2 + center_x**2)
         
-        # Normalize to 0-1
-        overlap_mask = 1.0 - np.clip(dist_from_center / max_dist, 0, 1)
+        # Normalize to 0-1 (avoid division by zero)
+        if max_dist > 0:
+            overlap_mask = 1.0 - np.clip(dist_from_center / max_dist, 0, 1)
+        else:
+            overlap_mask = np.ones(shape, dtype=np.float32)
         
         return overlap_mask
     
@@ -180,20 +215,39 @@ class PixelStitchBlender:
     
     def _calculate_bbox(self, aligned_images: List[Dict]) -> Tuple[int, int, int, int]:
         """Calculate bounding box for all images"""
+        if not aligned_images:
+            return (0, 0, 100, 100)
+        
         x_min = y_min = float('inf')
         x_max = y_max = float('-inf')
         
         for img_data in aligned_images:
             bbox = img_data.get('bbox')
-            if bbox:
+            if bbox and len(bbox) >= 4:
                 x_min = min(x_min, bbox[0])
                 y_min = min(y_min, bbox[1])
                 x_max = max(x_max, bbox[2])
                 y_max = max(y_max, bbox[3])
             else:
                 h, w = img_data['image'].shape[:2]
+                if x_min == float('inf'):
+                    x_min = 0
+                if y_min == float('inf'):
+                    y_min = 0
                 x_max = max(x_max, w)
                 y_max = max(y_max, h)
+        
+        # Validate bounding box
+        if x_min == float('inf') or y_min == float('inf') or x_max == float('-inf') or y_max == float('-inf'):
+            # Fallback: use first image dimensions
+            h, w = aligned_images[0]['image'].shape[:2]
+            return (0, 0, w, h)
+        
+        # Ensure valid dimensions
+        if x_max <= x_min:
+            x_max = x_min + 100
+        if y_max <= y_min:
+            y_max = y_min + 100
         
         return (int(x_min), int(y_min), int(x_max), int(y_max))
 

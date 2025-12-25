@@ -21,6 +21,27 @@ if (-not $isAdmin) {
 # Create installation directory
 Write-Host "Creating installation directory..." -ForegroundColor Green
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+# Get the script directory (project root)
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Copy source files to installation directory if not already there
+if ($ScriptDir -ne $InstallDir) {
+    Write-Host "Copying application files to installation directory..." -ForegroundColor Green
+    # Copy src directory
+    if (Test-Path (Join-Path $ScriptDir "src")) {
+        Copy-Item -Path (Join-Path $ScriptDir "src") -Destination $InstallDir -Recurse -Force
+    }
+    # Copy other necessary files
+    $filesToCopy = @("requirements.txt", "README.md", "LICENSE")
+    foreach ($file in $filesToCopy) {
+        $sourceFile = Join-Path $ScriptDir $file
+        if (Test-Path $sourceFile) {
+            Copy-Item -Path $sourceFile -Destination $InstallDir -Force
+        }
+    }
+}
+
 Set-Location $InstallDir
 
 # Check if Python is installed

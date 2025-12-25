@@ -71,30 +71,51 @@ class ImageQualityAssessor:
         Calculate Laplacian variance (blur detection)
         Higher values indicate sharper images
         """
-        laplacian = cv2.Laplacian(image, cv2.CV_64F)
-        return laplacian.var()
+        try:
+            laplacian = cv2.Laplacian(image, cv2.CV_64F)
+            var = laplacian.var()
+            return var if not np.isnan(var) else 0.0
+        except Exception as e:
+            logger.warning(f"Error calculating Laplacian variance: {e}")
+            return 0.0
     
     def _gradient_magnitude(self, image: np.ndarray) -> float:
         """Calculate mean gradient magnitude"""
-        grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
-        magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        return np.mean(magnitude)
+        try:
+            grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
+            magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            mean_val = np.mean(magnitude)
+            return mean_val if not np.isnan(mean_val) else 0.0
+        except Exception as e:
+            logger.warning(f"Error calculating gradient magnitude: {e}")
+            return 0.0
     
     def _contrast_score(self, image: np.ndarray) -> float:
         """Calculate contrast score"""
-        # Use standard deviation as contrast measure
-        std = np.std(image)
-        return self._normalize(std, 0, 100)
+        try:
+            # Use standard deviation as contrast measure
+            std = np.std(image)
+            if np.isnan(std):
+                return 0.0
+            return self._normalize(std, 0, 100)
+        except Exception as e:
+            logger.warning(f"Error calculating contrast score: {e}")
+            return 0.0
     
     def _noise_score(self, image: np.ndarray) -> float:
         """Estimate noise level"""
-        # Use high-frequency content as noise indicator
-        kernel = np.array([[-1, -1, -1],
-                          [-1,  8, -1],
-                          [-1, -1, -1]])
-        filtered = cv2.filter2D(image.astype(np.float32), -1, kernel)
-        return np.std(filtered)
+        try:
+            # Use high-frequency content as noise indicator
+            kernel = np.array([[-1, -1, -1],
+                              [-1,  8, -1],
+                              [-1, -1, -1]])
+            filtered = cv2.filter2D(image.astype(np.float32), -1, kernel)
+            std_val = np.std(filtered)
+            return std_val if not np.isnan(std_val) else 0.0
+        except Exception as e:
+            logger.warning(f"Error calculating noise score: {e}")
+            return 0.0
     
     def _normalize(self, value: float, min_val: float, max_val: float) -> float:
         """Normalize value to 0-1 range"""
