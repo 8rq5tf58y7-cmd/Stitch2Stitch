@@ -246,9 +246,9 @@ class ImageAligner:
             j = match['image_j']
             if match['confidence'] > 0.1 and match.get('num_matches', 0) >= 10:
                 if j not in graph[i]:
-                graph[i].append(j)
+                    graph[i].append(j)
                 if i not in graph[j]:
-                graph[j].append(i)
+                    graph[j].append(i)
         
         return graph
     

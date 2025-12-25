@@ -203,7 +203,8 @@ class MainWindow(QMainWindow):
         file_layout.addWidget(self.image_list)
         
         btn_layout = QHBoxLayout()
-        self.btn_add_images = QPushButton("Add Images...")
+        self.btn_add_images = QPushButton("Select Folder...")
+        self.btn_add_images.setToolTip("Select a folder containing images to stitch")
         self.btn_add_images.clicked.connect(self.add_images)
         self.btn_remove_image = QPushButton("Remove Selected")
         self.btn_remove_image.clicked.connect(self.remove_selected_image)
@@ -237,6 +238,16 @@ class MainWindow(QMainWindow):
         self.gpu_checkbox = QCheckBox("Enable GPU Acceleration")
         self.gpu_checkbox.setChecked(False)
         settings_layout.addWidget(self.gpu_checkbox)
+        
+        # Memory efficient mode
+        self.memory_efficient_checkbox = QCheckBox("Memory Efficient Mode")
+        self.memory_efficient_checkbox.setChecked(True)  # Enabled by default
+        self.memory_efficient_checkbox.setToolTip(
+            "Reduces memory usage by 70-90% during image loading.\n"
+            "Uses compressed image caching and lazy loading.\n"
+            "Recommended for large image sets or limited RAM systems."
+        )
+        settings_layout.addWidget(self.memory_efficient_checkbox)
         
         # Feature detector
         detector_layout = QHBoxLayout()
@@ -731,6 +742,8 @@ class MainWindow(QMainWindow):
             max_warp_mp = self.max_warp_spin.value()
             max_warp_pixels = max_warp_mp * 1_000_000 if max_warp_mp > 0 else None
             
+            memory_efficient = self.memory_efficient_checkbox.isChecked()
+            
             self.stitcher = ImageStitcher(
                 use_gpu=use_gpu,
                 quality_threshold=quality_threshold,
@@ -742,29 +755,63 @@ class MainWindow(QMainWindow):
                 blending_options=blending_options,
                 allow_scale=allow_scale,
                 max_panorama_pixels=max_panorama_pixels,
-                max_warp_pixels=max_warp_pixels
+                max_warp_pixels=max_warp_pixels,
+                memory_efficient=memory_efficient
             )
-            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP)")
+            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient})")
         except Exception as e:
             logger.error(f"Failed to initialize stitcher: {e}", exc_info=True)
             raise
     
     def add_images(self):
-        """Add images to the list"""
-        files, _ = QFileDialog.getOpenFileNames(
+        """Add images from a selected folder"""
+        folder = QFileDialog.getExistingDirectory(
             self,
-            "Select Images",
+            "Select Folder Containing Images",
             "",
-            "Image Files (*.jpg *.jpeg *.png *.tif *.tiff *.bmp);;All Files (*)"
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
         )
         
-        for file in files:
-            path = Path(file)
-            if path not in self.image_paths:
-                self.image_paths.append(path)
-                self.image_list.addItem(path.name)
+        if not folder:
+            return  # User cancelled
         
-        self.log(f"Added {len(files)} image(s). Total: {len(self.image_paths)}")
+        folder_path = Path(folder)
+        
+        # Supported image extensions
+        image_extensions = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.JPG', '.JPEG', '.PNG', '.TIF', '.TIFF', '.BMP'}
+        
+        # Find all image files in the folder
+        image_files = []
+        for ext in image_extensions:
+            image_files.extend(folder_path.glob(f"*{ext}"))
+        
+        # Sort by filename for consistent ordering
+        image_files.sort(key=lambda p: p.name.lower())
+        
+        if not image_files:
+            QMessageBox.information(
+                self,
+                "No Images Found",
+                f"No image files found in:\n{folder}\n\nSupported formats: JPG, PNG, TIFF, BMP"
+            )
+            return
+        
+        # Add images that aren't already in the list
+        added_count = 0
+        for image_path in image_files:
+            if image_path not in self.image_paths:
+                self.image_paths.append(image_path)
+                self.image_list.addItem(image_path.name)
+                added_count += 1
+        
+        self.log(f"Added {added_count} image(s) from folder. Total: {len(self.image_paths)}")
+        
+        if added_count < len(image_files):
+            QMessageBox.information(
+                self,
+                "Some Images Skipped",
+                f"Added {added_count} new image(s).\n{len(image_files) - added_count} image(s) were already in the list."
+            )
     
     def remove_selected_image(self):
         """Remove selected image from list"""

@@ -158,11 +158,59 @@ if (Test-Path $requirementsPath) {
 
 # Create launcher script
 Write-Host "Creating launcher..." -ForegroundColor Green
+# Get project directory (where installer script is located)
+$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
 $launcherScript = @"
 @echo off
-cd /d "%~dp0"
-call venv\Scripts\activate.bat
-python src\main.py %*
+REM Stitch2Stitch Windows Launcher
+setlocal
+
+REM Find project directory (where source files might be)
+set "PROJECT_DIR=$ProjectDir"
+set "INSTALL_DIR=$InstallDir"
+
+REM Determine where source files are located
+set "SRC_DIR="
+set "WORK_DIR="
+
+REM First check installation directory (preferred)
+if exist "%INSTALL_DIR%\src\main.py" (
+    set "SRC_DIR=%INSTALL_DIR%\src"
+    set "WORK_DIR=%INSTALL_DIR%"
+) else if exist "%PROJECT_DIR%\src\main.py" (
+    set "SRC_DIR=%PROJECT_DIR%\src"
+    set "WORK_DIR=%PROJECT_DIR%"
+) else (
+    echo Error: Source files not found!
+    echo Checked:
+    echo   %INSTALL_DIR%\src\main.py
+    echo   %PROJECT_DIR%\src\main.py
+    echo.
+    echo Please make sure Stitch2Stitch is properly installed.
+    pause
+    exit /b 1
+)
+
+REM Change to working directory
+cd /d "%WORK_DIR%"
+
+REM Try to find virtual environment
+set "VENV_PATH="
+if exist "%INSTALL_DIR%\venv\Scripts\activate.bat" (
+    set "VENV_PATH=%INSTALL_DIR%\venv\Scripts\activate.bat"
+) else if exist "%PROJECT_DIR%\venv\Scripts\activate.bat" (
+    set "VENV_PATH=%PROJECT_DIR%\venv\Scripts\activate.bat"
+) else (
+    echo Error: Virtual environment not found!
+    echo Please run the installer first.
+    pause
+    exit /b 1
+)
+
+REM Activate virtual environment and run
+call "%VENV_PATH%"
+python "%SRC_DIR%\main.py" %*
 "@
 
 $launcherScript | Out-File -FilePath "Stitch2Stitch.bat" -Encoding ASCII
