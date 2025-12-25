@@ -298,85 +298,266 @@ class ImageAligner:
         self,
         images_data: List[Dict],
         matches: List[Dict]
-    ) -> Dict[int, List[int]]:
-        """Build connectivity graph from matches"""
-        graph = {i: [] for i in range(len(images_data))}
+    ) -> Dict[int, List[Tuple[int, float]]]:
+        """
+        Build weighted connectivity graph from matches.
         
+        For burst photos, sequential connections (i, i+1) are weighted higher.
+        Returns dict mapping image_idx -> list of (neighbor_idx, weight) tuples.
+        Weight represents connection quality (higher = better).
+        """
+        n = len(images_data)
+        graph = {i: [] for i in range(n)}
+        
+        # Build match quality map
+        match_quality = {}
         for match in matches:
             i = match['image_i']
             j = match['image_j']
             if match['confidence'] > 0.1 and match.get('num_matches', 0) >= 10:
-                if j not in graph[i]:
-                    graph[i].append(j)
-                if i not in graph[j]:
-                    graph[j].append(i)
+                # Quality based on number of matches and inlier ratio
+                num_matches = match.get('num_matches', 0)
+                inlier_ratio = match.get('inlier_ratio', 0.5)
+                quality = num_matches * inlier_ratio
+                
+                # Boost for sequential connections (burst photo priority)
+                if abs(i - j) == 1:
+                    quality *= 2.0  # Double weight for adjacent images
+                elif abs(i - j) <= 3:
+                    quality *= 1.5  # 1.5x weight for near-sequential
+                
+                match_quality[(i, j)] = quality
+                match_quality[(j, i)] = quality
+        
+        # Build graph with weighted edges
+        for (i, j), quality in match_quality.items():
+            if i < j:  # Only process each pair once
+                graph[i].append((j, quality))
+                graph[j].append((i, quality))
+        
+        # Sort neighbors by weight (highest first) for priority traversal
+        for i in graph:
+            graph[i].sort(key=lambda x: x[1], reverse=True)
         
         return graph
     
-    def _find_reference_image(self, graph: Dict[int, List[int]]) -> int:
-        """Find image with most connections as reference"""
-        max_connections = -1
+    def _find_reference_image(self, graph: Dict[int, List[Tuple[int, float]]]) -> int:
+        """
+        Find best reference image based on connection quality.
+        
+        Prefers images with high-quality connections to neighbors,
+        especially sequential neighbors for burst photos.
+        """
+        best_score = -1
         ref_idx = 0
         
         for idx, connections in graph.items():
-            if len(connections) > max_connections:
-                max_connections = len(connections)
+            # Score based on total connection quality
+            total_quality = sum(weight for _, weight in connections)
+            # Bonus for being in the middle of the sequence (for burst photos)
+            n_images = len(graph)
+            center_bonus = 1.0 - abs(idx - n_images // 2) / (n_images / 2 + 1)
+            score = total_quality * (1.0 + 0.2 * center_bonus)
+            
+            if score > best_score:
+                best_score = score
                 ref_idx = idx
         
+        logger.info(f"Selected reference image {ref_idx} (score={best_score:.1f})")
         return ref_idx
     
     def _calculate_absolute_transforms(
         self,
         n_images: int,
         relative_transforms: Dict[Tuple[int, int], np.ndarray],
-        graph: Dict[int, List[int]],
+        graph: Dict[int, List[Tuple[int, float]]],
         ref_idx: int
     ) -> Dict[int, np.ndarray]:
         """
-        Calculate absolute transforms using BFS from reference image
+        Calculate absolute transforms using weighted BFS from reference image.
+        
+        Prioritizes high-quality connections and performs consistency checking
+        to avoid misplacements from bad matches.
         
         Each transform maps from the image's local coordinates to the 
         global (reference) coordinate system.
         """
+        import heapq
+        
         # Reference image has identity transform
         transforms = {ref_idx: np.eye(3, dtype=np.float64)}
+        transform_sources = {ref_idx: []}  # Track path to each image
         visited = {ref_idx}
-        queue = [ref_idx]
         
-        while queue:
-            current = queue.pop(0)
-            current_transform = transforms[current]
+        # Priority queue: (negative_quality, image_idx, parent_idx)
+        # Use negative because heapq is min-heap
+        pq = []
+        for neighbor, weight in graph.get(ref_idx, []):
+            heapq.heappush(pq, (-weight, neighbor, ref_idx))
+        
+        while pq:
+            neg_quality, neighbor, parent = heapq.heappop(pq)
             
-            for neighbor in graph.get(current, []):
-                if neighbor in visited:
-                    continue
-                
-                # Get transform from neighbor to current
-                # We want: T_neighbor_to_global = T_current_to_global @ T_neighbor_to_current
-                key = (neighbor, current)
-                if key in relative_transforms:
-                    neighbor_to_current = relative_transforms[key]
-                    neighbor_to_global = current_transform @ neighbor_to_current
-                    transforms[neighbor] = neighbor_to_global
-                    visited.add(neighbor)
-                    queue.append(neighbor)
+            if neighbor in visited:
+                continue
+            
+            # Get transform from neighbor to parent
+            key = (neighbor, parent)
+            if key not in relative_transforms:
+                continue
+            
+            neighbor_to_parent = relative_transforms[key]
+            parent_transform = transforms[parent]
+            neighbor_to_global = parent_transform @ neighbor_to_parent
+            
+            # Consistency check: if we have a sequential neighbor already placed,
+            # verify this placement is reasonable
+            is_consistent = True
+            for seq_offset in [-1, 1]:
+                seq_neighbor = neighbor + seq_offset
+                if seq_neighbor in transforms and 0 <= seq_neighbor < n_images:
+                    seq_transform = transforms[seq_neighbor]
+                    # Check if positions are reasonably close
+                    our_pos = np.array([neighbor_to_global[0, 2], neighbor_to_global[1, 2]])
+                    seq_pos = np.array([seq_transform[0, 2], seq_transform[1, 2]])
+                    distance = np.linalg.norm(our_pos - seq_pos)
                     
-                    # Log position
-                    tx, ty = neighbor_to_global[0, 2], neighbor_to_global[1, 2]
-                    scale = np.sqrt(neighbor_to_global[0, 0]**2 + neighbor_to_global[0, 1]**2)
-                    logger.info(f"Image {neighbor}: position=({tx:.1f}, {ty:.1f}), scale={scale:.3f}")
+                    # For burst photos, sequential images should be relatively close
+                    # Allow up to 2000px distance (adjust based on image size)
+                    if distance > 5000:
+                        logger.warning(f"Image {neighbor} placement inconsistent with sequential neighbor {seq_neighbor} "
+                                      f"(distance={distance:.0f}px), will try alternative path")
+                        is_consistent = False
+                        break
+            
+            if not is_consistent:
+                # Try to find this image via a different path later
+                # Add lower-priority alternatives to the queue
+                for alt_neighbor, alt_weight in graph.get(neighbor, []):
+                    if alt_neighbor in visited and alt_neighbor != parent:
+                        # Can reach via already-visited node
+                        heapq.heappush(pq, (-alt_weight * 0.5, neighbor, alt_neighbor))
+                continue
+            
+            # Accept this placement
+            transforms[neighbor] = neighbor_to_global
+            transform_sources[neighbor] = transform_sources[parent] + [parent]
+            visited.add(neighbor)
+            
+            # Log position
+            tx, ty = neighbor_to_global[0, 2], neighbor_to_global[1, 2]
+            scale = np.sqrt(neighbor_to_global[0, 0]**2 + neighbor_to_global[0, 1]**2)
+            logger.info(f"Image {neighbor}: position=({tx:.1f}, {ty:.1f}), scale={scale:.3f} (via {parent})")
+            
+            # Add neighbors to queue
+            for next_neighbor, weight in graph.get(neighbor, []):
+                if next_neighbor not in visited:
+                    heapq.heappush(pq, (-weight, next_neighbor, neighbor))
         
-        # Handle disconnected images
+        # Handle disconnected images - try sequential chain fallback
         unplaced = [i for i in range(n_images) if i not in transforms]
         if unplaced:
-            logger.warning(f"Images {unplaced} are disconnected, placing separately")
-            max_x = max(t[0, 2] for t in transforms.values()) if transforms else 0
-            for i, img_idx in enumerate(unplaced):
-                transforms[img_idx] = np.array([
-                    [1, 0, max_x + 500 + i * 500],
-                    [0, 1, 0],
-                    [0, 0, 1]
-                ], dtype=np.float64)
+            logger.warning(f"Images {unplaced} are disconnected, attempting sequential placement")
+            
+            for img_idx in unplaced:
+                # Try to find a placed sequential neighbor
+                placed = False
+                for offset in [-1, 1, -2, 2, -3, 3]:
+                    seq_neighbor = img_idx + offset
+                    if seq_neighbor in transforms:
+                        key = (img_idx, seq_neighbor)
+                        if key in relative_transforms:
+                            seq_transform = transforms[seq_neighbor]
+                            img_to_neighbor = relative_transforms[key]
+                            transforms[img_idx] = seq_transform @ img_to_neighbor
+                            tx, ty = transforms[img_idx][0, 2], transforms[img_idx][1, 2]
+                            logger.info(f"Image {img_idx}: position=({tx:.1f}, {ty:.1f}) (sequential fallback via {seq_neighbor})")
+                            placed = True
+                            break
+                
+                if not placed:
+                    # Last resort: place at end
+                    max_x = max(t[0, 2] for t in transforms.values()) if transforms else 0
+                    transforms[img_idx] = np.array([
+                        [1, 0, max_x + 1000],
+                        [0, 1, 0],
+                        [0, 0, 1]
+                    ], dtype=np.float64)
+                    logger.warning(f"Image {img_idx}: placed at end (no valid connections)")
+        
+        # Final consistency check: detect outlier placements
+        transforms = self._detect_and_fix_outliers(transforms, relative_transforms, n_images)
+        
+        return transforms
+    
+    def _detect_and_fix_outliers(
+        self,
+        transforms: Dict[int, np.ndarray],
+        relative_transforms: Dict[Tuple[int, int], np.ndarray],
+        n_images: int
+    ) -> Dict[int, np.ndarray]:
+        """
+        Detect images that are placed inconsistently with their sequential neighbors
+        and attempt to fix them.
+        """
+        positions = {i: (t[0, 2], t[1, 2]) for i, t in transforms.items()}
+        
+        # Calculate expected spacing from sequential neighbors
+        sequential_distances = []
+        for i in range(n_images - 1):
+            if i in positions and i + 1 in positions:
+                dist = np.sqrt((positions[i+1][0] - positions[i][0])**2 + 
+                              (positions[i+1][1] - positions[i][1])**2)
+                sequential_distances.append(dist)
+        
+        if len(sequential_distances) < 3:
+            return transforms
+        
+        median_distance = np.median(sequential_distances)
+        logger.info(f"Median sequential distance: {median_distance:.0f}px")
+        
+        # Find outliers (images far from both sequential neighbors)
+        outliers = []
+        for i in range(1, n_images - 1):
+            if i not in positions:
+                continue
+            
+            prev_ok = i - 1 not in positions
+            next_ok = i + 1 not in positions
+            
+            if i - 1 in positions:
+                dist_prev = np.sqrt((positions[i][0] - positions[i-1][0])**2 + 
+                                   (positions[i][1] - positions[i-1][1])**2)
+                prev_ok = dist_prev < median_distance * 4
+            
+            if i + 1 in positions:
+                dist_next = np.sqrt((positions[i][0] - positions[i+1][0])**2 + 
+                                   (positions[i][1] - positions[i+1][1])**2)
+                next_ok = dist_next < median_distance * 4
+            
+            if not prev_ok and not next_ok:
+                outliers.append(i)
+        
+        # Try to fix outliers by re-placing them based on sequential transforms
+        for i in outliers:
+            logger.warning(f"Image {i} is an outlier, attempting to re-place")
+            
+            # Try sequential placement
+            for offset in [-1, 1]:
+                neighbor = i + offset
+                if neighbor in transforms:
+                    key = (i, neighbor)
+                    if key in relative_transforms:
+                        neighbor_transform = transforms[neighbor]
+                        rel_transform = relative_transforms[key]
+                        new_transform = neighbor_transform @ rel_transform
+                        
+                        new_x, new_y = new_transform[0, 2], new_transform[1, 2]
+                        old_x, old_y = transforms[i][0, 2], transforms[i][1, 2]
+                        
+                        logger.info(f"Image {i}: repositioned from ({old_x:.0f}, {old_y:.0f}) to ({new_x:.0f}, {new_y:.0f})")
+                        transforms[i] = new_transform
+                        break
         
         return transforms
     
