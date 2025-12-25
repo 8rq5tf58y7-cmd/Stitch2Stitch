@@ -91,6 +91,11 @@ class ImageAligner:
             n_images, relative_transforms, graph, ref_idx
         )
         
+        # Refine transforms using edge matching in overlap regions
+        transforms = self._refine_transforms_with_edges(
+            images_data, transforms, relative_transforms
+        )
+        
         # Apply transforms to create aligned images
         aligned_images = self._apply_transforms(images_data, transforms, ref_idx)
         
@@ -374,11 +379,9 @@ class ImageAligner:
         ref_idx: int
     ) -> Dict[int, np.ndarray]:
         """
-        Calculate absolute transforms using weighted BFS from reference image.
+        Calculate absolute transforms using priority BFS from reference image.
         
-        Prioritizes high-quality connections and performs consistency checking
-        to avoid misplacements from bad matches.
-        
+        Prioritizes sequential connections (for burst photos) and high-quality matches.
         Each transform maps from the image's local coordinates to the 
         global (reference) coordinate system.
         """
@@ -386,7 +389,6 @@ class ImageAligner:
         
         # Reference image has identity transform
         transforms = {ref_idx: np.eye(3, dtype=np.float64)}
-        transform_sources = {ref_idx: []}  # Track path to each image
         visited = {ref_idx}
         
         # Priority queue: (negative_quality, image_idx, parent_idx)
@@ -404,44 +406,23 @@ class ImageAligner:
             # Get transform from neighbor to parent
             key = (neighbor, parent)
             if key not in relative_transforms:
-                continue
+                # Try reverse direction
+                reverse_key = (parent, neighbor)
+                if reverse_key in relative_transforms:
+                    try:
+                        neighbor_to_parent = np.linalg.inv(relative_transforms[reverse_key])
+                    except np.linalg.LinAlgError:
+                        continue
+                else:
+                    continue
+            else:
+                neighbor_to_parent = relative_transforms[key]
             
-            neighbor_to_parent = relative_transforms[key]
             parent_transform = transforms[parent]
             neighbor_to_global = parent_transform @ neighbor_to_parent
             
-            # Consistency check: if we have a sequential neighbor already placed,
-            # verify this placement is reasonable
-            is_consistent = True
-            for seq_offset in [-1, 1]:
-                seq_neighbor = neighbor + seq_offset
-                if seq_neighbor in transforms and 0 <= seq_neighbor < n_images:
-                    seq_transform = transforms[seq_neighbor]
-                    # Check if positions are reasonably close
-                    our_pos = np.array([neighbor_to_global[0, 2], neighbor_to_global[1, 2]])
-                    seq_pos = np.array([seq_transform[0, 2], seq_transform[1, 2]])
-                    distance = np.linalg.norm(our_pos - seq_pos)
-                    
-                    # For burst photos, sequential images should be relatively close
-                    # Allow up to 2000px distance (adjust based on image size)
-                    if distance > 5000:
-                        logger.warning(f"Image {neighbor} placement inconsistent with sequential neighbor {seq_neighbor} "
-                                      f"(distance={distance:.0f}px), will try alternative path")
-                        is_consistent = False
-                        break
-            
-            if not is_consistent:
-                # Try to find this image via a different path later
-                # Add lower-priority alternatives to the queue
-                for alt_neighbor, alt_weight in graph.get(neighbor, []):
-                    if alt_neighbor in visited and alt_neighbor != parent:
-                        # Can reach via already-visited node
-                        heapq.heappush(pq, (-alt_weight * 0.5, neighbor, alt_neighbor))
-                continue
-            
             # Accept this placement
             transforms[neighbor] = neighbor_to_global
-            transform_sources[neighbor] = transform_sources[parent] + [parent]
             visited.add(neighbor)
             
             # Log position
@@ -454,41 +435,280 @@ class ImageAligner:
                 if next_neighbor not in visited:
                     heapq.heappush(pq, (-weight, next_neighbor, neighbor))
         
-        # Handle disconnected images - try sequential chain fallback
+        # Handle disconnected images using sequential chain
         unplaced = [i for i in range(n_images) if i not in transforms]
         if unplaced:
-            logger.warning(f"Images {unplaced} are disconnected, attempting sequential placement")
-            
-            for img_idx in unplaced:
-                # Try to find a placed sequential neighbor
-                placed = False
-                for offset in [-1, 1, -2, 2, -3, 3]:
-                    seq_neighbor = img_idx + offset
-                    if seq_neighbor in transforms:
-                        key = (img_idx, seq_neighbor)
-                        if key in relative_transforms:
-                            seq_transform = transforms[seq_neighbor]
-                            img_to_neighbor = relative_transforms[key]
-                            transforms[img_idx] = seq_transform @ img_to_neighbor
-                            tx, ty = transforms[img_idx][0, 2], transforms[img_idx][1, 2]
-                            logger.info(f"Image {img_idx}: position=({tx:.1f}, {ty:.1f}) (sequential fallback via {seq_neighbor})")
-                            placed = True
-                            break
-                
-                if not placed:
-                    # Last resort: place at end
-                    max_x = max(t[0, 2] for t in transforms.values()) if transforms else 0
-                    transforms[img_idx] = np.array([
-                        [1, 0, max_x + 1000],
-                        [0, 1, 0],
-                        [0, 0, 1]
-                    ], dtype=np.float64)
-                    logger.warning(f"Image {img_idx}: placed at end (no valid connections)")
-        
-        # Final consistency check: detect outlier placements
-        transforms = self._detect_and_fix_outliers(transforms, relative_transforms, n_images)
+            logger.warning(f"{len(unplaced)} images disconnected, using sequential chain")
+            self._place_disconnected_sequentially(
+                unplaced, transforms, relative_transforms, n_images
+            )
         
         return transforms
+    
+    def _place_disconnected_sequentially(
+        self,
+        unplaced: List[int],
+        transforms: Dict[int, np.ndarray],
+        relative_transforms: Dict[Tuple[int, int], np.ndarray],
+        n_images: int
+    ):
+        """Place disconnected images by following sequential chain."""
+        # Sort unplaced by distance to nearest placed image
+        for img_idx in sorted(unplaced):
+            if img_idx in transforms:
+                continue
+                
+            # Try sequential neighbors first
+            placed = False
+            for offset in [-1, 1, -2, 2, -3, 3, -5, 5]:
+                seq_neighbor = img_idx + offset
+                if 0 <= seq_neighbor < n_images and seq_neighbor in transforms:
+                    key = (img_idx, seq_neighbor)
+                    if key in relative_transforms:
+                        seq_transform = transforms[seq_neighbor]
+                        rel_transform = relative_transforms[key]
+                        transforms[img_idx] = seq_transform @ rel_transform
+                        tx, ty = transforms[img_idx][0, 2], transforms[img_idx][1, 2]
+                        logger.info(f"Image {img_idx}: placed via sequential neighbor {seq_neighbor} at ({tx:.0f}, {ty:.0f})")
+                        placed = True
+                        break
+                    
+                    # Try inverse
+                    reverse_key = (seq_neighbor, img_idx)
+                    if reverse_key in relative_transforms:
+                        try:
+                            seq_transform = transforms[seq_neighbor]
+                            rel_transform = np.linalg.inv(relative_transforms[reverse_key])
+                            transforms[img_idx] = seq_transform @ rel_transform
+                            tx, ty = transforms[img_idx][0, 2], transforms[img_idx][1, 2]
+                            logger.info(f"Image {img_idx}: placed via sequential neighbor {seq_neighbor} (inverse) at ({tx:.0f}, {ty:.0f})")
+                            placed = True
+                            break
+                        except np.linalg.LinAlgError:
+                            continue
+            
+            if not placed:
+                # Interpolate position from nearest placed neighbors
+                prev_placed = None
+                next_placed = None
+                
+                for p in range(img_idx - 1, -1, -1):
+                    if p in transforms:
+                        prev_placed = p
+                        break
+                
+                for n in range(img_idx + 1, n_images):
+                    if n in transforms:
+                        next_placed = n
+                        break
+                
+                if prev_placed is not None and next_placed is not None:
+                    # Interpolate
+                    prev_pos = transforms[prev_placed][:2, 2]
+                    next_pos = transforms[next_placed][:2, 2]
+                    t = (img_idx - prev_placed) / (next_placed - prev_placed)
+                    interp_pos = prev_pos + t * (next_pos - prev_pos)
+                    transforms[img_idx] = np.array([
+                        [1, 0, interp_pos[0]],
+                        [0, 1, interp_pos[1]],
+                        [0, 0, 1]
+                    ], dtype=np.float64)
+                    logger.info(f"Image {img_idx}: interpolated between {prev_placed} and {next_placed} at ({interp_pos[0]:.0f}, {interp_pos[1]:.0f})")
+                elif prev_placed is not None:
+                    # Extrapolate from previous
+                    prev_pos = transforms[prev_placed][:2, 2]
+                    # Estimate offset from earlier images
+                    offset = np.array([200, 0])  # Default horizontal offset
+                    if prev_placed > 0 and prev_placed - 1 in transforms:
+                        offset = prev_pos - transforms[prev_placed - 1][:2, 2]
+                    new_pos = prev_pos + offset * (img_idx - prev_placed)
+                    transforms[img_idx] = np.array([
+                        [1, 0, new_pos[0]],
+                        [0, 1, new_pos[1]],
+                        [0, 0, 1]
+                    ], dtype=np.float64)
+                    logger.info(f"Image {img_idx}: extrapolated from {prev_placed} at ({new_pos[0]:.0f}, {new_pos[1]:.0f})")
+                else:
+                    # Place at origin
+                    transforms[img_idx] = np.eye(3, dtype=np.float64)
+                    logger.warning(f"Image {img_idx}: no neighbors, placed at origin")
+    
+    def _refine_transforms_with_edges(
+        self,
+        images_data: List[Dict],
+        transforms: Dict[int, np.ndarray],
+        relative_transforms: Dict[Tuple[int, int], np.ndarray]
+    ) -> Dict[int, np.ndarray]:
+        """
+        Refine transforms by verifying edge alignment in overlap regions.
+        
+        For each pair of overlapping images:
+        1. Compute the overlap region
+        2. Extract edges using Canny
+        3. Verify edges match after transform
+        4. Apply small corrections if needed
+        """
+        n_images = len(images_data)
+        
+        # Get image sizes
+        sizes = {}
+        for i, img_data in enumerate(images_data):
+            if i in transforms:
+                h, w = img_data['image'].shape[:2]
+                sizes[i] = (w, h)
+        
+        # For each sequential pair, verify and refine
+        refinements_made = 0
+        for i in range(n_images - 1):
+            if i not in transforms or i + 1 not in transforms:
+                continue
+            
+            # Check if we have relative transform between them
+            key = (i, i + 1)
+            if key not in relative_transforms and (i + 1, i) not in relative_transforms:
+                continue
+            
+            try:
+                correction = self._compute_edge_correction(
+                    images_data[i]['image'],
+                    images_data[i + 1]['image'],
+                    transforms[i],
+                    transforms[i + 1],
+                    sizes.get(i),
+                    sizes.get(i + 1)
+                )
+                
+                if correction is not None and np.linalg.norm(correction) > 0.5:
+                    # Apply correction to image i+1 and all subsequent images
+                    correction_matrix = np.array([
+                        [1, 0, correction[0]],
+                        [0, 1, correction[1]],
+                        [0, 0, 1]
+                    ], dtype=np.float64)
+                    
+                    for j in range(i + 1, n_images):
+                        if j in transforms:
+                            transforms[j] = correction_matrix @ transforms[j]
+                    
+                    refinements_made += 1
+                    logger.debug(f"Applied edge correction ({correction[0]:.1f}, {correction[1]:.1f}) to images {i+1}+")
+                    
+            except Exception as e:
+                logger.debug(f"Edge refinement failed for pair ({i}, {i+1}): {e}")
+        
+        if refinements_made > 0:
+            logger.info(f"Applied {refinements_made} edge-based refinements")
+        
+        return transforms
+    
+    def _compute_edge_correction(
+        self,
+        img1: np.ndarray,
+        img2: np.ndarray,
+        transform1: np.ndarray,
+        transform2: np.ndarray,
+        size1: Tuple[int, int],
+        size2: Tuple[int, int]
+    ) -> Optional[np.ndarray]:
+        """
+        Compute correction needed to align edges in overlap region.
+        
+        Returns (dx, dy) correction or None if edges already align well.
+        """
+        if size1 is None or size2 is None:
+            return None
+        
+        # Compute bounding boxes in global coordinates
+        w1, h1 = size1
+        w2, h2 = size2
+        
+        # Image 1 bbox
+        x1_min, y1_min = transform1[0, 2], transform1[1, 2]
+        x1_max, y1_max = x1_min + w1, y1_min + h1
+        
+        # Image 2 bbox
+        x2_min, y2_min = transform2[0, 2], transform2[1, 2]
+        x2_max, y2_max = x2_min + w2, y2_min + h2
+        
+        # Compute overlap
+        overlap_x_min = max(x1_min, x2_min)
+        overlap_x_max = min(x1_max, x2_max)
+        overlap_y_min = max(y1_min, y2_min)
+        overlap_y_max = min(y1_max, y2_max)
+        
+        overlap_w = overlap_x_max - overlap_x_min
+        overlap_h = overlap_y_max - overlap_y_min
+        
+        # Need at least 50px overlap
+        if overlap_w < 50 or overlap_h < 50:
+            return None
+        
+        # Extract overlap regions from both images
+        # Local coordinates in image 1
+        local1_x = int(overlap_x_min - x1_min)
+        local1_y = int(overlap_y_min - y1_min)
+        local1_w = int(min(overlap_w, w1 - local1_x))
+        local1_h = int(min(overlap_h, h1 - local1_y))
+        
+        # Local coordinates in image 2
+        local2_x = int(overlap_x_min - x2_min)
+        local2_y = int(overlap_y_min - y2_min)
+        local2_w = int(min(overlap_w, w2 - local2_x))
+        local2_h = int(min(overlap_h, h2 - local2_y))
+        
+        # Ensure valid regions
+        if local1_w < 50 or local1_h < 50 or local2_w < 50 or local2_h < 50:
+            return None
+        
+        # Extract regions
+        region1 = img1[local1_y:local1_y + local1_h, local1_x:local1_x + local1_w]
+        region2 = img2[local2_y:local2_y + local2_h, local2_x:local2_x + local2_w]
+        
+        # Ensure same size for comparison
+        min_w = min(region1.shape[1], region2.shape[1])
+        min_h = min(region1.shape[0], region2.shape[0])
+        region1 = region1[:min_h, :min_w]
+        region2 = region2[:min_h, :min_w]
+        
+        if region1.size == 0 or region2.size == 0:
+            return None
+        
+        # Convert to grayscale
+        if len(region1.shape) == 3:
+            gray1 = cv2.cvtColor(region1, cv2.COLOR_BGR2GRAY)
+        else:
+            gray1 = region1
+            
+        if len(region2.shape) == 3:
+            gray2 = cv2.cvtColor(region2, cv2.COLOR_BGR2GRAY)
+        else:
+            gray2 = region2
+        
+        # Detect edges
+        edges1 = cv2.Canny(gray1, 50, 150)
+        edges2 = cv2.Canny(gray2, 50, 150)
+        
+        # Use phase correlation to find sub-pixel shift
+        try:
+            # Convert to float for phase correlation
+            f1 = np.float32(edges1)
+            f2 = np.float32(edges2)
+            
+            # Phase correlation
+            shift, response = cv2.phaseCorrelate(f1, f2)
+            
+            # Only apply if response is strong (good match)
+            if response > 0.3:
+                # Limit correction to small values (max 10px)
+                dx = np.clip(shift[0], -10, 10)
+                dy = np.clip(shift[1], -10, 10)
+                
+                if abs(dx) > 0.5 or abs(dy) > 0.5:
+                    return np.array([dx, dy])
+        except Exception:
+            pass
+        
+        return None
     
     def _detect_and_fix_outliers(
         self,
