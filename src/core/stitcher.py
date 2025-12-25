@@ -13,6 +13,7 @@ import gc
 from ml.feature_detector import LP_SIFTDetector, ORBDetector, AKAZEDetector
 from ml.matcher import AdvancedMatcher
 from ml.advanced_matchers import LoFTRMatcher, SuperGlueMatcher, DISKMatcher
+from ml.efficient_matcher import EfficientMatcher, create_efficient_matcher
 from quality.assessor import ImageQualityAssessor
 from core.alignment import ImageAligner
 from core.blender import ImageBlender
@@ -21,6 +22,7 @@ from core.pixelstitch_blender import PixelStitchBlender
 from core.control_points import ControlPointManager
 from utils.memory_manager import MemoryManager
 from utils.lazy_loader import LazyImageLoader, ImageProxy, estimate_memory_for_images
+from utils.duplicate_detector import DuplicateDetector, remove_duplicates_from_paths
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,10 @@ class ImageStitcher:
         allow_scale: bool = True,
         max_panorama_pixels: Optional[int] = 100_000_000,
         max_warp_pixels: Optional[int] = 50_000_000,
-        memory_efficient: bool = True
+        memory_efficient: bool = True,
+        remove_duplicates: bool = False,
+        duplicate_threshold: float = 0.92,
+        matching_memory_mode: str = 'balanced'
     ):
         """
         Initialize the stitcher
@@ -69,6 +74,16 @@ class ImageStitcher:
                 Memory savings: ~70-90% during loading/feature detection phase
                 - Traditional: All images loaded at once (~3.6GB for 100x 36MB images)
                 - Efficient: Thumbnails + compressed cache (~200-400MB)
+            remove_duplicates: Pre-scan to remove duplicate/similar images
+            duplicate_threshold: Similarity threshold for duplicate detection (0.0-1.0)
+                - 0.90 = 90% similar (aggressive, catches more duplicates)
+                - 0.95 = 95% similar (moderate, near-identical images)
+                - 0.99 = 99% similar (conservative, only exact duplicates)
+            matching_memory_mode: Memory optimization level for feature matching
+                - 'minimal': Maximum memory savings (PCA + cascade filter + disk cache)
+                - 'balanced': Good balance of memory and speed (PCA + cascade filter)
+                - 'quality': Full quality, some compression (PCA only)
+                - 'standard': No optimization (traditional matching)
         """
         self.use_gpu = use_gpu
         self.quality_threshold = quality_threshold
@@ -78,10 +93,20 @@ class ImageStitcher:
         self.max_panorama_pixels = max_panorama_pixels
         self.max_warp_pixels = max_warp_pixels
         self.memory_efficient = memory_efficient
+        self.remove_duplicates = remove_duplicates
+        self.duplicate_threshold = duplicate_threshold
+        self.matching_memory_mode = matching_memory_mode
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
         self._cancelled = False
+        
+        # Initialize duplicate detector if enabled
+        self._duplicate_detector: Optional[DuplicateDetector] = None
+        if remove_duplicates:
+            self._duplicate_detector = DuplicateDetector(
+                similarity_threshold=duplicate_threshold
+            )
         
         # Initialize lazy loader if memory efficient mode
         self._lazy_loader: Optional[LazyImageLoader] = None
@@ -95,8 +120,12 @@ class ImageStitcher:
         # Initialize feature detector
         self.feature_detector = self._create_feature_detector(feature_detector, use_gpu, max_features)
         
-        # Initialize feature matcher
-        self.matcher = self._create_feature_matcher(feature_matcher, use_gpu)
+        # Initialize feature matcher (use efficient matcher in memory_efficient mode)
+        self.matcher = self._create_feature_matcher(
+            feature_matcher, use_gpu, 
+            use_efficient=memory_efficient,
+            memory_mode=matching_memory_mode
+        )
         
         # Initialize quality assessor
         self.quality_assessor = ImageQualityAssessor(use_gpu=use_gpu)
@@ -134,10 +163,33 @@ class ImageStitcher:
             logger.warning(f"Unknown detector method {method}, using LP-SIFT")
             return LP_SIFTDetector(use_gpu=use_gpu, n_features=max_features)
     
-    def _create_feature_matcher(self, method: str, use_gpu: bool):
-        """Create feature matcher based on method"""
+    def _create_feature_matcher(
+        self, 
+        method: str, 
+        use_gpu: bool, 
+        use_efficient: bool = False,
+        memory_mode: str = 'balanced'
+    ):
+        """Create feature matcher based on method
+        
+        Args:
+            method: Matching method ('flann', 'loftr', 'superglue', 'disk')
+            use_gpu: Enable GPU acceleration
+            use_efficient: Use memory-efficient matcher (for FLANN method)
+            memory_mode: Memory optimization mode ('minimal', 'balanced', 'quality', 'standard')
+        """
         method = method.lower()
-        if method == 'flann':
+        
+        # Use efficient matcher for FLANN when memory_efficient is enabled
+        if method == 'flann' and use_efficient:
+            logger.info(f"Using EfficientMatcher with mode '{memory_mode}'")
+            return create_efficient_matcher(
+                use_gpu=use_gpu,
+                method='flann',
+                ratio_threshold=0.75,
+                memory_mode=memory_mode
+            )
+        elif method == 'flann':
             return AdvancedMatcher(use_gpu=use_gpu, method='flann')
         elif method == 'loftr':
             return LoFTRMatcher(use_gpu=use_gpu)
@@ -147,6 +199,8 @@ class ImageStitcher:
             return DISKMatcher(use_gpu=use_gpu)
         else:
             logger.warning(f"Unknown matcher method {method}, using FLANN")
+            if use_efficient:
+                return create_efficient_matcher(use_gpu=use_gpu, method='flann', memory_mode=memory_mode)
             return AdvancedMatcher(use_gpu=use_gpu, method='flann')
     
     def _create_blender(self, method: str, use_gpu: bool, blending_options: Dict = None):
@@ -185,6 +239,17 @@ class ImageStitcher:
         
         logger.info(f"Starting stitching process for {len(image_paths)} images")
         self._update_progress(0, "Starting stitching process...")
+        
+        # Step 0 (Optional): Remove duplicate/similar images
+        if self.remove_duplicates and self._duplicate_detector is not None:
+            self._check_cancel()
+            logger.info("Step 0: Detecting and removing duplicate images...")
+            self._update_progress(2, f"Scanning {len(image_paths)} images for duplicates...")
+            
+            image_paths = self._remove_duplicate_images(image_paths)
+            
+            if not image_paths:
+                raise ValueError("No images remaining after duplicate removal")
         
         # Step 1: Load and assess image quality
         self._check_cancel()
@@ -262,6 +327,82 @@ class ImageStitcher:
         if self.progress_callback:
             self.progress_callback(percentage, message)
     
+    def _remove_duplicate_images(self, image_paths: List[Path]) -> List[Path]:
+        """
+        Remove duplicate and similar images from the input list.
+        
+        Args:
+            image_paths: List of image paths
+            
+        Returns:
+            Filtered list with duplicates removed
+        """
+        if not self._duplicate_detector or len(image_paths) <= 1:
+            return image_paths
+        
+        total = len(image_paths)
+        
+        def progress_callback(current: int, total_items: int, message: str):
+            """Map duplicate detection progress to 2-10% range"""
+            self._check_cancel()
+            if total_items > 0:
+                progress = 2 + int(8 * (current / total_items))
+                self._update_progress(progress, f"Duplicate scan: {message}")
+        
+        # Load thumbnails for comparison
+        self._update_progress(2, f"Loading thumbnails for duplicate detection...")
+        
+        images = []
+        for i, path in enumerate(image_paths):
+            self._check_cancel()
+            progress_callback(i, total, f"Loading {path.name}")
+            
+            img = cv2.imread(str(path))
+            if img is not None:
+                # Resize for faster comparison
+                h, w = img.shape[:2]
+                if max(h, w) > 256:
+                    scale = 256 / max(h, w)
+                    img = cv2.resize(img, (int(w * scale), int(h * scale)), 
+                                   interpolation=cv2.INTER_AREA)
+                images.append((path, img))
+            else:
+                logger.warning(f"Could not load image for duplicate check: {path}")
+        
+        if len(images) <= 1:
+            return image_paths
+        
+        # Find duplicates
+        self._update_progress(5, f"Comparing {len(images)} images for duplicates...")
+        
+        keep_indices, duplicates = self._duplicate_detector.find_duplicates(
+            images, 
+            progress_callback=progress_callback
+        )
+        
+        # Get filtered paths
+        filtered_paths = [images[i][0] for i in keep_indices]
+        num_removed = total - len(filtered_paths)
+        
+        if num_removed > 0:
+            logger.info(f"Duplicate detection: KEEPING {len(filtered_paths)} unique images (removed {num_removed} duplicates)")
+            self._update_progress(10, f"✓ Keeping {len(filtered_paths)} unique images (removed {num_removed} duplicate(s))")
+            
+            # Log which images were removed
+            removed_paths = set(image_paths) - set(filtered_paths)
+            for path in removed_paths:
+                logger.info(f"  Removed: {path.name}")
+            logger.info(f"  Kept: {[p.name for p in filtered_paths]}")
+        else:
+            logger.info(f"Duplicate detection: ALL {total} images are unique (no duplicates found)")
+            self._update_progress(10, f"✓ All {total} images are unique (no duplicates)")
+        
+        # Clean up
+        del images
+        gc.collect()
+        
+        return filtered_paths
+    
     def create_grid_alignment(
         self,
         image_paths: List[Path],
@@ -284,6 +425,22 @@ class ImageStitcher:
             Dictionary with grid layout information
         """
         logger.info(f"Creating grid alignment for {len(image_paths)} images (overlap: {min_overlap_percent}%-{max_overlap_percent}%, spacing: {spacing_factor}x)")
+        
+        # Optional: Remove duplicate images first
+        if self.remove_duplicates and self._duplicate_detector is not None:
+            self._check_cancel()
+            logger.info("Pre-processing: Detecting and removing duplicate images...")
+            self._update_progress(2, f"Scanning {len(image_paths)} images for duplicates...")
+            image_paths = self._remove_duplicate_images(image_paths)
+            
+            if not image_paths:
+                logger.warning("No images remaining after duplicate removal")
+                return {
+                    'images': [],
+                    'positions': [],
+                    'grid_size': (1, 1),
+                    'matches': []
+                }
         
         # Load and assess images
         images_data = self._load_and_assess_images(image_paths)
@@ -1014,7 +1171,32 @@ class ImageStitcher:
         return features_data
     
     def _match_features(self, features_data: List[Dict]) -> List[Dict]:
-        """Match features between images"""
+        """Match features between images
+        
+        Uses EfficientMatcher with cascade filtering and PCA compression when
+        memory_efficient mode is enabled, otherwise falls back to standard matching.
+        """
+        # Check if we're using the efficient matcher
+        if isinstance(self.matcher, EfficientMatcher):
+            # Use efficient batch matching with cascade filtering
+            self._update_progress(50, "Preparing memory-efficient feature matching...")
+            
+            # Estimate memory savings
+            n_images = len(features_data)
+            avg_features = sum(len(fd.get('descriptors', [])) for fd in features_data) // max(n_images, 1)
+            savings = self.matcher.estimate_memory_savings(n_images, avg_features)
+            logger.info(f"Memory-efficient matching: ~{savings['savings_mb']:.1f}MB savings "
+                       f"({savings['savings_percent']:.0f}%), {savings['pair_reduction_percent']:.0f}% fewer pairs")
+            
+            # Use the efficient matcher's batch method
+            matches = self.matcher.match_all(
+                features_data,
+                progress_callback=self._update_progress,
+                cancel_check=lambda: self._cancelled
+            )
+            return matches
+        
+        # Standard matching path for other matchers
         matches = []
         
         # Check if matcher is a deep learning matcher that needs images

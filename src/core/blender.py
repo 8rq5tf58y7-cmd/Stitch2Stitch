@@ -86,8 +86,10 @@ class ImageBlender:
     
     def _autostitch_blend(self, aligned_images: List[Dict], options: Dict) -> np.ndarray:
         """
-        AutoStitch-style blending: select pixels from one image in overlap regions
-        No averaging/blending - images fit together like a puzzle
+        AutoStitch-style blending: seamless puzzle-fit with no background
+        - Full opacity pixels (no averaging/blending)
+        - Seam-optimized overlap transitions
+        - Auto-crops to actual content (no background)
         Memory-optimized version.
         """
         if not aligned_images:
@@ -106,25 +108,29 @@ class ImageBlender:
         
         # Check size and scale down if needed (only if limit is set)
         total_pixels = output_h * output_w
+        scale_factor = 1.0
         if self.max_panorama_pixels and total_pixels > self.max_panorama_pixels:
-            scale = np.sqrt(self.max_panorama_pixels / total_pixels)
-            output_h = int(output_h * scale)
-            output_w = int(output_w * scale)
+            scale_factor = np.sqrt(self.max_panorama_pixels / total_pixels)
+            output_h = int(output_h * scale_factor)
+            output_w = int(output_w * scale_factor)
             logger.warning(f"Panorama too large ({total_pixels/1e6:.1f}MP), scaling to {output_w}x{output_h}")
         
         logger.info(f"Creating panorama canvas: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
         
-        # Create output canvas with white background (uint8 to save memory)
-        panorama = np.ones((output_h, output_w, 3), dtype=np.uint8) * 255
-        # Use uint8 for filled mask too (saves memory vs bool on large arrays)
+        # Start with transparent/empty canvas (will auto-crop at end)
+        panorama = np.zeros((output_h, output_w, 3), dtype=np.uint8)
+        # Track which pixels are filled and which image owns them
         filled_mask = np.zeros((output_h, output_w), dtype=np.uint8)
+        # Store image index for seam optimization (-1 = unfilled)
+        owner_mask = np.full((output_h, output_w), -1, dtype=np.int16)
         
-        # Sort images by quality/confidence (best first)
-        sorted_images = sorted(
-            aligned_images,
-            key=lambda x: x.get('quality', 0.5),
-            reverse=True
-        )
+        # Sort images by position for better seam finding (left-to-right, top-to-bottom)
+        # This ensures overlaps are handled in a natural order
+        def image_position(img_data):
+            bbox_img = img_data.get('bbox', (0, 0, 0, 0))
+            return (bbox_img[1], bbox_img[0])  # (y, x) for top-to-bottom, left-to-right
+        
+        sorted_images = sorted(aligned_images, key=image_position)
         
         # Process each image
         for idx, img_data in enumerate(sorted_images):
@@ -136,21 +142,36 @@ class ImageBlender:
             
             h, w = img.shape[:2]
             
-            # Create content mask efficiently
+            # Scale image if panorama was scaled
+            if scale_factor < 1.0:
+                new_h = int(h * scale_factor)
+                new_w = int(w * scale_factor)
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                if alpha is not None:
+                    alpha = cv2.resize(alpha, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                h, w = new_h, new_w
+            
+            # Create content mask - detect actual image content (not black/near-black borders)
             if alpha is not None:
                 alpha_mask = alpha > 127
             else:
                 alpha_mask = np.ones((h, w), dtype=bool)
             
-            # Filter warp artifacts
+            # Detect and exclude black borders (common in warped images)
+            if len(img.shape) == 3:
+                # Content threshold: pixels with any significant color
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                content_mask = gray > 5  # Very low threshold to catch actual content
+                alpha_mask = alpha_mask & content_mask
+            
+            # Filter extreme warp artifacts
             if was_warped and len(img.shape) == 3:
-                # Use max channel for faster intensity check
                 intensity = np.max(img, axis=2)
-                alpha_mask = alpha_mask & (intensity > 10) & (intensity < 250)
+                alpha_mask = alpha_mask & (intensity > 3) & (intensity < 252)
             
             bbox_img = img_data.get('bbox', (0, 0, w, h))
-            x_off = bbox_img[0] - x_min
-            y_off = bbox_img[1] - y_min
+            x_off = int((bbox_img[0] - x_min) * scale_factor) if scale_factor < 1.0 else bbox_img[0] - x_min
+            y_off = int((bbox_img[1] - y_min) * scale_factor) if scale_factor < 1.0 else bbox_img[1] - y_min
             
             # Calculate valid region
             src_x_start = max(0, -x_off)
@@ -170,27 +191,290 @@ class ImageBlender:
             src_region = img[src_y_start:src_y_end, src_x_start:src_x_end]
             src_alpha = alpha_mask[src_y_start:src_y_end, src_x_start:src_x_end]
             dst_filled = filled_mask[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
+            dst_owner = owner_mask[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
             
-            # Write mask: valid alpha and not already filled
-            write_mask = src_alpha & (dst_filled == 0)
+            # Find overlap region for seam optimization
+            overlap_mask = src_alpha & (dst_filled > 0)
             
-            if np.any(write_mask):
-                # Use numpy advanced indexing (faster than per-channel loop)
+            # For overlap regions, use seam-finding to choose which image's pixels to use
+            if np.any(overlap_mask):
                 dst_region = panorama[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
-                dst_region[write_mask] = src_region[write_mask]
                 
-                # Update filled mask
-                filled_mask[dst_y_start:dst_y_end, dst_x_start:dst_x_end][write_mask] = 1
+                # Compute optimal seam in overlap region
+                seam_mask = self._find_optimal_seam(
+                    dst_region, src_region, overlap_mask
+                )
+                
+                # Update pixels where seam favors the new image
+                new_pixel_mask = src_alpha & ((dst_filled == 0) | seam_mask)
+            else:
+                # No overlap - just fill empty areas
+                new_pixel_mask = src_alpha & (dst_filled == 0)
             
-            # Free alpha_mask memory
-            del alpha_mask, write_mask
+            if np.any(new_pixel_mask):
+                dst_region = panorama[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
+                dst_region[new_pixel_mask] = src_region[new_pixel_mask]
+                
+                # Update filled mask and owner
+                filled_mask[dst_y_start:dst_y_end, dst_x_start:dst_x_end][new_pixel_mask] = 1
+                owner_mask[dst_y_start:dst_y_end, dst_x_start:dst_x_end][new_pixel_mask] = idx
+            
+            # Free memory
+            del alpha_mask, new_pixel_mask
+            if 'overlap_mask' in dir():
+                del overlap_mask
+        
+        # Auto-crop to actual content (remove empty borders)
+        panorama = self._autocrop_to_content(panorama, filled_mask)
         
         # Cleanup
-        del filled_mask
+        del filled_mask, owner_mask
         gc.collect()
         
-        logger.info("Blending complete")
+        logger.info("AutoStitch blending complete (auto-cropped)")
         return panorama
+    
+    def _find_optimal_seam(
+        self,
+        img1: np.ndarray,
+        img2: np.ndarray,
+        overlap_mask: np.ndarray
+    ) -> np.ndarray:
+        """
+        Find optimal seam between two images in overlap region.
+        Returns mask where True = use img2, False = use img1.
+        Uses gradient-domain seam finding for seamless transitions.
+        """
+        h, w = overlap_mask.shape
+        seam_mask = np.zeros((h, w), dtype=bool)
+        
+        if not np.any(overlap_mask):
+            return seam_mask
+        
+        # Convert to grayscale for gradient computation
+        if len(img1.shape) == 3:
+            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        else:
+            gray1 = img1.astype(np.float32)
+            gray2 = img2.astype(np.float32)
+        
+        # Compute gradients (edges)
+        grad1_x = cv2.Sobel(gray1, cv2.CV_32F, 1, 0, ksize=3)
+        grad1_y = cv2.Sobel(gray1, cv2.CV_32F, 0, 1, ksize=3)
+        grad2_x = cv2.Sobel(gray2, cv2.CV_32F, 1, 0, ksize=3)
+        grad2_y = cv2.Sobel(gray2, cv2.CV_32F, 0, 1, ksize=3)
+        
+        # Gradient magnitude
+        grad1 = np.sqrt(grad1_x**2 + grad1_y**2)
+        grad2 = np.sqrt(grad2_x**2 + grad2_y**2)
+        
+        # Color difference in overlap
+        if len(img1.shape) == 3:
+            diff = np.sum(np.abs(img1.astype(np.float32) - img2.astype(np.float32)), axis=2)
+        else:
+            diff = np.abs(img1.astype(np.float32) - img2.astype(np.float32))
+        
+        # Cost: prefer cutting through low-gradient areas with low color difference
+        # Lower cost = better seam location
+        cost = diff + 0.5 * (grad1 + grad2)
+        
+        # Find overlap bounding box
+        rows, cols = np.where(overlap_mask)
+        if len(rows) == 0:
+            return seam_mask
+        
+        min_row, max_row = rows.min(), rows.max()
+        min_col, max_col = cols.min(), cols.max()
+        
+        # Determine seam direction based on overlap shape
+        overlap_h = max_row - min_row + 1
+        overlap_w = max_col - min_col + 1
+        
+        if overlap_w > overlap_h:
+            # Horizontal overlap - find vertical seam
+            seam_mask = self._find_vertical_seam(
+                cost, overlap_mask, min_row, max_row, min_col, max_col
+            )
+        else:
+            # Vertical overlap - find horizontal seam
+            seam_mask = self._find_horizontal_seam(
+                cost, overlap_mask, min_row, max_row, min_col, max_col
+            )
+        
+        return seam_mask
+    
+    def _find_vertical_seam(
+        self,
+        cost: np.ndarray,
+        overlap_mask: np.ndarray,
+        min_row: int,
+        max_row: int,
+        min_col: int,
+        max_col: int
+    ) -> np.ndarray:
+        """Find vertical seam through overlap region using dynamic programming"""
+        h, w = cost.shape
+        seam_mask = np.zeros((h, w), dtype=bool)
+        
+        overlap_w = max_col - min_col + 1
+        overlap_h = max_row - min_row + 1
+        
+        if overlap_w < 2 or overlap_h < 2:
+            # Too small - use center split
+            center_col = (min_col + max_col) // 2
+            seam_mask[:, center_col:] = overlap_mask[:, center_col:]
+            return seam_mask
+        
+        # Extract overlap region cost
+        region_cost = cost[min_row:max_row+1, min_col:max_col+1].copy()
+        region_mask = overlap_mask[min_row:max_row+1, min_col:max_col+1]
+        
+        # Set non-overlap areas to high cost
+        region_cost[~region_mask] = 1e9
+        
+        # Dynamic programming to find minimum cost seam
+        dp = region_cost.copy()
+        for row in range(1, overlap_h):
+            for col in range(overlap_w):
+                left = dp[row-1, max(0, col-1)]
+                center = dp[row-1, col]
+                right = dp[row-1, min(overlap_w-1, col+1)]
+                dp[row, col] += min(left, center, right)
+        
+        # Backtrack to find seam
+        seam_cols = np.zeros(overlap_h, dtype=int)
+        seam_cols[-1] = np.argmin(dp[-1])
+        
+        for row in range(overlap_h - 2, -1, -1):
+            col = seam_cols[row + 1]
+            left = dp[row, max(0, col-1)]
+            center = dp[row, col]
+            right = dp[row, min(overlap_w-1, col+1)]
+            
+            min_val = min(left, center, right)
+            if left == min_val and col > 0:
+                seam_cols[row] = col - 1
+            elif right == min_val and col < overlap_w - 1:
+                seam_cols[row] = col + 1
+            else:
+                seam_cols[row] = col
+        
+        # Create mask: pixels to the right of seam use img2
+        for row in range(overlap_h):
+            seam_col = seam_cols[row]
+            seam_mask[min_row + row, min_col + seam_col:max_col + 1] = True
+        
+        # Only apply within overlap
+        seam_mask = seam_mask & overlap_mask
+        
+        return seam_mask
+    
+    def _find_horizontal_seam(
+        self,
+        cost: np.ndarray,
+        overlap_mask: np.ndarray,
+        min_row: int,
+        max_row: int,
+        min_col: int,
+        max_col: int
+    ) -> np.ndarray:
+        """Find horizontal seam through overlap region using dynamic programming"""
+        h, w = cost.shape
+        seam_mask = np.zeros((h, w), dtype=bool)
+        
+        overlap_w = max_col - min_col + 1
+        overlap_h = max_row - min_row + 1
+        
+        if overlap_w < 2 or overlap_h < 2:
+            # Too small - use center split
+            center_row = (min_row + max_row) // 2
+            seam_mask[center_row:, :] = overlap_mask[center_row:, :]
+            return seam_mask
+        
+        # Extract overlap region cost
+        region_cost = cost[min_row:max_row+1, min_col:max_col+1].copy()
+        region_mask = overlap_mask[min_row:max_row+1, min_col:max_col+1]
+        
+        # Set non-overlap areas to high cost
+        region_cost[~region_mask] = 1e9
+        
+        # Dynamic programming - scan left to right for horizontal seam
+        # dp[row, col] = minimum cost to reach (row, col) from left edge
+        dp = np.full((overlap_h, overlap_w), 1e9, dtype=np.float32)
+        dp[:, 0] = region_cost[:, 0]
+        
+        for col in range(1, overlap_w):
+            for row in range(overlap_h):
+                top = dp[max(0, row-1), col-1]
+                center = dp[row, col-1]
+                bottom = dp[min(overlap_h-1, row+1), col-1]
+                dp[row, col] = region_cost[row, col] + min(top, center, bottom)
+        
+        # Backtrack from right edge
+        seam_rows = np.zeros(overlap_w, dtype=int)
+        seam_rows[-1] = np.argmin(dp[:, -1])
+        
+        for col in range(overlap_w - 2, -1, -1):
+            row = seam_rows[col + 1]
+            top = dp[max(0, row-1), col] if row > 0 else 1e9
+            center = dp[row, col]
+            bottom = dp[min(overlap_h-1, row+1), col] if row < overlap_h - 1 else 1e9
+            
+            min_val = min(top, center, bottom)
+            if top == min_val and row > 0:
+                seam_rows[col] = row - 1
+            elif bottom == min_val and row < overlap_h - 1:
+                seam_rows[col] = row + 1
+            else:
+                seam_rows[col] = row
+        
+        # Create mask: pixels below seam use img2
+        for col in range(overlap_w):
+            seam_row = seam_rows[col]
+            seam_mask[min_row + seam_row:max_row + 1, min_col + col] = True
+        
+        # Only apply within overlap
+        seam_mask = seam_mask & overlap_mask
+        
+        return seam_mask
+    
+    def _autocrop_to_content(
+        self,
+        panorama: np.ndarray,
+        filled_mask: np.ndarray
+    ) -> np.ndarray:
+        """Auto-crop panorama to actual content, removing empty borders"""
+        # Find content bounds
+        rows_with_content = np.any(filled_mask > 0, axis=1)
+        cols_with_content = np.any(filled_mask > 0, axis=0)
+        
+        if not np.any(rows_with_content) or not np.any(cols_with_content):
+            logger.warning("No content found in panorama, returning as-is")
+            return panorama
+        
+        row_indices = np.where(rows_with_content)[0]
+        col_indices = np.where(cols_with_content)[0]
+        
+        min_row, max_row = row_indices[0], row_indices[-1]
+        min_col, max_col = col_indices[0], col_indices[-1]
+        
+        # Add small padding (2 pixels) to avoid cutting edge pixels
+        padding = 2
+        min_row = max(0, min_row - padding)
+        max_row = min(panorama.shape[0] - 1, max_row + padding)
+        min_col = max(0, min_col - padding)
+        max_col = min(panorama.shape[1] - 1, max_col + padding)
+        
+        cropped = panorama[min_row:max_row + 1, min_col:max_col + 1]
+        
+        original_size = panorama.shape[0] * panorama.shape[1]
+        cropped_size = cropped.shape[0] * cropped.shape[1]
+        reduction = (1 - cropped_size / original_size) * 100
+        
+        logger.info(f"Auto-cropped: {panorama.shape[1]}x{panorama.shape[0]} -> {cropped.shape[1]}x{cropped.shape[0]} ({reduction:.1f}% reduction)")
+        
+        return cropped
     
     def _multiband_blend(self, aligned_images: List[Dict], options: Dict) -> np.ndarray:
         """Multi-band blending for seamless transitions (memory-optimized)"""

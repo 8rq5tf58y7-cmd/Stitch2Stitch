@@ -249,6 +249,53 @@ class MainWindow(QMainWindow):
         )
         settings_layout.addWidget(self.memory_efficient_checkbox)
         
+        # Matching memory optimization
+        match_mem_layout = QHBoxLayout()
+        match_mem_layout.addWidget(QLabel("Matching Memory:"))
+        self.matching_memory_combo = QComboBox()
+        self.matching_memory_combo.addItems([
+            "Balanced (Recommended)",
+            "Quality First",
+            "Minimal Memory",
+            "Standard (No Optimization)"
+        ])
+        self.matching_memory_combo.setCurrentIndex(0)
+        self.matching_memory_combo.setToolTip(
+            "Memory optimization for feature matching:\n"
+            "• Balanced: PCA compression + cascade filter (~60% savings)\n"
+            "• Quality First: PCA only, all pairs matched (~30% savings)\n"
+            "• Minimal Memory: Maximum optimization + disk caching (~80% savings)\n"
+            "• Standard: No optimization (use if matching seems incorrect)"
+        )
+        match_mem_layout.addWidget(self.matching_memory_combo)
+        settings_layout.addLayout(match_mem_layout)
+        
+        # Duplicate detection
+        dup_layout = QHBoxLayout()
+        self.remove_duplicates_checkbox = QCheckBox("Remove Duplicates")
+        self.remove_duplicates_checkbox.setChecked(False)
+        self.remove_duplicates_checkbox.setToolTip(
+            "Pre-scan images to detect and remove duplicates/similar photos.\n"
+            "Reduces memory usage and improves stitching quality.\n"
+            "Uses perceptual hashing and histogram comparison."
+        )
+        dup_layout.addWidget(self.remove_duplicates_checkbox)
+        
+        dup_layout.addWidget(QLabel("Threshold:"))
+        self.duplicate_threshold_spin = QDoubleSpinBox()
+        self.duplicate_threshold_spin.setRange(0.80, 0.99)
+        self.duplicate_threshold_spin.setSingleStep(0.01)
+        self.duplicate_threshold_spin.setValue(0.92)
+        self.duplicate_threshold_spin.setDecimals(2)
+        self.duplicate_threshold_spin.setToolTip(
+            "Similarity threshold for duplicate detection.\n"
+            "0.90 = 90% similar (catches more duplicates)\n"
+            "0.95 = 95% similar (only near-identical)\n"
+            "0.99 = 99% similar (only exact duplicates)"
+        )
+        dup_layout.addWidget(self.duplicate_threshold_spin)
+        settings_layout.addLayout(dup_layout)
+        
         # Feature detector
         detector_layout = QHBoxLayout()
         detector_layout.addWidget(QLabel("Feature Detector:"))
@@ -743,6 +790,12 @@ class MainWindow(QMainWindow):
             max_warp_pixels = max_warp_mp * 1_000_000 if max_warp_mp > 0 else None
             
             memory_efficient = self.memory_efficient_checkbox.isChecked()
+            remove_duplicates = self.remove_duplicates_checkbox.isChecked()
+            duplicate_threshold = self.duplicate_threshold_spin.value()
+            
+            # Get matching memory mode from combo box
+            matching_memory_modes = ['balanced', 'quality', 'minimal', 'standard']
+            matching_memory_mode = matching_memory_modes[self.matching_memory_combo.currentIndex()]
             
             self.stitcher = ImageStitcher(
                 use_gpu=use_gpu,
@@ -756,9 +809,13 @@ class MainWindow(QMainWindow):
                 allow_scale=allow_scale,
                 max_panorama_pixels=max_panorama_pixels,
                 max_warp_pixels=max_warp_pixels,
-                memory_efficient=memory_efficient
+                memory_efficient=memory_efficient,
+                remove_duplicates=remove_duplicates,
+                duplicate_threshold=duplicate_threshold,
+                matching_memory_mode=matching_memory_mode
             )
-            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient})")
+            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, "
+                       f"memory_efficient={memory_efficient}, matching_mode={matching_memory_mode})")
         except Exception as e:
             logger.error(f"Failed to initialize stitcher: {e}", exc_info=True)
             raise
