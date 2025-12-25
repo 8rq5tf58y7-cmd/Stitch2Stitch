@@ -325,14 +325,15 @@ class ImageAligner:
     def _fix_linear_layout(
         self,
         transforms: Dict[int, np.ndarray],
-        n_images: int
+        n_images: int,
+        images_data: List[Dict] = None
     ) -> Dict[int, np.ndarray]:
         """
         Detect and fix linear layouts (all images on one horizontal line).
         
         For burst photos scanned in rows, the feature matching often only finds
         horizontal connections (1-2-3-4...) missing the vertical/row transitions.
-        This detects that pattern and reorganizes into a 2D grid.
+        This detects that pattern and reorganizes into a 2D grid WITH PROPER OVERLAP.
         """
         if len(transforms) < 4:
             return transforms
@@ -349,32 +350,35 @@ class ImageAligner:
         # If Y range is very small compared to X range, layout is linear
         if x_range > 0 and y_range / max(x_range, 1) < 0.15:
             logger.warning(f"Detected LINEAR layout: Y range={y_range:.0f}, X range={x_range:.0f}")
-            logger.info("Reorganizing into 2D grid based on image sequence...")
+            logger.info("Reorganizing into 2D grid with overlap...")
             
-            # Estimate grid dimensions - assume roughly square aspect ratio for the final result
-            # For burst photos, estimate based on typical scanning patterns
+            # Estimate grid dimensions
             grid_cols = int(np.ceil(np.sqrt(n_images * 1.5)))  # Wider than tall
             grid_rows = int(np.ceil(n_images / grid_cols))
             
             logger.info(f"Creating {grid_rows} rows x {grid_cols} columns grid")
             
-            # Calculate spacing from the average horizontal distance between images
+            # Calculate the actual horizontal spacing from feature matches
+            # This tells us how much images actually overlap
             x_sorted = sorted(positions, key=lambda p: p[1])
             if len(x_sorted) > 1:
-                # Get median spacing between adjacent images
                 spacings = []
                 for i in range(min(len(x_sorted) - 1, grid_cols * 2)):
                     spacing = x_sorted[i + 1][1] - x_sorted[i][1]
                     if spacing > 0:
                         spacings.append(spacing)
-                avg_spacing = np.median(spacings) if spacings else 1000
+                horizontal_spacing = np.median(spacings) if spacings else 1000
             else:
-                avg_spacing = 1000
+                horizontal_spacing = 1000
             
-            # Ensure reasonable spacing
-            avg_spacing = max(100, min(avg_spacing, 10000))
+            # The horizontal_spacing represents the actual offset between images
+            # This already accounts for overlap! We should use the same spacing vertically
+            # to maintain consistent overlap in both directions
+            vertical_spacing = horizontal_spacing  # Same overlap ratio for Y
             
-            # Reorganize positions in 2D grid, following image index order
+            logger.info(f"Using spacing: {horizontal_spacing:.0f}px horizontal, {vertical_spacing:.0f}px vertical")
+            
+            # Reorganize positions in 2D grid with proper overlap
             new_transforms = {}
             sorted_by_idx = sorted(positions, key=lambda p: p[0])
             
@@ -382,12 +386,13 @@ class ImageAligner:
                 row = seq_idx // grid_cols
                 col = seq_idx % grid_cols
                 
-                # Snake pattern: alternate direction each row (common in scanning)
+                # Snake pattern: alternate direction each row
                 if row % 2 == 1:
                     col = grid_cols - 1 - col
                 
-                new_x = col * avg_spacing
-                new_y = row * avg_spacing
+                # Use the feature-derived spacing (which accounts for overlap)
+                new_x = col * horizontal_spacing
+                new_y = row * vertical_spacing
                 
                 # Preserve rotation/scale from original transform
                 old_transform = transforms[img_idx]

@@ -136,17 +136,27 @@ class ImageBlender:
             
             h, w = img.shape[:2]
             
-            # Create content mask efficiently
+            # Create content mask - detect actual image content (not black borders)
             if alpha is not None:
                 alpha_mask = alpha > 127
             else:
                 alpha_mask = np.ones((h, w), dtype=bool)
             
-            # Filter warp artifacts
+            # ALWAYS filter black/near-black pixels (common in photos and scans)
+            if len(img.shape) == 3:
+                # Detect black borders: pixels where ALL channels are very dark
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                # Content threshold: > 15 to catch actual content (not pure black borders)
+                content_mask = gray > 15
+                alpha_mask = alpha_mask & content_mask
+                
+                # Also filter very bright pixels (overexposed borders)
+                alpha_mask = alpha_mask & (gray < 250)
+            
+            # Additional filtering for warped images (catch interpolation artifacts)
             if was_warped and len(img.shape) == 3:
-                # Use max channel for faster intensity check
                 intensity = np.max(img, axis=2)
-                alpha_mask = alpha_mask & (intensity > 10) & (intensity < 250)
+                alpha_mask = alpha_mask & (intensity > 10)
             
             bbox_img = img_data.get('bbox', (0, 0, w, h))
             x_off = bbox_img[0] - x_min
@@ -185,12 +195,58 @@ class ImageBlender:
             # Free alpha_mask memory
             del alpha_mask, write_mask
         
+        # Auto-crop to remove white borders (unfilled areas)
+        panorama = self._autocrop_panorama(panorama, filled_mask)
+        
         # Cleanup
         del filled_mask
         gc.collect()
         
         logger.info("Blending complete")
         return panorama
+    
+    def _autocrop_panorama(self, panorama: np.ndarray, filled_mask: np.ndarray) -> np.ndarray:
+        """
+        Auto-crop panorama to remove unfilled borders.
+        
+        Args:
+            panorama: The blended panorama
+            filled_mask: Mask showing which pixels were filled
+            
+        Returns:
+            Cropped panorama with borders removed
+        """
+        # Find content bounds from filled mask
+        rows_with_content = np.any(filled_mask > 0, axis=1)
+        cols_with_content = np.any(filled_mask > 0, axis=0)
+        
+        if not np.any(rows_with_content) or not np.any(cols_with_content):
+            logger.warning("No content found in panorama, returning as-is")
+            return panorama
+        
+        row_indices = np.where(rows_with_content)[0]
+        col_indices = np.where(cols_with_content)[0]
+        
+        min_row, max_row = row_indices[0], row_indices[-1]
+        min_col, max_col = col_indices[0], col_indices[-1]
+        
+        # Add small padding (5 pixels) for safety
+        padding = 5
+        min_row = max(0, min_row - padding)
+        max_row = min(panorama.shape[0] - 1, max_row + padding)
+        min_col = max(0, min_col - padding)
+        max_col = min(panorama.shape[1] - 1, max_col + padding)
+        
+        cropped = panorama[min_row:max_row + 1, min_col:max_col + 1]
+        
+        original_size = panorama.shape[0] * panorama.shape[1]
+        cropped_size = cropped.shape[0] * cropped.shape[1]
+        
+        if cropped_size < original_size:
+            reduction = (1 - cropped_size / original_size) * 100
+            logger.info(f"Auto-cropped: {panorama.shape[1]}x{panorama.shape[0]} -> {cropped.shape[1]}x{cropped.shape[0]} ({reduction:.1f}% reduction)")
+        
+        return cropped
     
     def _multiband_blend(self, aligned_images: List[Dict], options: Dict) -> np.ndarray:
         """Multi-band blending for seamless transitions (memory-optimized)"""
