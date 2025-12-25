@@ -164,24 +164,49 @@ class ImageAligner:
         pts2: np.ndarray
     ) -> Optional[np.ndarray]:
         """
-        Estimate similarity transform from pts1 to pts2
+        Estimate similarity transform from pts1 to pts2 with robust outlier rejection.
         
         Similarity transform has 4 DOF: translation (tx, ty), uniform scale (s), rotation (θ)
         Matrix form: [[s*cos(θ), -s*sin(θ), tx],
                       [s*sin(θ),  s*cos(θ), ty],
                       [0,         0,         1]]
+        
+        Uses multiple rounds of RANSAC with decreasing threshold for thorough outlier removal.
         """
-        if len(pts1) < 2:
+        if len(pts1) < 4:
             return None
         
-        # Use OpenCV's estimateAffinePartial2D for similarity transform estimation
+        # Multi-round RANSAC with decreasing threshold for robust estimation
+        current_pts1 = pts1.copy()
+        current_pts2 = pts2.copy()
+        best_transform = None
+        best_inlier_count = 0
+        
+        # Round 1: Coarse estimation (loose threshold)
         similarity, inliers = cv2.estimateAffinePartial2D(
-            pts1, pts2,
+            current_pts1, current_pts2,
             method=cv2.RANSAC,
-            ransacReprojThreshold=3.0,
-            confidence=0.995,
-            maxIters=2000
+            ransacReprojThreshold=5.0,  # Looser threshold first
+            confidence=0.99,
+            maxIters=1000
         )
+        
+        if similarity is not None and inliers is not None:
+            # Keep only inliers for refinement
+            inlier_mask = inliers.ravel().astype(bool)
+            if np.sum(inlier_mask) >= 4:
+                current_pts1 = current_pts1[inlier_mask]
+                current_pts2 = current_pts2[inlier_mask]
+        
+        # Round 2: Fine estimation (strict threshold)
+        if len(current_pts1) >= 4:
+            similarity, inliers = cv2.estimateAffinePartial2D(
+                current_pts1, current_pts2,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=2.5,  # Stricter threshold
+                confidence=0.995,
+                maxIters=2000
+            )
         
         if similarity is None:
             logger.warning("Failed to estimate similarity transform")
@@ -190,6 +215,7 @@ class ImageAligner:
         # Validate transform
         scale = np.sqrt(similarity[0, 0]**2 + similarity[0, 1]**2)
         rotation = np.arctan2(similarity[1, 0], similarity[0, 0])
+        rotation_deg = np.degrees(rotation)
         
         # Check scale bounds
         if not self.allow_scale:
@@ -203,14 +229,41 @@ class ImageAligner:
                 logger.warning(f"Scale {scale:.3f} out of range, rejecting transform")
                 return None
         
-        # Rotation is allowed - no limits (images may be rotated)
+        # Rotation is allowed - but warn for large rotations
+        if abs(rotation_deg) > 45:
+            logger.info(f"Large rotation detected: {rotation_deg:.1f}°")
         
         # Check inlier ratio
         if inliers is not None:
-            inlier_ratio = np.sum(inliers) / len(pts1)
-            if inlier_ratio < 0.3:
-                logger.warning(f"Low inlier ratio {inlier_ratio:.1%}, rejecting transform")
+            inlier_count = np.sum(inliers)
+            inlier_ratio = inlier_count / len(pts1)  # Use original point count
+            if inlier_ratio < 0.25:  # Stricter threshold (was 0.3)
+                logger.warning(f"Low inlier ratio {inlier_ratio:.1%} ({inlier_count}/{len(pts1)}), rejecting transform")
                 return None
+            
+            logger.debug(f"Transform validated: scale={scale:.3f}, rotation={rotation_deg:.1f}°, inliers={inlier_count}/{len(pts1)} ({inlier_ratio:.1%})")
+        
+        # Compute reprojection error for quality assessment
+        if inliers is not None:
+            inlier_mask = inliers.ravel().astype(bool)
+            if np.any(inlier_mask):
+                pts1_inliers = current_pts1[inlier_mask] if len(current_pts1) == len(inlier_mask) else current_pts1
+                pts2_inliers = current_pts2[inlier_mask] if len(current_pts2) == len(inlier_mask) else current_pts2
+                
+                if len(pts1_inliers) > 0:
+                    # Transform pts1 and compute distance to pts2
+                    pts1_h = np.hstack([pts1_inliers, np.ones((len(pts1_inliers), 1))])
+                    projected = (similarity @ pts1_h.T).T
+                    errors = np.linalg.norm(projected - pts2_inliers, axis=1)
+                    mean_error = np.mean(errors)
+                    max_error = np.max(errors)
+                    
+                    # Reject if error is too high
+                    if mean_error > 10.0:  # pixels
+                        logger.warning(f"High reprojection error: mean={mean_error:.1f}px, max={max_error:.1f}px")
+                        return None
+                    
+                    logger.debug(f"Reprojection error: mean={mean_error:.2f}px, max={max_error:.2f}px")
         
         # Convert 2x3 to 3x3
         transform = np.vstack([similarity, [0, 0, 1]])
@@ -316,95 +369,6 @@ class ImageAligner:
                     [0, 1, 0],
                     [0, 0, 1]
                 ], dtype=np.float64)
-        
-        # Check if layout is too linear (all on one row) and needs 2D correction
-        transforms = self._fix_linear_layout(transforms, n_images)
-        
-        return transforms
-    
-    def _fix_linear_layout(
-        self,
-        transforms: Dict[int, np.ndarray],
-        n_images: int,
-        images_data: List[Dict] = None
-    ) -> Dict[int, np.ndarray]:
-        """
-        Detect and fix linear layouts (all images on one horizontal line).
-        
-        For burst photos scanned in rows, the feature matching often only finds
-        horizontal connections (1-2-3-4...) missing the vertical/row transitions.
-        This detects that pattern and reorganizes into a 2D grid WITH PROPER OVERLAP.
-        """
-        if len(transforms) < 4:
-            return transforms
-        
-        # Get all positions
-        positions = [(i, transforms[i][0, 2], transforms[i][1, 2]) for i in sorted(transforms.keys())]
-        
-        y_values = [p[2] for p in positions]
-        x_values = [p[1] for p in positions]
-        
-        y_range = max(y_values) - min(y_values) if y_values else 0
-        x_range = max(x_values) - min(x_values) if x_values else 1
-        
-        # If Y range is very small compared to X range, layout is linear
-        if x_range > 0 and y_range / max(x_range, 1) < 0.15:
-            logger.warning(f"Detected LINEAR layout: Y range={y_range:.0f}, X range={x_range:.0f}")
-            logger.info("Reorganizing into 2D grid with overlap...")
-            
-            # Estimate grid dimensions
-            grid_cols = int(np.ceil(np.sqrt(n_images * 1.5)))  # Wider than tall
-            grid_rows = int(np.ceil(n_images / grid_cols))
-            
-            logger.info(f"Creating {grid_rows} rows x {grid_cols} columns grid")
-            
-            # Calculate the actual horizontal spacing from feature matches
-            # This tells us how much images actually overlap
-            x_sorted = sorted(positions, key=lambda p: p[1])
-            if len(x_sorted) > 1:
-                spacings = []
-                for i in range(min(len(x_sorted) - 1, grid_cols * 2)):
-                    spacing = x_sorted[i + 1][1] - x_sorted[i][1]
-                    if spacing > 0:
-                        spacings.append(spacing)
-                horizontal_spacing = np.median(spacings) if spacings else 1000
-            else:
-                horizontal_spacing = 1000
-            
-            # The horizontal_spacing represents the actual offset between images
-            # This already accounts for overlap! We should use the same spacing vertically
-            # to maintain consistent overlap in both directions
-            vertical_spacing = horizontal_spacing  # Same overlap ratio for Y
-            
-            logger.info(f"Using spacing: {horizontal_spacing:.0f}px horizontal, {vertical_spacing:.0f}px vertical")
-            
-            # Reorganize positions in 2D grid with proper overlap
-            new_transforms = {}
-            sorted_by_idx = sorted(positions, key=lambda p: p[0])
-            
-            for seq_idx, (img_idx, old_x, old_y) in enumerate(sorted_by_idx):
-                row = seq_idx // grid_cols
-                col = seq_idx % grid_cols
-                
-                # Snake pattern: alternate direction each row
-                if row % 2 == 1:
-                    col = grid_cols - 1 - col
-                
-                # Use the feature-derived spacing (which accounts for overlap)
-                new_x = col * horizontal_spacing
-                new_y = row * vertical_spacing
-                
-                # Preserve rotation/scale from original transform
-                old_transform = transforms[img_idx]
-                new_transform = old_transform.copy()
-                new_transform[0, 2] = new_x
-                new_transform[1, 2] = new_y
-                new_transforms[img_idx] = new_transform
-                
-                if seq_idx < 8 or seq_idx >= n_images - 2:
-                    logger.debug(f"Image {img_idx}: grid[{row},{col}] -> ({new_x:.0f}, {new_y:.0f})")
-            
-            return new_transforms
         
         return transforms
     

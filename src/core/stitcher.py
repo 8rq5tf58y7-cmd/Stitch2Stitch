@@ -44,7 +44,10 @@ class ImageStitcher:
         allow_scale: bool = True,
         max_panorama_pixels: Optional[int] = 100_000_000,
         max_warp_pixels: Optional[int] = 50_000_000,
-        memory_efficient: bool = True
+        memory_efficient: bool = True,
+        geometric_verify: bool = True,
+        select_optimal_coverage: bool = False,
+        max_coverage_overlap: float = 0.5
     ):
         """
         Initialize the stitcher
@@ -69,6 +72,12 @@ class ImageStitcher:
                 Memory savings: ~70-90% during loading/feature detection phase
                 - Traditional: All images loaded at once (~3.6GB for 100x 36MB images)
                 - Efficient: Thumbnails + compressed cache (~200-400MB)
+            geometric_verify: Enable geometric verification to filter bad feature matches
+                Uses RANSAC-based similarity transform estimation to reject outliers
+            select_optimal_coverage: Only use images necessary to cover the panorama area
+                Avoids redundant images that overlap >max_coverage_overlap with already-selected images
+            max_coverage_overlap: Maximum allowed overlap (0.0-1.0) between selected images
+                Lower values = fewer images, higher values = more redundancy
         """
         self.use_gpu = use_gpu
         self.quality_threshold = quality_threshold
@@ -78,6 +87,9 @@ class ImageStitcher:
         self.max_panorama_pixels = max_panorama_pixels
         self.max_warp_pixels = max_warp_pixels
         self.memory_efficient = memory_efficient
+        self.geometric_verify = geometric_verify
+        self.select_optimal_coverage = select_optimal_coverage
+        self.max_coverage_overlap = max_coverage_overlap
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
@@ -118,7 +130,8 @@ class ImageStitcher:
         logger.info(
             f"Stitcher initialized (GPU: {use_gpu}, "
             f"Detector: {feature_detector}, Matcher: {feature_matcher}, "
-            f"Blender: {blending_method}, Quality threshold: {quality_threshold})"
+            f"Blender: {blending_method}, Quality threshold: {quality_threshold}, "
+            f"Geometric verify: {geometric_verify}, Optimal coverage: {select_optimal_coverage})"
         )
     
     def _create_feature_detector(self, method: str, use_gpu: bool, max_features: int = 5000):
@@ -213,6 +226,17 @@ class ImageStitcher:
         
         if not matches:
             raise ValueError("No feature matches found between images")
+        
+        # Step 3.5: Select optimal coverage (remove redundant images)
+        if self.select_optimal_coverage:
+            self._check_cancel()
+            logger.info("Step 3.5: Selecting optimal image coverage...")
+            self._update_progress(65, "Selecting optimal image coverage...")
+            images_data, features_data, matches = self._select_optimal_images(
+                images_data, features_data, matches
+            )
+            gc.collect()
+            logger.info(f"After coverage selection: {len(images_data)} images")
         
         # Step 4: Align images (use control points if available)
         self._check_cancel()
@@ -1015,14 +1039,17 @@ class ImageStitcher:
     
     def _match_features(self, features_data: List[Dict]) -> List[Dict]:
         """
-        Match features between images.
+        Match features between images with geometric verification.
         
         For large image sets, uses windowed matching to avoid O(n²) complexity:
         - Small sets (≤20 images): Match all pairs
         - Large sets: Match nearby images + periodic jumps for row detection
+        
+        When geometric_verify is enabled, uses RANSAC to filter bad matches.
         """
         matches = []
         n_images = len(features_data)
+        rejected_count = 0
         
         # Check if matcher is a deep learning matcher that needs images
         from ml.advanced_matchers import LoFTRMatcher, SuperGlueMatcher, DISKMatcher
@@ -1063,34 +1090,185 @@ class ImageStitcher:
                 else:
                     desc1 = features_data[i]['descriptors']
                     desc2 = features_data[j]['descriptors']
+                    kp1 = features_data[i]['keypoints']
+                    kp2 = features_data[j]['keypoints']
                     
                     if desc1 is None or desc2 is None:
                         continue
                     if len(desc1) == 0 or len(desc2) == 0:
                         continue
                     
-                    match_result = self.matcher.match(desc1, desc2)
+                    # Use geometric verification if enabled
+                    if self.geometric_verify and hasattr(self.matcher, 'match_with_keypoints'):
+                        match_result = self.matcher.match_with_keypoints(kp1, desc1, kp2, desc2)
+                    else:
+                        match_result = self.matcher.match(desc1, desc2)
+                
+                # Check if match was rejected by geometric verification
+                if match_result.get('rejected_reason'):
+                    logger.debug(f"Pair ({i}, {j}): rejected - {match_result['rejected_reason']}")
+                    rejected_count += 1
+                    continue
                 
                 num_matches = match_result.get('num_matches', 0) if match_result else 0
+                inlier_ratio = match_result.get('inlier_ratio', 1.0)
                 
                 if num_matches > 0:
-                    logger.debug(f"Pair ({i}, {j}): {num_matches} matches, confidence: {match_result.get('confidence', 0.0):.4f}")
+                    logger.debug(f"Pair ({i}, {j}): {num_matches} matches, confidence: {match_result.get('confidence', 0.0):.4f}, inlier ratio: {inlier_ratio:.1%}")
                 
-                # Require at least 15 matches
-                if match_result and num_matches >= 15:
+                # Require at least 15 matches (or 12 if geometric verified with high inlier ratio)
+                min_matches = 12 if inlier_ratio > 0.6 else 15
+                if match_result and num_matches >= min_matches:
                     matches.append({
                         'image_i': i,
                         'image_j': j,
                         'matches': match_result.get('matches', []),
                         'num_matches': num_matches,
-                        'confidence': match_result.get('confidence', 0.0)
+                        'confidence': match_result.get('confidence', 0.0),
+                        'inliers': match_result.get('inliers', num_matches),
+                        'inlier_ratio': inlier_ratio
                     })
             except Exception as e:
                 logger.error(f"Error matching pair ({i}, {j}): {e}")
                 continue
         
+        if rejected_count > 0:
+            logger.info(f"Geometric verification rejected {rejected_count} bad matches")
         logger.info(f"Found {len(matches)} valid matches from {total_pairs} pairs checked")
         return matches
+    
+    def _select_optimal_images(
+        self,
+        images_data: List[Dict],
+        features_data: List[Dict],
+        matches: List[Dict]
+    ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+        """
+        Select only images necessary to cover the panorama area without redundancy.
+        
+        Uses a greedy algorithm to build a spanning set of images:
+        1. Start with the most connected image (best reference)
+        2. Add images that extend coverage without too much overlap
+        3. Stop when all connected areas are covered
+        
+        Args:
+            images_data: List of image data dictionaries
+            features_data: List of feature data dictionaries
+            matches: List of match dictionaries
+            
+        Returns:
+            Filtered (images_data, features_data, matches)
+        """
+        if len(images_data) <= 3:
+            return images_data, features_data, matches
+        
+        n_images = len(images_data)
+        
+        # Build overlap graph (how much each pair overlaps)
+        overlap_graph = {}
+        connection_count = [0] * n_images
+        
+        for match in matches:
+            i = match['image_i']
+            j = match['image_j']
+            
+            # Estimate overlap from match confidence and count
+            confidence = match.get('confidence', 0.0)
+            inlier_ratio = match.get('inlier_ratio', 0.5)
+            num_matches = match.get('num_matches', 0)
+            
+            # Higher confidence + more matches = more overlap
+            overlap_estimate = min(confidence * inlier_ratio * 2, 1.0)
+            
+            overlap_graph[(i, j)] = overlap_estimate
+            overlap_graph[(j, i)] = overlap_estimate
+            connection_count[i] += 1
+            connection_count[j] += 1
+        
+        # Start with the most connected image
+        selected = set()
+        start_idx = max(range(n_images), key=lambda x: connection_count[x])
+        selected.add(start_idx)
+        
+        # Track which images we've already considered for coverage
+        coverage_provided = {start_idx}
+        
+        logger.info(f"Coverage selection starting from image {start_idx} ({connection_count[start_idx]} connections)")
+        
+        # Iteratively add images that extend coverage
+        max_iterations = n_images
+        for iteration in range(max_iterations):
+            best_candidate = None
+            best_score = -1
+            
+            for idx in range(n_images):
+                if idx in selected:
+                    continue
+                
+                # Check if this image connects to the selected set
+                connects_to_selected = False
+                max_overlap_with_selected = 0.0
+                
+                for sel_idx in selected:
+                    key = (idx, sel_idx)
+                    if key in overlap_graph:
+                        connects_to_selected = True
+                        max_overlap_with_selected = max(max_overlap_with_selected, overlap_graph[key])
+                
+                if not connects_to_selected:
+                    continue
+                
+                # Skip if too much overlap with existing selection (redundant)
+                if max_overlap_with_selected > self.max_coverage_overlap:
+                    logger.debug(f"Image {idx}: skipping - {max_overlap_with_selected:.1%} overlap exceeds max {self.max_coverage_overlap:.1%}")
+                    continue
+                
+                # Score based on: connections to non-selected (extends coverage) - overlap with selected (redundancy)
+                connections_to_new = sum(1 for k in range(n_images) if k not in selected and (idx, k) in overlap_graph)
+                
+                # Higher score = better candidate
+                score = connections_to_new + (1.0 - max_overlap_with_selected) * 2
+                
+                if score > best_score:
+                    best_score = score
+                    best_candidate = idx
+            
+            if best_candidate is None:
+                # No more candidates that connect and don't overlap too much
+                break
+            
+            selected.add(best_candidate)
+            logger.debug(f"Added image {best_candidate} (score: {best_score:.2f})")
+        
+        # Ensure we have at least the minimum connected set
+        if len(selected) < 2:
+            logger.warning("Coverage selection resulted in too few images, using all connected images")
+            selected = set(i for i in range(n_images) if connection_count[i] > 0)
+        
+        # Build index mapping
+        selected_list = sorted(selected)
+        index_map = {old: new for new, old in enumerate(selected_list)}
+        
+        # Filter data
+        new_images = [images_data[i] for i in selected_list]
+        new_features = [features_data[i] for i in selected_list]
+        
+        # Filter and remap matches
+        new_matches = []
+        for match in matches:
+            i = match['image_i']
+            j = match['image_j']
+            if i in index_map and j in index_map:
+                new_match = match.copy()
+                new_match['image_i'] = index_map[i]
+                new_match['image_j'] = index_map[j]
+                new_matches.append(new_match)
+        
+        removed = n_images - len(selected)
+        if removed > 0:
+            logger.info(f"Coverage selection: using {len(selected)}/{n_images} images (removed {removed} redundant)")
+        
+        return new_images, new_features, new_matches
     
     def _get_smart_matching_pairs(self, n_images: int) -> List[Tuple[int, int]]:
         """

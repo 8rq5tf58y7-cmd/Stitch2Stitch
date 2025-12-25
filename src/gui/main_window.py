@@ -279,6 +279,49 @@ class MainWindow(QMainWindow):
         self.allow_scale_checkbox.setToolTip("Allow images to be scaled and rotated to match at overlaps.\nUseful when images have different resolutions, zoom levels, or orientations.")
         settings_layout.addWidget(self.allow_scale_checkbox)
         
+        # Match filtering group
+        filtering_group = QGroupBox("Match Filtering (Bad Link Removal)")
+        filtering_layout = QVBoxLayout()
+        
+        # Geometric verification checkbox
+        self.geo_verify_checkbox = QCheckBox("Geometric Verification")
+        self.geo_verify_checkbox.setChecked(True)
+        self.geo_verify_checkbox.setToolTip(
+            "Filter bad feature matches using RANSAC-based geometric verification.\n"
+            "Removes matches that don't fit a consistent spatial transformation.\n"
+            "Recommended: ON for better alignment accuracy."
+        )
+        filtering_layout.addWidget(self.geo_verify_checkbox)
+        
+        # Optimal coverage checkbox with threshold
+        coverage_layout = QHBoxLayout()
+        self.optimal_coverage_checkbox = QCheckBox("Select Optimal Coverage")
+        self.optimal_coverage_checkbox.setChecked(False)
+        self.optimal_coverage_checkbox.setToolTip(
+            "Only use images necessary to cover the panorama area.\n"
+            "Removes redundant images that overlap too much with already-selected images.\n"
+            "Useful for large image sets with many overlapping photos."
+        )
+        coverage_layout.addWidget(self.optimal_coverage_checkbox)
+        
+        coverage_layout.addWidget(QLabel("Max Overlap:"))
+        self.max_coverage_spin = QDoubleSpinBox()
+        self.max_coverage_spin.setRange(0.1, 0.9)
+        self.max_coverage_spin.setSingleStep(0.1)
+        self.max_coverage_spin.setValue(0.5)
+        self.max_coverage_spin.setDecimals(1)
+        self.max_coverage_spin.setToolTip(
+            "Maximum allowed overlap between selected images.\n"
+            "0.3 = 30% overlap max (fewer images, faster processing)\n"
+            "0.5 = 50% overlap max (balanced)\n"
+            "0.7 = 70% overlap max (more images, better coverage)"
+        )
+        coverage_layout.addWidget(self.max_coverage_spin)
+        filtering_layout.addLayout(coverage_layout)
+        
+        filtering_group.setLayout(filtering_layout)
+        settings_layout.addWidget(filtering_group)
+        
         # Feature matcher
         matcher_layout = QHBoxLayout()
         matcher_layout.addWidget(QLabel("Feature Matcher:"))
@@ -744,6 +787,11 @@ class MainWindow(QMainWindow):
             
             memory_efficient = self.memory_efficient_checkbox.isChecked()
             
+            # Match filtering options
+            geometric_verify = self.geo_verify_checkbox.isChecked()
+            select_optimal_coverage = self.optimal_coverage_checkbox.isChecked()
+            max_coverage_overlap = self.max_coverage_spin.value()
+            
             self.stitcher = ImageStitcher(
                 use_gpu=use_gpu,
                 quality_threshold=quality_threshold,
@@ -756,9 +804,12 @@ class MainWindow(QMainWindow):
                 allow_scale=allow_scale,
                 max_panorama_pixels=max_panorama_pixels,
                 max_warp_pixels=max_warp_pixels,
-                memory_efficient=memory_efficient
+                memory_efficient=memory_efficient,
+                geometric_verify=geometric_verify,
+                select_optimal_coverage=select_optimal_coverage,
+                max_coverage_overlap=max_coverage_overlap
             )
-            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient})")
+            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient}, geo_verify={geometric_verify}, optimal_coverage={select_optimal_coverage})")
         except Exception as e:
             logger.error(f"Failed to initialize stitcher: {e}", exc_info=True)
             raise

@@ -48,7 +48,7 @@ check_python() {
             if ! $PYTHON_CMD --version &> /dev/null; then
                 echo "Warning: python3 found but not working properly"
                 return 1
-            fi
+            
             return 0
         else
             echo "Python version $PYTHON_VERSION_INSTALLED is too old. Need 3.9 or higher."
