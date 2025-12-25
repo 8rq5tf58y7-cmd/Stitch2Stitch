@@ -321,6 +321,29 @@ class MainWindow(QMainWindow):
         smart_layout.addWidget(self.max_overlap_spin)
         settings_layout.addLayout(smart_layout)
         
+        # Grid layout specification (for 2D stitching)
+        grid_layout = QHBoxLayout()
+        self.grid_mode_checkbox = QCheckBox("Force 2D Grid")
+        self.grid_mode_checkbox.setChecked(False)
+        self.grid_mode_checkbox.setToolTip(
+            "Force images into a 2D grid layout.\n"
+            "Useful for burst photos scanned in rows.\n"
+            "Set columns = number of images per row."
+        )
+        grid_layout.addWidget(self.grid_mode_checkbox)
+        
+        grid_layout.addWidget(QLabel("Columns:"))
+        self.grid_cols_spin = QSpinBox()
+        self.grid_cols_spin.setRange(0, 100)
+        self.grid_cols_spin.setValue(0)
+        self.grid_cols_spin.setToolTip(
+            "Number of columns in the grid (0 = auto-detect).\n"
+            "Set this to the number of images per row.\n"
+            "Example: 20 photos in 4 rows = 5 columns"
+        )
+        grid_layout.addWidget(self.grid_cols_spin)
+        settings_layout.addLayout(grid_layout)
+        
         # Feature detector
         detector_layout = QHBoxLayout()
         detector_layout.addWidget(QLabel("Feature Detector:"))
@@ -824,6 +847,9 @@ class MainWindow(QMainWindow):
             matching_memory_modes = ['balanced', 'quality', 'minimal', 'standard']
             matching_memory_mode = matching_memory_modes[self.matching_memory_combo.currentIndex()]
             
+            force_grid = self.grid_mode_checkbox.isChecked()
+            grid_cols = self.grid_cols_spin.value()
+            
             self.stitcher = ImageStitcher(
                 use_gpu=use_gpu,
                 quality_threshold=quality_threshold,
@@ -841,7 +867,9 @@ class MainWindow(QMainWindow):
                 duplicate_threshold=duplicate_threshold,
                 matching_memory_mode=matching_memory_mode,
                 smart_select=smart_select,
-                max_overlap_percent=max_overlap_percent
+                max_overlap_percent=max_overlap_percent,
+                force_grid=force_grid,
+                grid_cols=grid_cols
             )
             logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, "
                        f"memory_efficient={memory_efficient}, matching_mode={matching_memory_mode})")

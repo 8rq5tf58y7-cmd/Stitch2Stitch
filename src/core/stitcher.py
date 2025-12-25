@@ -51,8 +51,10 @@ class ImageStitcher:
         remove_duplicates: bool = False,
         duplicate_threshold: float = 0.92,
         matching_memory_mode: str = 'balanced',
-        smart_select: bool = False,
-        max_overlap_percent: float = 25.0
+            smart_select: bool = False,
+        max_overlap_percent: float = 25.0,
+        force_grid: bool = False,
+        grid_cols: int = 0
     ):
         """
         Initialize the stitcher
@@ -92,6 +94,8 @@ class ImageStitcher:
                 - 25% = Standard (skip highly overlapping photos)
                 - 50% = Relaxed (keep more photos)
                 - 10% = Aggressive (skip more photos)
+            force_grid: Force images into a 2D grid layout
+            grid_cols: Number of columns for grid (0 = auto-detect)
         """
         self.use_gpu = use_gpu
         self.quality_threshold = quality_threshold
@@ -106,6 +110,8 @@ class ImageStitcher:
         self.matching_memory_mode = matching_memory_mode
         self.smart_select = smart_select
         self.max_overlap_percent = max_overlap_percent
+        self.force_grid = force_grid
+        self.grid_cols = grid_cols if grid_cols > 0 else None
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
@@ -152,7 +158,9 @@ class ImageStitcher:
         self.aligner = ImageAligner(
             use_gpu=use_gpu, 
             allow_scale=allow_scale,
-            max_warp_pixels=max_warp_pixels
+            max_warp_pixels=max_warp_pixels,
+            force_grid=force_grid,
+            grid_cols=self.grid_cols
         )
         
         # Initialize control point manager (PTGui-style)
