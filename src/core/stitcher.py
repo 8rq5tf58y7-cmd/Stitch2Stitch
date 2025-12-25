@@ -21,6 +21,7 @@ from core.pixelstitch_blender import PixelStitchBlender
 from core.control_points import ControlPointManager
 from utils.memory_manager import MemoryManager
 from utils.lazy_loader import LazyImageLoader, ImageProxy, estimate_memory_for_images
+from utils.duplicate_detector import DuplicateDetector
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,9 @@ class ImageStitcher:
         memory_efficient: bool = True,
         geometric_verify: bool = True,
         select_optimal_coverage: bool = False,
-        max_coverage_overlap: float = 0.5
+        max_coverage_overlap: float = 0.5,
+        remove_duplicates: bool = True,
+        duplicate_threshold: float = 0.92
     ):
         """
         Initialize the stitcher
@@ -78,6 +81,10 @@ class ImageStitcher:
                 Avoids redundant images that overlap >max_coverage_overlap with already-selected images
             max_coverage_overlap: Maximum allowed overlap (0.0-1.0) between selected images
                 Lower values = fewer images, higher values = more redundancy
+            remove_duplicates: Enable duplicate/similar image removal for burst photos
+                Removes nearly identical frames to reduce processing and improve alignment
+            duplicate_threshold: Similarity threshold (0.0-1.0) for duplicate detection
+                0.92 = very strict (only near-identical), 0.85 = moderate, 0.75 = aggressive
         """
         self.use_gpu = use_gpu
         self.quality_threshold = quality_threshold
@@ -90,6 +97,8 @@ class ImageStitcher:
         self.geometric_verify = geometric_verify
         self.select_optimal_coverage = select_optimal_coverage
         self.max_coverage_overlap = max_coverage_overlap
+        self.remove_duplicates = remove_duplicates
+        self.duplicate_threshold = duplicate_threshold
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
@@ -209,6 +218,19 @@ class ImageStitcher:
             raise ValueError("No images passed quality assessment")
         
         logger.info(f"Selected {len(images_data)} high-quality images out of {len(image_paths)}")
+        
+        # Step 1.5: Remove duplicate/similar images (for burst photos)
+        if self.remove_duplicates and len(images_data) > 2:
+            self._check_cancel()
+            logger.info("Step 1.5: Removing duplicate images...")
+            self._update_progress(20, "Detecting and removing duplicate images...")
+            images_data = self._remove_duplicate_images(images_data)
+            gc.collect()
+            
+            if len(images_data) < 2:
+                raise ValueError("Too few unique images after duplicate removal")
+            
+            logger.info(f"After duplicate removal: {len(images_data)} unique images")
         
         # Step 2: Detect features
         self._check_cancel()
@@ -644,6 +666,48 @@ class ImageStitcher:
         # Fallback to OpenCV
         cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, quality])
         logger.info(f"JPEG saved with quality={quality} (dpi not embedded)")
+    
+    def _remove_duplicate_images(self, images_data: List[Dict]) -> List[Dict]:
+        """
+        Remove duplicate/similar images from burst photo sets.
+        
+        Uses perceptual hashing and pixel-level similarity to identify
+        near-identical frames that would only add redundancy.
+        """
+        if len(images_data) <= 2:
+            return images_data
+        
+        # Create detector with progress callback
+        detector = DuplicateDetector(
+            similarity_threshold=self.duplicate_threshold,
+            hash_size=16,
+            comparison_window=30,  # Compare with nearby images (efficient for burst)
+            progress_callback=self._update_progress
+        )
+        
+        # Extract images and paths for comparison
+        images = [d['image'] for d in images_data]
+        paths = [d.get('path') for d in images_data]
+        
+        # Find and remove duplicates
+        keep_indices, duplicate_pairs = detector.find_duplicates(images, paths)
+        
+        # Log duplicate statistics
+        if duplicate_pairs:
+            logger.info(f"Found {len(duplicate_pairs)} duplicate pairs")
+            for idx1, idx2, sim in duplicate_pairs[:5]:  # Show first 5
+                name1 = paths[idx1].name if paths[idx1] else f"image_{idx1}"
+                name2 = paths[idx2].name if paths[idx2] else f"image_{idx2}"
+                logger.debug(f"  {name2} is duplicate of {name1} (similarity={sim:.3f})")
+        
+        # Filter to keep only unique images
+        filtered_data = [images_data[i] for i in keep_indices]
+        
+        removed_count = len(images_data) - len(filtered_data)
+        if removed_count > 0:
+            self._update_progress(25, f"Removed {removed_count} duplicate images")
+        
+        return filtered_data
     
     def _load_and_assess_images(self, image_paths: List[Path]) -> List[Dict]:
         """Load images and assess quality (with optional memory-efficient mode)"""

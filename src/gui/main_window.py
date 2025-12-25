@@ -319,6 +319,32 @@ class MainWindow(QMainWindow):
         coverage_layout.addWidget(self.max_coverage_spin)
         filtering_layout.addLayout(coverage_layout)
         
+        # Duplicate detection for burst photos
+        dup_layout = QHBoxLayout()
+        self.remove_duplicates_checkbox = QCheckBox("Remove Duplicate Images")
+        self.remove_duplicates_checkbox.setChecked(True)
+        self.remove_duplicates_checkbox.setToolTip(
+            "Remove duplicate/similar images from burst photo sets.\n"
+            "Improves alignment by removing redundant frames.\n"
+            "Recommended: ON for burst mode photos."
+        )
+        dup_layout.addWidget(self.remove_duplicates_checkbox)
+        
+        dup_layout.addWidget(QLabel("Threshold:"))
+        self.duplicate_threshold_spin = QDoubleSpinBox()
+        self.duplicate_threshold_spin.setRange(0.70, 0.98)
+        self.duplicate_threshold_spin.setSingleStep(0.02)
+        self.duplicate_threshold_spin.setValue(0.92)
+        self.duplicate_threshold_spin.setDecimals(2)
+        self.duplicate_threshold_spin.setToolTip(
+            "Similarity threshold for duplicate detection.\n"
+            "0.92 = Strict (only near-identical frames)\n"
+            "0.85 = Moderate (similar frames merged)\n"
+            "0.75 = Aggressive (more frames removed)"
+        )
+        dup_layout.addWidget(self.duplicate_threshold_spin)
+        filtering_layout.addLayout(dup_layout)
+        
         filtering_group.setLayout(filtering_layout)
         settings_layout.addWidget(filtering_group)
         
@@ -792,6 +818,10 @@ class MainWindow(QMainWindow):
             select_optimal_coverage = self.optimal_coverage_checkbox.isChecked()
             max_coverage_overlap = self.max_coverage_spin.value()
             
+            # Duplicate detection options
+            remove_duplicates = self.remove_duplicates_checkbox.isChecked()
+            duplicate_threshold = self.duplicate_threshold_spin.value()
+            
             self.stitcher = ImageStitcher(
                 use_gpu=use_gpu,
                 quality_threshold=quality_threshold,
@@ -807,9 +837,11 @@ class MainWindow(QMainWindow):
                 memory_efficient=memory_efficient,
                 geometric_verify=geometric_verify,
                 select_optimal_coverage=select_optimal_coverage,
-                max_coverage_overlap=max_coverage_overlap
+                max_coverage_overlap=max_coverage_overlap,
+                remove_duplicates=remove_duplicates,
+                duplicate_threshold=duplicate_threshold
             )
-            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient}, geo_verify={geometric_verify}, optimal_coverage={select_optimal_coverage})")
+            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient}, geo_verify={geometric_verify}, optimal_coverage={select_optimal_coverage}, remove_dups={remove_duplicates})")
         except Exception as e:
             logger.error(f"Failed to initialize stitcher: {e}", exc_info=True)
             raise
