@@ -249,101 +249,6 @@ class MainWindow(QMainWindow):
         )
         settings_layout.addWidget(self.memory_efficient_checkbox)
         
-        # Matching memory optimization
-        match_mem_layout = QHBoxLayout()
-        match_mem_layout.addWidget(QLabel("Matching Memory:"))
-        self.matching_memory_combo = QComboBox()
-        self.matching_memory_combo.addItems([
-            "Balanced (Recommended)",
-            "Quality First",
-            "Minimal Memory",
-            "Standard (No Optimization)"
-        ])
-        self.matching_memory_combo.setCurrentIndex(0)
-        self.matching_memory_combo.setToolTip(
-            "Memory optimization for feature matching:\n"
-            "• Balanced: PCA compression + cascade filter (~60% savings)\n"
-            "• Quality First: PCA only, all pairs matched (~30% savings)\n"
-            "• Minimal Memory: Maximum optimization + disk caching (~80% savings)\n"
-            "• Standard: No optimization (use if matching seems incorrect)"
-        )
-        match_mem_layout.addWidget(self.matching_memory_combo)
-        settings_layout.addLayout(match_mem_layout)
-        
-        # Duplicate detection
-        dup_layout = QHBoxLayout()
-        self.remove_duplicates_checkbox = QCheckBox("Remove Duplicates")
-        self.remove_duplicates_checkbox.setChecked(False)
-        self.remove_duplicates_checkbox.setToolTip(
-            "Pre-scan images to detect and remove duplicates/similar photos.\n"
-            "Reduces memory usage and improves stitching quality.\n"
-            "Uses perceptual hashing and histogram comparison."
-        )
-        dup_layout.addWidget(self.remove_duplicates_checkbox)
-        
-        dup_layout.addWidget(QLabel("Threshold:"))
-        self.duplicate_threshold_spin = QDoubleSpinBox()
-        self.duplicate_threshold_spin.setRange(0.80, 0.99)
-        self.duplicate_threshold_spin.setSingleStep(0.01)
-        self.duplicate_threshold_spin.setValue(0.92)
-        self.duplicate_threshold_spin.setDecimals(2)
-        self.duplicate_threshold_spin.setToolTip(
-            "Similarity threshold for duplicate detection.\n"
-            "0.90 = 90% similar (catches more duplicates)\n"
-            "0.95 = 95% similar (only near-identical)\n"
-            "0.99 = 99% similar (only exact duplicates)"
-        )
-        dup_layout.addWidget(self.duplicate_threshold_spin)
-        settings_layout.addLayout(dup_layout)
-        
-        # Smart image selection (skip redundant images)
-        smart_layout = QHBoxLayout()
-        self.smart_select_checkbox = QCheckBox("Smart Selection")
-        self.smart_select_checkbox.setChecked(True)
-        self.smart_select_checkbox.setToolTip(
-            "Automatically skip redundant photos with too much overlap.\n"
-            "Reduces processing time and memory for burst photo sets.\n"
-            "Ensures images don't overlap by more than the specified amount."
-        )
-        smart_layout.addWidget(self.smart_select_checkbox)
-        
-        smart_layout.addWidget(QLabel("Max Overlap:"))
-        self.max_overlap_spin = QSpinBox()
-        self.max_overlap_spin.setRange(10, 75)
-        self.max_overlap_spin.setValue(25)
-        self.max_overlap_spin.setSuffix("%")
-        self.max_overlap_spin.setToolTip(
-            "Maximum overlap allowed between adjacent images.\n"
-            "25% = Standard (skip highly overlapping burst photos)\n"
-            "50% = Relaxed (keep more photos)\n"
-            "10% = Aggressive (skip more redundant photos)"
-        )
-        smart_layout.addWidget(self.max_overlap_spin)
-        settings_layout.addLayout(smart_layout)
-        
-        # Grid layout specification (for 2D stitching)
-        grid_layout = QHBoxLayout()
-        self.grid_mode_checkbox = QCheckBox("Force 2D Grid")
-        self.grid_mode_checkbox.setChecked(False)
-        self.grid_mode_checkbox.setToolTip(
-            "Force images into a 2D grid layout.\n"
-            "Useful for burst photos scanned in rows.\n"
-            "Set columns = number of images per row."
-        )
-        grid_layout.addWidget(self.grid_mode_checkbox)
-        
-        grid_layout.addWidget(QLabel("Columns:"))
-        self.grid_cols_spin = QSpinBox()
-        self.grid_cols_spin.setRange(0, 100)
-        self.grid_cols_spin.setValue(0)
-        self.grid_cols_spin.setToolTip(
-            "Number of columns in the grid (0 = auto-detect).\n"
-            "Set this to the number of images per row.\n"
-            "Example: 20 photos in 4 rows = 5 columns"
-        )
-        grid_layout.addWidget(self.grid_cols_spin)
-        settings_layout.addLayout(grid_layout)
-        
         # Feature detector
         detector_layout = QHBoxLayout()
         detector_layout.addWidget(QLabel("Feature Detector:"))
@@ -838,17 +743,6 @@ class MainWindow(QMainWindow):
             max_warp_pixels = max_warp_mp * 1_000_000 if max_warp_mp > 0 else None
             
             memory_efficient = self.memory_efficient_checkbox.isChecked()
-            remove_duplicates = self.remove_duplicates_checkbox.isChecked()
-            duplicate_threshold = self.duplicate_threshold_spin.value()
-            smart_select = self.smart_select_checkbox.isChecked()
-            max_overlap_percent = self.max_overlap_spin.value()
-            
-            # Get matching memory mode from combo box
-            matching_memory_modes = ['balanced', 'quality', 'minimal', 'standard']
-            matching_memory_mode = matching_memory_modes[self.matching_memory_combo.currentIndex()]
-            
-            force_grid = self.grid_mode_checkbox.isChecked()
-            grid_cols = self.grid_cols_spin.value()
             
             self.stitcher = ImageStitcher(
                 use_gpu=use_gpu,
@@ -862,17 +756,9 @@ class MainWindow(QMainWindow):
                 allow_scale=allow_scale,
                 max_panorama_pixels=max_panorama_pixels,
                 max_warp_pixels=max_warp_pixels,
-                memory_efficient=memory_efficient,
-                remove_duplicates=remove_duplicates,
-                duplicate_threshold=duplicate_threshold,
-                matching_memory_mode=matching_memory_mode,
-                smart_select=smart_select,
-                max_overlap_percent=max_overlap_percent,
-                force_grid=force_grid,
-                grid_cols=grid_cols
+                memory_efficient=memory_efficient
             )
-            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, "
-                       f"memory_efficient={memory_efficient}, matching_mode={matching_memory_mode})")
+            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient})")
         except Exception as e:
             logger.error(f"Failed to initialize stitcher: {e}", exc_info=True)
             raise

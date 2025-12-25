@@ -27,9 +27,7 @@ class ImageAligner:
         self, 
         use_gpu: bool = False, 
         allow_scale: bool = True,
-        max_warp_pixels: Optional[int] = DEFAULT_MAX_WARP_PIXELS,
-        force_grid: bool = False,
-        grid_cols: Optional[int] = None
+        max_warp_pixels: Optional[int] = DEFAULT_MAX_WARP_PIXELS
     ):
         """
         Initialize aligner
@@ -41,15 +39,11 @@ class ImageAligner:
                 Memory guidelines:
                 - 50MP: ~150MB per image
                 - 100MP: ~300MB per image
-            force_grid: Force images into a 2D grid layout
-            grid_cols: Number of columns for grid (None = auto-detect)
         """
         self.use_gpu = use_gpu
         self.allow_scale = allow_scale
         self.max_warp_pixels = max_warp_pixels if max_warp_pixels else None
-        self.force_grid = force_grid
-        self.grid_cols = grid_cols
-        logger.info(f"Image aligner initialized (allow_scale={allow_scale}, max_warp_pixels={self.max_warp_pixels or 'unlimited'}, force_grid={force_grid}, grid_cols={grid_cols})")
+        logger.info(f"Image aligner initialized (allow_scale={allow_scale}, max_warp_pixels={self.max_warp_pixels or 'unlimited'})")
     
     def align_images(
         self,
@@ -323,106 +317,87 @@ class ImageAligner:
                     [0, 0, 1]
                 ], dtype=np.float64)
         
-        # Check if layout is too linear (all on one line) and needs 2D correction
-        transforms = self._check_and_fix_linear_layout(transforms, n_images)
+        # Check if layout is too linear (all on one row) and needs 2D correction
+        transforms = self._fix_linear_layout(transforms, n_images)
         
         return transforms
     
-    def _check_and_fix_linear_layout(
+    def _fix_linear_layout(
         self,
         transforms: Dict[int, np.ndarray],
         n_images: int
     ) -> Dict[int, np.ndarray]:
         """
-        Check if all images are on a horizontal line and fix to 2D grid if needed.
+        Detect and fix linear layouts (all images on one horizontal line).
         
-        For burst photos taken in a scanning pattern, images may only have 
-        horizontal relationships detected. This infers vertical positions 
-        from the layout pattern.
+        For burst photos scanned in rows, the feature matching often only finds
+        horizontal connections (1-2-3-4...) missing the vertical/row transitions.
+        This detects that pattern and reorganizes into a 2D grid.
         """
-        if len(transforms) < 4 and not self.force_grid:
+        if len(transforms) < 4:
             return transforms
         
         # Get all positions
-        positions = []
-        for i in sorted(transforms.keys()):
-            t = transforms[i]
-            positions.append((i, t[0, 2], t[1, 2]))  # (index, x, y)
+        positions = [(i, transforms[i][0, 2], transforms[i][1, 2]) for i in sorted(transforms.keys())]
         
-        # Check Y variation
         y_values = [p[2] for p in positions]
-        y_range = max(y_values) - min(y_values) if y_values else 0
-        
         x_values = [p[1] for p in positions]
-        x_range = max(x_values) - min(x_values) if x_values else 0
         
-        # Determine if we need to fix layout
-        needs_fix = False
+        y_range = max(y_values) - min(y_values) if y_values else 0
+        x_range = max(x_values) - min(x_values) if x_values else 1
         
-        # Force grid mode always applies grid
-        if self.force_grid:
-            needs_fix = True
-            logger.info("Force grid mode enabled, applying 2D grid layout")
-        # Otherwise check if layout is too horizontal (Y range much smaller than X range)
-        elif x_range > 0 and y_range / x_range < 0.1 and n_images >= 4:
-            needs_fix = True
-            logger.warning(f"Detected linear layout (Y range: {y_range:.1f}, X range: {x_range:.1f})")
-        
-        if needs_fix:
-            logger.info("Converting to 2D grid layout...")
+        # If Y range is very small compared to X range, layout is linear
+        if x_range > 0 and y_range / max(x_range, 1) < 0.15:
+            logger.warning(f"Detected LINEAR layout: Y range={y_range:.0f}, X range={x_range:.0f}")
+            logger.info("Reorganizing into 2D grid based on image sequence...")
             
-            # Use user-specified columns or estimate
-            if self.grid_cols and self.grid_cols > 0:
-                grid_cols = self.grid_cols
-                logger.info(f"Using user-specified grid columns: {grid_cols}")
-            else:
-                # Estimate grid dimensions
-                grid_cols = int(np.ceil(np.sqrt(n_images * 1.5)))  # Slightly wider than tall
-            
+            # Estimate grid dimensions - assume roughly square aspect ratio for the final result
+            # For burst photos, estimate based on typical scanning patterns
+            grid_cols = int(np.ceil(np.sqrt(n_images * 1.5)))  # Wider than tall
             grid_rows = int(np.ceil(n_images / grid_cols))
             
-            # Sort by original index to maintain image order
-            sorted_positions = sorted(positions, key=lambda p: p[0])
+            logger.info(f"Creating {grid_rows} rows x {grid_cols} columns grid")
             
-            # Calculate average image spacing from X positions
+            # Calculate spacing from the average horizontal distance between images
             x_sorted = sorted(positions, key=lambda p: p[1])
             if len(x_sorted) > 1:
-                x_diffs = [x_sorted[i+1][1] - x_sorted[i][1] 
-                          for i in range(min(len(x_sorted) - 1, grid_cols))]
-                x_diffs = [d for d in x_diffs if d > 0]  # Filter non-positive
-                avg_x_spacing = np.median(x_diffs) if x_diffs else 1000
+                # Get median spacing between adjacent images
+                spacings = []
+                for i in range(min(len(x_sorted) - 1, grid_cols * 2)):
+                    spacing = x_sorted[i + 1][1] - x_sorted[i][1]
+                    if spacing > 0:
+                        spacings.append(spacing)
+                avg_spacing = np.median(spacings) if spacings else 1000
             else:
-                avg_x_spacing = 1000
+                avg_spacing = 1000
             
             # Ensure reasonable spacing
-            avg_x_spacing = max(100, avg_x_spacing)
+            avg_spacing = max(100, min(avg_spacing, 10000))
             
-            # Use similar spacing for Y (assuming square-ish images)
-            avg_y_spacing = avg_x_spacing
-            
-            # Reassign positions in a 2D grid
-            logger.info(f"Creating {grid_rows}x{grid_cols} grid with spacing ~{avg_x_spacing:.1f}px")
-            
+            # Reorganize positions in 2D grid, following image index order
             new_transforms = {}
-            for idx, (img_idx, old_x, old_y) in enumerate(sorted_positions):
-                row = idx // grid_cols
-                col = idx % grid_cols
+            sorted_by_idx = sorted(positions, key=lambda p: p[0])
+            
+            for seq_idx, (img_idx, old_x, old_y) in enumerate(sorted_by_idx):
+                row = seq_idx // grid_cols
+                col = seq_idx % grid_cols
                 
-                # Alternate row direction for snake pattern (common in scanning)
+                # Snake pattern: alternate direction each row (common in scanning)
                 if row % 2 == 1:
                     col = grid_cols - 1 - col
                 
-                new_x = col * avg_x_spacing
-                new_y = row * avg_y_spacing
+                new_x = col * avg_spacing
+                new_y = row * avg_spacing
                 
-                # Create new transform preserving rotation/scale
+                # Preserve rotation/scale from original transform
                 old_transform = transforms[img_idx]
                 new_transform = old_transform.copy()
                 new_transform[0, 2] = new_x
                 new_transform[1, 2] = new_y
                 new_transforms[img_idx] = new_transform
                 
-                logger.debug(f"Image {img_idx}: ({old_x:.1f}, {old_y:.1f}) -> ({new_x:.1f}, {new_y:.1f}) [row {row}, col {col}]")
+                if seq_idx < 8 or seq_idx >= n_images - 2:
+                    logger.debug(f"Image {img_idx}: grid[{row},{col}] -> ({new_x:.0f}, {new_y:.0f})")
             
             return new_transforms
         

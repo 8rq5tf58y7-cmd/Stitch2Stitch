@@ -13,7 +13,6 @@ import gc
 from ml.feature_detector import LP_SIFTDetector, ORBDetector, AKAZEDetector
 from ml.matcher import AdvancedMatcher
 from ml.advanced_matchers import LoFTRMatcher, SuperGlueMatcher, DISKMatcher
-from ml.efficient_matcher import EfficientMatcher, create_efficient_matcher
 from quality.assessor import ImageQualityAssessor
 from core.alignment import ImageAligner
 from core.blender import ImageBlender
@@ -22,8 +21,6 @@ from core.pixelstitch_blender import PixelStitchBlender
 from core.control_points import ControlPointManager
 from utils.memory_manager import MemoryManager
 from utils.lazy_loader import LazyImageLoader, ImageProxy, estimate_memory_for_images
-from utils.duplicate_detector import DuplicateDetector, remove_duplicates_from_paths
-from utils.image_selector import ImageSelector, select_optimal_images
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +44,7 @@ class ImageStitcher:
         allow_scale: bool = True,
         max_panorama_pixels: Optional[int] = 100_000_000,
         max_warp_pixels: Optional[int] = 50_000_000,
-        memory_efficient: bool = True,
-        remove_duplicates: bool = False,
-        duplicate_threshold: float = 0.92,
-        matching_memory_mode: str = 'balanced',
-            smart_select: bool = False,
-        max_overlap_percent: float = 25.0,
-        force_grid: bool = False,
-        grid_cols: int = 0
+        memory_efficient: bool = True
     ):
         """
         Initialize the stitcher
@@ -79,23 +69,6 @@ class ImageStitcher:
                 Memory savings: ~70-90% during loading/feature detection phase
                 - Traditional: All images loaded at once (~3.6GB for 100x 36MB images)
                 - Efficient: Thumbnails + compressed cache (~200-400MB)
-            remove_duplicates: Pre-scan to remove duplicate/similar images
-            duplicate_threshold: Similarity threshold for duplicate detection (0.0-1.0)
-                - 0.90 = 90% similar (aggressive, catches more duplicates)
-                - 0.95 = 95% similar (moderate, near-identical images)
-                - 0.99 = 99% similar (conservative, only exact duplicates)
-            matching_memory_mode: Memory optimization level for feature matching
-                - 'minimal': Maximum memory savings (PCA + cascade filter + disk cache)
-                - 'balanced': Good balance of memory and speed (PCA + cascade filter)
-                - 'quality': Full quality, some compression (PCA only)
-                - 'standard': No optimization (traditional matching)
-            smart_select: Enable smart image selection (skip redundant images)
-            max_overlap_percent: Maximum overlap allowed between images (0-100)
-                - 25% = Standard (skip highly overlapping photos)
-                - 50% = Relaxed (keep more photos)
-                - 10% = Aggressive (skip more photos)
-            force_grid: Force images into a 2D grid layout
-            grid_cols: Number of columns for grid (0 = auto-detect)
         """
         self.use_gpu = use_gpu
         self.quality_threshold = quality_threshold
@@ -105,32 +78,10 @@ class ImageStitcher:
         self.max_panorama_pixels = max_panorama_pixels
         self.max_warp_pixels = max_warp_pixels
         self.memory_efficient = memory_efficient
-        self.remove_duplicates = remove_duplicates
-        self.duplicate_threshold = duplicate_threshold
-        self.matching_memory_mode = matching_memory_mode
-        self.smart_select = smart_select
-        self.max_overlap_percent = max_overlap_percent
-        self.force_grid = force_grid
-        self.grid_cols = grid_cols if grid_cols > 0 else None
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
         self._cancelled = False
-        
-        # Initialize duplicate detector if enabled
-        self._duplicate_detector: Optional[DuplicateDetector] = None
-        if remove_duplicates:
-            self._duplicate_detector = DuplicateDetector(
-                similarity_threshold=duplicate_threshold
-            )
-        
-        # Initialize image selector if enabled
-        self._image_selector: Optional[ImageSelector] = None
-        if smart_select:
-            self._image_selector = ImageSelector(
-                max_overlap_percent=max_overlap_percent,
-                min_overlap_percent=5.0
-            )
         
         # Initialize lazy loader if memory efficient mode
         self._lazy_loader: Optional[LazyImageLoader] = None
@@ -144,12 +95,8 @@ class ImageStitcher:
         # Initialize feature detector
         self.feature_detector = self._create_feature_detector(feature_detector, use_gpu, max_features)
         
-        # Initialize feature matcher (use efficient matcher in memory_efficient mode)
-        self.matcher = self._create_feature_matcher(
-            feature_matcher, use_gpu, 
-            use_efficient=memory_efficient,
-            memory_mode=matching_memory_mode
-        )
+        # Initialize feature matcher
+        self.matcher = self._create_feature_matcher(feature_matcher, use_gpu)
         
         # Initialize quality assessor
         self.quality_assessor = ImageQualityAssessor(use_gpu=use_gpu)
@@ -158,9 +105,7 @@ class ImageStitcher:
         self.aligner = ImageAligner(
             use_gpu=use_gpu, 
             allow_scale=allow_scale,
-            max_warp_pixels=max_warp_pixels,
-            force_grid=force_grid,
-            grid_cols=self.grid_cols
+            max_warp_pixels=max_warp_pixels
         )
         
         # Initialize control point manager (PTGui-style)
@@ -189,33 +134,10 @@ class ImageStitcher:
             logger.warning(f"Unknown detector method {method}, using LP-SIFT")
             return LP_SIFTDetector(use_gpu=use_gpu, n_features=max_features)
     
-    def _create_feature_matcher(
-        self, 
-        method: str, 
-        use_gpu: bool, 
-        use_efficient: bool = False,
-        memory_mode: str = 'balanced'
-    ):
-        """Create feature matcher based on method
-        
-        Args:
-            method: Matching method ('flann', 'loftr', 'superglue', 'disk')
-            use_gpu: Enable GPU acceleration
-            use_efficient: Use memory-efficient matcher (for FLANN method)
-            memory_mode: Memory optimization mode ('minimal', 'balanced', 'quality', 'standard')
-        """
+    def _create_feature_matcher(self, method: str, use_gpu: bool):
+        """Create feature matcher based on method"""
         method = method.lower()
-        
-        # Use efficient matcher for FLANN when memory_efficient is enabled
-        if method == 'flann' and use_efficient:
-            logger.info(f"Using EfficientMatcher with mode '{memory_mode}'")
-            return create_efficient_matcher(
-                use_gpu=use_gpu,
-                method='flann',
-                ratio_threshold=0.75,
-                memory_mode=memory_mode
-            )
-        elif method == 'flann':
+        if method == 'flann':
             return AdvancedMatcher(use_gpu=use_gpu, method='flann')
         elif method == 'loftr':
             return LoFTRMatcher(use_gpu=use_gpu)
@@ -225,8 +147,6 @@ class ImageStitcher:
             return DISKMatcher(use_gpu=use_gpu)
         else:
             logger.warning(f"Unknown matcher method {method}, using FLANN")
-            if use_efficient:
-                return create_efficient_matcher(use_gpu=use_gpu, method='flann', memory_mode=memory_mode)
             return AdvancedMatcher(use_gpu=use_gpu, method='flann')
     
     def _create_blender(self, method: str, use_gpu: bool, blending_options: Dict = None):
@@ -265,34 +185,6 @@ class ImageStitcher:
         
         logger.info(f"Starting stitching process for {len(image_paths)} images")
         self._update_progress(0, "Starting stitching process...")
-        
-        # Step 0a (Optional): Remove duplicate/similar images
-        if self.remove_duplicates and self._duplicate_detector is not None:
-            self._check_cancel()
-            logger.info("Step 0a: Detecting and removing duplicate images...")
-            self._update_progress(2, f"Scanning {len(image_paths)} images for duplicates...")
-            
-            image_paths = self._remove_duplicate_images(image_paths)
-            
-            if not image_paths:
-                raise ValueError("No images remaining after duplicate removal")
-        
-        # Step 0b (Optional): Smart image selection (limit overlap)
-        if self.smart_select and self._image_selector is not None:
-            self._check_cancel()
-            logger.info(f"Step 0b: Smart selection (max {self.max_overlap_percent}% overlap)...")
-            self._update_progress(5, f"Analyzing {len(image_paths)} images for optimal selection...")
-            
-            image_paths, selection_stats = self._select_optimal_images(image_paths)
-            
-            if not image_paths:
-                raise ValueError("No images remaining after smart selection")
-            
-            self._update_progress(
-                8, 
-                f"✓ Selected {selection_stats['selected']}/{selection_stats['total']} images "
-                f"({selection_stats['reduction_percent']:.0f}% reduction)"
-            )
         
         # Step 1: Load and assess image quality
         self._check_cancel()
@@ -370,127 +262,6 @@ class ImageStitcher:
         if self.progress_callback:
             self.progress_callback(percentage, message)
     
-    def _remove_duplicate_images(self, image_paths: List[Path]) -> List[Path]:
-        """
-        Remove duplicate and similar images from the input list.
-        
-        Args:
-            image_paths: List of image paths
-            
-        Returns:
-            Filtered list with duplicates removed
-        """
-        if not self._duplicate_detector or len(image_paths) <= 1:
-            return image_paths
-        
-        total = len(image_paths)
-        
-        def progress_callback(current: int, total_items: int, message: str):
-            """Map duplicate detection progress to 2-10% range"""
-            self._check_cancel()
-            if total_items > 0:
-                progress = 2 + int(8 * (current / total_items))
-                self._update_progress(progress, f"Duplicate scan: {message}")
-        
-        # Load thumbnails for comparison
-        self._update_progress(2, f"Loading thumbnails for duplicate detection...")
-        
-        images = []
-        for i, path in enumerate(image_paths):
-            self._check_cancel()
-            progress_callback(i, total, f"Loading {path.name}")
-            
-            img = cv2.imread(str(path))
-            if img is not None:
-                # Resize for faster comparison
-                h, w = img.shape[:2]
-                if max(h, w) > 256:
-                    scale = 256 / max(h, w)
-                    img = cv2.resize(img, (int(w * scale), int(h * scale)), 
-                                   interpolation=cv2.INTER_AREA)
-                images.append((path, img))
-            else:
-                logger.warning(f"Could not load image for duplicate check: {path}")
-        
-        if len(images) <= 1:
-            return image_paths
-        
-        # Find duplicates
-        self._update_progress(5, f"Comparing {len(images)} images for duplicates...")
-        
-        keep_indices, duplicates = self._duplicate_detector.find_duplicates(
-            images, 
-            progress_callback=progress_callback
-        )
-        
-        # Get filtered paths
-        filtered_paths = [images[i][0] for i in keep_indices]
-        num_removed = total - len(filtered_paths)
-        
-        if num_removed > 0:
-            logger.info(f"Duplicate detection: KEEPING {len(filtered_paths)} unique images (removed {num_removed} duplicates)")
-            self._update_progress(10, f"✓ Keeping {len(filtered_paths)} unique images (removed {num_removed} duplicate(s))")
-            
-            # Log which images were removed
-            removed_paths = set(image_paths) - set(filtered_paths)
-            for path in removed_paths:
-                logger.info(f"  Removed: {path.name}")
-            logger.info(f"  Kept: {[p.name for p in filtered_paths]}")
-        else:
-            logger.info(f"Duplicate detection: ALL {total} images are unique (no duplicates found)")
-            self._update_progress(10, f"✓ All {total} images are unique (no duplicates)")
-        
-        # Clean up
-        del images
-        gc.collect()
-        
-        return filtered_paths
-    
-    def _select_optimal_images(self, image_paths: List[Path]) -> Tuple[List[Path], Dict]:
-        """
-        Select optimal subset of images with limited overlap.
-        
-        Args:
-            image_paths: List of image paths
-            
-        Returns:
-            Tuple of (filtered_paths, stats_dict)
-        """
-        if not self._image_selector or len(image_paths) <= 2:
-            return image_paths, {'selected': len(image_paths), 'total': len(image_paths), 'reduction_percent': 0}
-        
-        total = len(image_paths)
-        
-        def progress_callback(current: int, total_items: int, message: str):
-            """Map smart selection progress to 5-8% range"""
-            self._check_cancel()
-            if total_items > 0:
-                progress = 5 + int(3 * (current / total_items))
-                self._update_progress(progress, f"Smart selection: {message}")
-        
-        selected_paths, stats = self._image_selector.select_images(
-            image_paths,
-            progress_callback=progress_callback
-        )
-        
-        if stats['selected'] < total:
-            logger.info(
-                f"Smart selection: USING {stats['selected']}/{total} images "
-                f"({stats['reduction_percent']:.1f}% reduction, "
-                f"avg overlap: {stats.get('avg_overlap', 0)*100:.1f}%)"
-            )
-            
-            # Log which images were kept/skipped
-            kept_set = set(selected_paths)
-            skipped = [p for p in image_paths if p not in kept_set]
-            if len(skipped) <= 20:  # Only log if not too many
-                for path in skipped:
-                    logger.info(f"  Skipped: {path.name}")
-        else:
-            logger.info(f"Smart selection: All {total} images selected (no redundant overlap)")
-        
-        return selected_paths, stats
-    
     def create_grid_alignment(
         self,
         image_paths: List[Path],
@@ -513,22 +284,6 @@ class ImageStitcher:
             Dictionary with grid layout information
         """
         logger.info(f"Creating grid alignment for {len(image_paths)} images (overlap: {min_overlap_percent}%-{max_overlap_percent}%, spacing: {spacing_factor}x)")
-        
-        # Optional: Remove duplicate images first
-        if self.remove_duplicates and self._duplicate_detector is not None:
-            self._check_cancel()
-            logger.info("Pre-processing: Detecting and removing duplicate images...")
-            self._update_progress(2, f"Scanning {len(image_paths)} images for duplicates...")
-            image_paths = self._remove_duplicate_images(image_paths)
-            
-            if not image_paths:
-                logger.warning("No images remaining after duplicate removal")
-                return {
-                    'images': [],
-                    'positions': [],
-                    'grid_size': (1, 1),
-                    'matches': []
-                }
         
         # Load and assess images
         images_data = self._load_and_assess_images(image_paths)
@@ -1259,104 +1014,126 @@ class ImageStitcher:
         return features_data
     
     def _match_features(self, features_data: List[Dict]) -> List[Dict]:
-        """Match features between images
-        
-        Uses EfficientMatcher with cascade filtering and PCA compression when
-        memory_efficient mode is enabled, otherwise falls back to standard matching.
         """
-        # Check if we're using the efficient matcher
-        if isinstance(self.matcher, EfficientMatcher):
-            # Use efficient batch matching with cascade filtering
-            self._update_progress(50, "Preparing memory-efficient feature matching...")
-            
-            # Estimate memory savings
-            n_images = len(features_data)
-            avg_features = sum(len(fd.get('descriptors', [])) for fd in features_data) // max(n_images, 1)
-            savings = self.matcher.estimate_memory_savings(n_images, avg_features)
-            logger.info(f"Memory-efficient matching: ~{savings['savings_mb']:.1f}MB savings "
-                       f"({savings['savings_percent']:.0f}%), {savings['pair_reduction_percent']:.0f}% fewer pairs")
-            
-            # Use the efficient matcher's batch method
-            matches = self.matcher.match_all(
-                features_data,
-                progress_callback=self._update_progress,
-                cancel_check=lambda: self._cancelled
-            )
-            return matches
+        Match features between images.
         
-        # Standard matching path for other matchers
+        For large image sets, uses windowed matching to avoid O(n²) complexity:
+        - Small sets (≤20 images): Match all pairs
+        - Large sets: Match nearby images + periodic jumps for row detection
+        """
         matches = []
+        n_images = len(features_data)
         
         # Check if matcher is a deep learning matcher that needs images
         from ml.advanced_matchers import LoFTRMatcher, SuperGlueMatcher, DISKMatcher
         is_dl_matcher = isinstance(self.matcher, (LoFTRMatcher,))
         is_superglue = isinstance(self.matcher, SuperGlueMatcher)
         
-        total_pairs = len(features_data) * (len(features_data) - 1) // 2
-        pair_count = 0
+        # For small image sets, match all pairs
+        if n_images <= 20:
+            pairs_to_match = [(i, j) for i in range(n_images) for j in range(i + 1, n_images)]
+            logger.info(f"Small image set ({n_images}): matching all {len(pairs_to_match)} pairs")
+        else:
+            # For large sets, use windowed matching strategy
+            pairs_to_match = self._get_smart_matching_pairs(n_images)
+            logger.info(f"Large image set ({n_images}): using smart matching with {len(pairs_to_match)} pairs")
         
-        for i in range(len(features_data)):
-            for j in range(i + 1, len(features_data)):
-                self._check_cancel()
-                
-                pair_count += 1
-                
-                # Update progress before matching (so user sees progress immediately)
-                if total_pairs > 0:
-                    progress = 50 + int(20 * (pair_count / total_pairs))
-                    self._update_progress(progress, f"Matching features: pair {pair_count}/{total_pairs}...")
-                
-                try:
-                    if is_dl_matcher:
-                        # LoFTR needs image data
-                        img1 = features_data[i]['image_data']['image']
-                        img2 = features_data[j]['image_data']['image']
-                        match_result = self.matcher.match(img1, img2)
-                    elif is_superglue:
-                        # SuperGlue needs keypoints and descriptors
-                        match_result = self.matcher.match(
-                            features_data[i]['keypoints'],
-                            features_data[i]['descriptors'],
-                            features_data[j]['keypoints'],
-                            features_data[j]['descriptors']
-                        )
-                    else:
-                        # Standard matchers use descriptors
-                        desc1 = features_data[i]['descriptors']
-                        desc2 = features_data[j]['descriptors']
-                        
-                        # Validate descriptors
-                        if desc1 is None or desc2 is None:
-                            logger.warning(f"Descriptors are None for pair ({i}, {j})")
-                            continue
-                        if len(desc1) == 0 or len(desc2) == 0:
-                            logger.debug(f"Empty descriptors for pair ({i}, {j})")
-                            continue
-                        
-                        match_result = self.matcher.match(desc1, desc2)
-                    
-                    num_matches = match_result.get('num_matches', 0) if match_result else 0
-                    
-                    # Log match results for debugging
-                    if num_matches > 0:
-                        logger.debug(f"Pair ({i}, {j}): {num_matches} matches, confidence: {match_result.get('confidence', 0.0):.4f}")
-                    
-                    # Require at least 15 matches for better reliability
-                    if match_result and num_matches >= 15:
-                        matches.append({
-                            'image_i': i,
-                            'image_j': j,
-                            'matches': match_result.get('matches', []),
-                            'num_matches': num_matches,
-                            'confidence': match_result.get('confidence', 0.0)
-                        })
-                    elif num_matches > 0:
-                        logger.debug(f"Pair ({i}, {j}) rejected: only {num_matches} matches (need >= 15)")
-                except Exception as e:
-                    logger.error(f"Error matching features between images {i} and {j}: {e}", exc_info=True)
-                    continue
+        total_pairs = len(pairs_to_match)
         
+        for pair_idx, (i, j) in enumerate(pairs_to_match):
+            self._check_cancel()
+            
+            # Update progress
+            if total_pairs > 0:
+                progress = 50 + int(20 * (pair_idx / total_pairs))
+                self._update_progress(progress, f"Matching features: pair {pair_idx + 1}/{total_pairs}...")
+            
+            try:
+                if is_dl_matcher:
+                    img1 = features_data[i]['image_data']['image']
+                    img2 = features_data[j]['image_data']['image']
+                    match_result = self.matcher.match(img1, img2)
+                elif is_superglue:
+                    match_result = self.matcher.match(
+                        features_data[i]['keypoints'],
+                        features_data[i]['descriptors'],
+                        features_data[j]['keypoints'],
+                        features_data[j]['descriptors']
+                    )
+                else:
+                    desc1 = features_data[i]['descriptors']
+                    desc2 = features_data[j]['descriptors']
+                    
+                    if desc1 is None or desc2 is None:
+                        continue
+                    if len(desc1) == 0 or len(desc2) == 0:
+                        continue
+                    
+                    match_result = self.matcher.match(desc1, desc2)
+                
+                num_matches = match_result.get('num_matches', 0) if match_result else 0
+                
+                if num_matches > 0:
+                    logger.debug(f"Pair ({i}, {j}): {num_matches} matches, confidence: {match_result.get('confidence', 0.0):.4f}")
+                
+                # Require at least 15 matches
+                if match_result and num_matches >= 15:
+                    matches.append({
+                        'image_i': i,
+                        'image_j': j,
+                        'matches': match_result.get('matches', []),
+                        'num_matches': num_matches,
+                        'confidence': match_result.get('confidence', 0.0)
+                    })
+            except Exception as e:
+                logger.error(f"Error matching pair ({i}, {j}): {e}")
+                continue
+        
+        logger.info(f"Found {len(matches)} valid matches from {total_pairs} pairs checked")
         return matches
+    
+    def _get_smart_matching_pairs(self, n_images: int) -> List[Tuple[int, int]]:
+        """
+        Generate smart matching pairs for large image sets.
+        
+        Strategy for burst photos:
+        1. Match adjacent images (i, i+1) - these definitely overlap
+        2. Match nearby images (window of ~5) - catch slight overlaps
+        3. Add periodic "jump" connections - helps detect row transitions
+        
+        This reduces O(n²) to O(n*k) where k is the window size + jumps
+        """
+        pairs = set()
+        
+        # Estimate grid dimensions (for jump calculation)
+        est_cols = int(np.ceil(np.sqrt(n_images * 1.5)))
+        
+        # Window size: match images within this range
+        window = min(10, n_images // 4 + 2)
+        
+        for i in range(n_images):
+            # 1. Match nearby images (sliding window)
+            for offset in range(1, window + 1):
+                j = i + offset
+                if j < n_images:
+                    pairs.add((min(i, j), max(i, j)))
+            
+            # 2. Add jump connections to detect row transitions
+            # If scanning left-to-right then down, image i might connect to i+cols
+            for jump in [est_cols - 1, est_cols, est_cols + 1]:
+                j = i + jump
+                if 0 <= j < n_images and j != i:
+                    pairs.add((min(i, j), max(i, j)))
+            
+            # 3. For every ~20 images, try some longer jumps (helps with irregular grids)
+            if i % 20 == 0:
+                for jump in [est_cols * 2, n_images // 4]:
+                    j = i + jump
+                    if 0 <= j < n_images:
+                        pairs.add((min(i, j), max(i, j)))
+        
+        # Sort pairs for consistent ordering
+        return sorted(list(pairs))
     
     def _align_with_control_points(
         self,
