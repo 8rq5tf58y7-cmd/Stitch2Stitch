@@ -23,6 +23,7 @@ from core.control_points import ControlPointManager
 from utils.memory_manager import MemoryManager
 from utils.lazy_loader import LazyImageLoader, ImageProxy, estimate_memory_for_images
 from utils.duplicate_detector import DuplicateDetector, remove_duplicates_from_paths
+from utils.image_selector import ImageSelector, select_optimal_images
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,9 @@ class ImageStitcher:
         memory_efficient: bool = True,
         remove_duplicates: bool = False,
         duplicate_threshold: float = 0.92,
-        matching_memory_mode: str = 'balanced'
+        matching_memory_mode: str = 'balanced',
+        smart_select: bool = False,
+        max_overlap_percent: float = 25.0
     ):
         """
         Initialize the stitcher
@@ -84,6 +87,11 @@ class ImageStitcher:
                 - 'balanced': Good balance of memory and speed (PCA + cascade filter)
                 - 'quality': Full quality, some compression (PCA only)
                 - 'standard': No optimization (traditional matching)
+            smart_select: Enable smart image selection (skip redundant images)
+            max_overlap_percent: Maximum overlap allowed between images (0-100)
+                - 25% = Standard (skip highly overlapping photos)
+                - 50% = Relaxed (keep more photos)
+                - 10% = Aggressive (skip more photos)
         """
         self.use_gpu = use_gpu
         self.quality_threshold = quality_threshold
@@ -96,6 +104,8 @@ class ImageStitcher:
         self.remove_duplicates = remove_duplicates
         self.duplicate_threshold = duplicate_threshold
         self.matching_memory_mode = matching_memory_mode
+        self.smart_select = smart_select
+        self.max_overlap_percent = max_overlap_percent
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
@@ -106,6 +116,14 @@ class ImageStitcher:
         if remove_duplicates:
             self._duplicate_detector = DuplicateDetector(
                 similarity_threshold=duplicate_threshold
+            )
+        
+        # Initialize image selector if enabled
+        self._image_selector: Optional[ImageSelector] = None
+        if smart_select:
+            self._image_selector = ImageSelector(
+                max_overlap_percent=max_overlap_percent,
+                min_overlap_percent=5.0
             )
         
         # Initialize lazy loader if memory efficient mode
@@ -240,16 +258,33 @@ class ImageStitcher:
         logger.info(f"Starting stitching process for {len(image_paths)} images")
         self._update_progress(0, "Starting stitching process...")
         
-        # Step 0 (Optional): Remove duplicate/similar images
+        # Step 0a (Optional): Remove duplicate/similar images
         if self.remove_duplicates and self._duplicate_detector is not None:
             self._check_cancel()
-            logger.info("Step 0: Detecting and removing duplicate images...")
+            logger.info("Step 0a: Detecting and removing duplicate images...")
             self._update_progress(2, f"Scanning {len(image_paths)} images for duplicates...")
             
             image_paths = self._remove_duplicate_images(image_paths)
             
             if not image_paths:
                 raise ValueError("No images remaining after duplicate removal")
+        
+        # Step 0b (Optional): Smart image selection (limit overlap)
+        if self.smart_select and self._image_selector is not None:
+            self._check_cancel()
+            logger.info(f"Step 0b: Smart selection (max {self.max_overlap_percent}% overlap)...")
+            self._update_progress(5, f"Analyzing {len(image_paths)} images for optimal selection...")
+            
+            image_paths, selection_stats = self._select_optimal_images(image_paths)
+            
+            if not image_paths:
+                raise ValueError("No images remaining after smart selection")
+            
+            self._update_progress(
+                8, 
+                f"✓ Selected {selection_stats['selected']}/{selection_stats['total']} images "
+                f"({selection_stats['reduction_percent']:.0f}% reduction)"
+            )
         
         # Step 1: Load and assess image quality
         self._check_cancel()
@@ -402,6 +437,51 @@ class ImageStitcher:
         gc.collect()
         
         return filtered_paths
+    
+    def _select_optimal_images(self, image_paths: List[Path]) -> Tuple[List[Path], Dict]:
+        """
+        Select optimal subset of images with limited overlap.
+        
+        Args:
+            image_paths: List of image paths
+            
+        Returns:
+            Tuple of (filtered_paths, stats_dict)
+        """
+        if not self._image_selector or len(image_paths) <= 2:
+            return image_paths, {'selected': len(image_paths), 'total': len(image_paths), 'reduction_percent': 0}
+        
+        total = len(image_paths)
+        
+        def progress_callback(current: int, total_items: int, message: str):
+            """Map smart selection progress to 5-8% range"""
+            self._check_cancel()
+            if total_items > 0:
+                progress = 5 + int(3 * (current / total_items))
+                self._update_progress(progress, f"Smart selection: {message}")
+        
+        selected_paths, stats = self._image_selector.select_images(
+            image_paths,
+            progress_callback=progress_callback
+        )
+        
+        if stats['selected'] < total:
+            logger.info(
+                f"Smart selection: USING {stats['selected']}/{total} images "
+                f"({stats['reduction_percent']:.1f}% reduction, "
+                f"avg overlap: {stats.get('avg_overlap', 0)*100:.1f}%)"
+            )
+            
+            # Log which images were kept/skipped
+            kept_set = set(selected_paths)
+            skipped = [p for p in image_paths if p not in kept_set]
+            if len(skipped) <= 20:  # Only log if not too many
+                for path in skipped:
+                    logger.info(f"  Skipped: {path.name}")
+        else:
+            logger.info(f"Smart selection: All {total} images selected (no redundant overlap)")
+        
+        return selected_paths, stats
     
     def create_grid_alignment(
         self,

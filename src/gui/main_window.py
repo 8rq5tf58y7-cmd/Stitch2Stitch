@@ -296,6 +296,31 @@ class MainWindow(QMainWindow):
         dup_layout.addWidget(self.duplicate_threshold_spin)
         settings_layout.addLayout(dup_layout)
         
+        # Smart image selection (skip redundant images)
+        smart_layout = QHBoxLayout()
+        self.smart_select_checkbox = QCheckBox("Smart Selection")
+        self.smart_select_checkbox.setChecked(True)
+        self.smart_select_checkbox.setToolTip(
+            "Automatically skip redundant photos with too much overlap.\n"
+            "Reduces processing time and memory for burst photo sets.\n"
+            "Ensures images don't overlap by more than the specified amount."
+        )
+        smart_layout.addWidget(self.smart_select_checkbox)
+        
+        smart_layout.addWidget(QLabel("Max Overlap:"))
+        self.max_overlap_spin = QSpinBox()
+        self.max_overlap_spin.setRange(10, 75)
+        self.max_overlap_spin.setValue(25)
+        self.max_overlap_spin.setSuffix("%")
+        self.max_overlap_spin.setToolTip(
+            "Maximum overlap allowed between adjacent images.\n"
+            "25% = Standard (skip highly overlapping burst photos)\n"
+            "50% = Relaxed (keep more photos)\n"
+            "10% = Aggressive (skip more redundant photos)"
+        )
+        smart_layout.addWidget(self.max_overlap_spin)
+        settings_layout.addLayout(smart_layout)
+        
         # Feature detector
         detector_layout = QHBoxLayout()
         detector_layout.addWidget(QLabel("Feature Detector:"))
@@ -792,6 +817,8 @@ class MainWindow(QMainWindow):
             memory_efficient = self.memory_efficient_checkbox.isChecked()
             remove_duplicates = self.remove_duplicates_checkbox.isChecked()
             duplicate_threshold = self.duplicate_threshold_spin.value()
+            smart_select = self.smart_select_checkbox.isChecked()
+            max_overlap_percent = self.max_overlap_spin.value()
             
             # Get matching memory mode from combo box
             matching_memory_modes = ['balanced', 'quality', 'minimal', 'standard']
@@ -812,7 +839,9 @@ class MainWindow(QMainWindow):
                 memory_efficient=memory_efficient,
                 remove_duplicates=remove_duplicates,
                 duplicate_threshold=duplicate_threshold,
-                matching_memory_mode=matching_memory_mode
+                matching_memory_mode=matching_memory_mode,
+                smart_select=smart_select,
+                max_overlap_percent=max_overlap_percent
             )
             logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, "
                        f"memory_efficient={memory_efficient}, matching_mode={matching_memory_mode})")
