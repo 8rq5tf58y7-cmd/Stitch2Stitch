@@ -151,8 +151,8 @@ class DuplicateDetector:
         """
         Compute overall similarity between two images.
         
-        Uses geometric mean of NCC and hash similarity for strict comparison.
-        Both metrics must agree for high similarity score.
+        Uses weighted combination for burst photo detection.
+        NCC is more reliable for nearly-identical burst frames.
         """
         # Compute hashes
         phash1 = self.compute_phash(img1)
@@ -166,17 +166,18 @@ class DuplicateDetector:
         # Take best hash similarity
         hash_sim = max(phash_sim, dhash_sim)
         
-        # Only compute NCC if hashes suggest potential match
-        # This is an optimization for large datasets
-        if hash_sim < 0.6:
-            return hash_sim * 0.5  # Quick rejection
-        
-        # Compute pixel-level similarity
+        # Compute pixel-level similarity (most reliable for burst photos)
         ncc_sim = self.compute_ncc(img1, img2)
         
-        # Use geometric mean - both must be high for high score
-        # This prevents false positives from hash collisions
-        combined = np.sqrt(hash_sim * ncc_sim)
+        # For burst photos, NCC is the most important metric
+        # Use weighted average favoring NCC, not geometric mean
+        # This catches near-identical frames even with slight hash differences
+        combined = 0.3 * hash_sim + 0.7 * ncc_sim
+        
+        # If NCC alone is very high (>0.95), trust it even if hashes differ
+        # This catches burst photos with minor exposure changes
+        if ncc_sim > 0.95:
+            combined = max(combined, ncc_sim * 0.98)
         
         return combined
     

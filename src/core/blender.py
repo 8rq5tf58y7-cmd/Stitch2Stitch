@@ -89,12 +89,22 @@ class ImageBlender:
         AutoStitch-style blending: select pixels from one image in overlap regions
         No averaging/blending - images fit together like a puzzle
         Memory-optimized version.
+        
+        Options:
+            padding: Extra pixels around edges (default 50)
+            zoom: Output scale factor (default 1.0, <1 = zoom out, >1 = zoom in)
+            fit_all: Ensure all images fit completely (default True)
         """
         if not aligned_images:
             raise ValueError("No images to blend")
         
-        # Calculate bounding box
-        bbox = self._calculate_bbox(aligned_images)
+        # Get options
+        padding = options.get('padding', 50)  # Default 50px padding
+        zoom = options.get('zoom', 1.0)  # Default no zoom
+        fit_all = options.get('fit_all', True)  # Default ensure all images fit
+        
+        # Calculate bounding box with padding
+        bbox = self._calculate_bbox(aligned_images, padding=padding if fit_all else 0)
         x_min, y_min, x_max, y_max = bbox
         
         output_h = y_max - y_min
@@ -104,12 +114,28 @@ class ImageBlender:
             logger.error(f"Invalid bounding box dimensions: {bbox}")
             return aligned_images[0]['image'].copy()
         
+        # Apply zoom factor (zoom < 1.0 = zoom out to show more, zoom > 1.0 = zoom in)
+        if zoom != 1.0 and zoom > 0:
+            # Adjust bounding box to show more/less area
+            center_x = (x_min + x_max) / 2
+            center_y = (y_min + y_max) / 2
+            half_w = output_w / 2 / zoom
+            half_h = output_h / 2 / zoom
+            x_min = int(center_x - half_w)
+            y_min = int(center_y - half_h)
+            x_max = int(center_x + half_w)
+            y_max = int(center_y + half_h)
+            output_w = x_max - x_min
+            output_h = y_max - y_min
+            logger.info(f"Zoom {zoom}x applied: canvas size {output_w}x{output_h}")
+        
         # Check size and scale down if needed (only if limit is set)
         total_pixels = output_h * output_w
+        scale_factor = 1.0
         if self.max_panorama_pixels and total_pixels > self.max_panorama_pixels:
-            scale = np.sqrt(self.max_panorama_pixels / total_pixels)
-            output_h = int(output_h * scale)
-            output_w = int(output_w * scale)
+            scale_factor = np.sqrt(self.max_panorama_pixels / total_pixels)
+            output_h = int(output_h * scale_factor)
+            output_w = int(output_w * scale_factor)
             logger.warning(f"Panorama too large ({total_pixels/1e6:.1f}MP), scaling to {output_w}x{output_h}")
         
         logger.info(f"Creating panorama canvas: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
@@ -142,25 +168,34 @@ class ImageBlender:
             else:
                 alpha_mask = np.ones((h, w), dtype=bool)
             
-            # ALWAYS filter black/near-black pixels (common in photos and scans)
+            # Filter only truly black border pixels (common from scanning/warping)
             if len(img.shape) == 3:
-                # Detect black borders: pixels where ALL channels are very dark
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                # Content threshold: > 15 to catch actual content (not pure black borders)
-                content_mask = gray > 15
-                alpha_mask = alpha_mask & content_mask
-                
-                # Also filter very bright pixels (overexposed borders)
-                alpha_mask = alpha_mask & (gray < 250)
+                # Only filter pixels where ALL channels are very dark (black borders)
+                # Use a low threshold to avoid filtering actual dark content
+                min_channel = np.min(img, axis=2)
+                # Black border: all channels < 10 (truly black, not just dark)
+                black_border_mask = min_channel < 10
+                alpha_mask = alpha_mask & (~black_border_mask)
             
-            # Additional filtering for warped images (catch interpolation artifacts)
-            if was_warped and len(img.shape) == 3:
-                intensity = np.max(img, axis=2)
-                alpha_mask = alpha_mask & (intensity > 10)
+            # Note: warped image artifacts (pure black) are already handled by black_border_mask above
             
             bbox_img = img_data.get('bbox', (0, 0, w, h))
-            x_off = bbox_img[0] - x_min
-            y_off = bbox_img[1] - y_min
+            
+            # Apply scale factor if canvas was scaled down due to size limits
+            if scale_factor != 1.0:
+                x_off = int((bbox_img[0] - x_min) * scale_factor)
+                y_off = int((bbox_img[1] - y_min) * scale_factor)
+                # Scale the image down too
+                scaled_w = int(w * scale_factor)
+                scaled_h = int(h * scale_factor)
+                if scaled_w > 0 and scaled_h > 0:
+                    img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+                    alpha_mask = cv2.resize(alpha_mask.astype(np.uint8), (scaled_w, scaled_h), 
+                                           interpolation=cv2.INTER_NEAREST).astype(bool)
+                    h, w = scaled_h, scaled_w
+            else:
+                x_off = bbox_img[0] - x_min
+                y_off = bbox_img[1] - y_min
             
             # Calculate valid region
             src_x_start = max(0, -x_off)
@@ -173,7 +208,14 @@ class ImageBlender:
             dst_x_end = min(output_w, x_off + w)
             dst_y_end = min(output_h, y_off + h)
             
+            # Log if image is being cut off
+            if src_x_start > 0 or src_y_start > 0 or src_x_end < w or src_y_end < h:
+                cut_pixels = max(src_x_start, src_y_start, w - src_x_end, h - src_y_end)
+                if cut_pixels > 10:  # Only warn if significant
+                    logger.warning(f"Image {idx} partially outside canvas (cut by ~{cut_pixels}px)")
+            
             if src_x_end <= src_x_start or src_y_end <= src_y_start:
+                logger.warning(f"Image {idx} completely outside canvas, skipping")
                 continue
             
             # Get source and destination regions
@@ -253,8 +295,13 @@ class ImageBlender:
         if not aligned_images:
             raise ValueError("No images to blend")
         
-        # Calculate bounding box
-        bbox = self._calculate_bbox(aligned_images)
+        # Get options
+        padding = options.get('padding', 50)
+        zoom = options.get('zoom', 1.0)
+        fit_all = options.get('fit_all', True)
+        
+        # Calculate bounding box with padding
+        bbox = self._calculate_bbox(aligned_images, padding=padding if fit_all else 0)
         x_min, y_min, x_max, y_max = bbox
         
         output_h = y_max - y_min
@@ -264,6 +311,20 @@ class ImageBlender:
         if output_h <= 0 or output_w <= 0:
             logger.error(f"Invalid bounding box dimensions: {bbox}")
             return aligned_images[0]['image'].copy()
+        
+        # Apply zoom factor
+        if zoom != 1.0 and zoom > 0:
+            center_x = (x_min + x_max) / 2
+            center_y = (y_min + y_max) / 2
+            half_w = output_w / 2 / zoom
+            half_h = output_h / 2 / zoom
+            x_min = int(center_x - half_w)
+            y_min = int(center_y - half_h)
+            x_max = int(center_x + half_w)
+            y_max = int(center_y + half_h)
+            output_w = x_max - x_min
+            output_h = y_max - y_min
+            logger.info(f"Zoom {zoom}x applied: canvas size {output_w}x{output_h}")
         
         # Limit maximum size to prevent memory issues (only if limit is set)
         total_pixels = output_h * output_w
@@ -348,11 +409,29 @@ class ImageBlender:
     
     def _feather_blend(self, aligned_images: List[Dict], options: Dict) -> np.ndarray:
         """Feather blending (simpler, faster, memory-optimized)"""
-        bbox = self._calculate_bbox(aligned_images)
+        # Get options
+        padding = options.get('padding', 50)
+        zoom = options.get('zoom', 1.0)
+        fit_all = options.get('fit_all', True)
+        
+        bbox = self._calculate_bbox(aligned_images, padding=padding if fit_all else 0)
         x_min, y_min, x_max, y_max = bbox
         
         output_h = y_max - y_min
         output_w = x_max - x_min
+        
+        # Apply zoom factor
+        if zoom != 1.0 and zoom > 0:
+            center_x = (x_min + x_max) / 2
+            center_y = (y_min + y_max) / 2
+            half_w = output_w / 2 / zoom
+            half_h = output_h / 2 / zoom
+            x_min = int(center_x - half_w)
+            y_min = int(center_y - half_h)
+            x_max = int(center_x + half_w)
+            y_max = int(center_y + half_h)
+            output_w = x_max - x_min
+            output_h = y_max - y_min
         
         # Size limit (only if limit is set)
         total_pixels = output_h * output_w
@@ -429,34 +508,48 @@ class ImageBlender:
         """Simple linear blending"""
         return self._feather_blend(aligned_images, options)
     
-    def _calculate_bbox(self, aligned_images: List[Dict]) -> Tuple[int, int, int, int]:
-        """Calculate bounding box for all images"""
+    def _calculate_bbox(self, aligned_images: List[Dict], padding: int = 0) -> Tuple[int, int, int, int]:
+        """
+        Calculate bounding box for all images with optional padding.
+        
+        Args:
+            aligned_images: List of aligned image data
+            padding: Extra pixels to add around all edges
+            
+        Returns:
+            Tuple of (x_min, y_min, x_max, y_max)
+        """
         if not aligned_images:
             return (0, 0, 100, 100)
         
         x_min = y_min = float('inf')
         x_max = y_max = float('-inf')
         
-        for img_data in aligned_images:
+        for idx, img_data in enumerate(aligned_images):
             bbox = img_data.get('bbox')
+            h, w = img_data['image'].shape[:2]
+            
             if bbox and len(bbox) >= 4:
-                x_min = min(x_min, bbox[0])
-                y_min = min(y_min, bbox[1])
-                x_max = max(x_max, bbox[2])
-                y_max = max(y_max, bbox[3])
+                # Use provided bounding box
+                img_x_min, img_y_min, img_x_max, img_y_max = bbox
+                x_min = min(x_min, img_x_min)
+                y_min = min(y_min, img_y_min)
+                x_max = max(x_max, img_x_max)
+                y_max = max(y_max, img_y_max)
+                logger.debug(f"Image {idx}: bbox=({img_x_min}, {img_y_min}, {img_x_max}, {img_y_max})")
             else:
-                h, w = img_data['image'].shape[:2]
-                if x_min == float('inf'):
-                    x_min = 0
-                if y_min == float('inf'):
-                    y_min = 0
+                # No bbox provided, assume origin
+                x_min = min(x_min, 0)
+                y_min = min(y_min, 0)
                 x_max = max(x_max, w)
                 y_max = max(y_max, h)
+                logger.debug(f"Image {idx}: no bbox, using (0, 0, {w}, {h})")
         
         # Validate bounding box
         if x_min == float('inf') or y_min == float('inf') or x_max == float('-inf') or y_max == float('-inf'):
             # Fallback: use first image dimensions
             h, w = aligned_images[0]['image'].shape[:2]
+            logger.warning("Invalid bounding box, using first image dimensions")
             return (0, 0, w, h)
         
         # Ensure valid dimensions
@@ -464,6 +557,15 @@ class ImageBlender:
             x_max = x_min + 100
         if y_max <= y_min:
             y_max = y_min + 100
+        
+        # Apply padding
+        if padding > 0:
+            x_min -= padding
+            y_min -= padding
+            x_max += padding
+            y_max += padding
+        
+        logger.info(f"Total bounding box: ({int(x_min)}, {int(y_min)}) to ({int(x_max)}, {int(y_max)}) = {int(x_max-x_min)}x{int(y_max-y_min)} pixels")
         
         return (int(x_min), int(y_min), int(x_max), int(y_max))
     

@@ -50,7 +50,14 @@ class ImageStitcher:
         select_optimal_coverage: bool = False,
         max_coverage_overlap: float = 0.5,
         remove_duplicates: bool = True,
-        duplicate_threshold: float = 0.92
+        duplicate_threshold: float = 0.92,
+        optimize_alignment: bool = False,
+        alignment_optimization_level: str = 'balanced',
+        # AutoPano Giga-inspired features
+        use_grid_topology: bool = True,
+        use_bundle_adjustment: bool = False,
+        use_hierarchical_stitching: bool = False,
+        use_enhanced_detection: bool = False
     ):
         """
         Initialize the stitcher
@@ -85,6 +92,20 @@ class ImageStitcher:
                 Removes nearly identical frames to reduce processing and improve alignment
             duplicate_threshold: Similarity threshold (0.0-1.0) for duplicate detection
                 0.92 = very strict (only near-identical), 0.85 = moderate, 0.75 = aggressive
+            optimize_alignment: Preprocess images to improve feature detection
+                Inspired by AutoPano Giga's alignment optimization feature
+            alignment_optimization_level: Level of optimization
+                'light' = subtle enhancement (fast, preserves original look)
+                'balanced' = moderate enhancement (recommended)
+                'aggressive' = strong enhancement (best for low-contrast images)
+            use_grid_topology: Auto-detect grid structure to reduce matching from O(n²) to O(n)
+                Critical for large flat panoramas (microscope, drone, satellite)
+            use_bundle_adjustment: Global optimization of all camera poses
+                Minimizes reprojection error across all keypoints
+            use_hierarchical_stitching: Cluster-based stitching for 1000+ images
+                Stitches clusters independently, then merges
+            use_enhanced_detection: Use enhanced feature detection for low-texture areas
+                Better for skies, walls, water, repetitive patterns
         """
         self.use_gpu = use_gpu
         self.quality_threshold = quality_threshold
@@ -99,7 +120,19 @@ class ImageStitcher:
         self.max_coverage_overlap = max_coverage_overlap
         self.remove_duplicates = remove_duplicates
         self.duplicate_threshold = duplicate_threshold
+        self.optimize_alignment = optimize_alignment
+        self.alignment_optimization_level = alignment_optimization_level
+        self.use_grid_topology = use_grid_topology
+        self.use_bundle_adjustment = use_bundle_adjustment
+        self.use_hierarchical_stitching = use_hierarchical_stitching
+        self.use_enhanced_detection = use_enhanced_detection
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
+        
+        # AutoPano-inspired features (lazy loaded)
+        self._grid_detector = None
+        self._bundle_adjuster = None
+        self._hierarchical_stitcher = None
+        self._enhanced_detector = None
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
         self._cancelled = False
@@ -189,6 +222,15 @@ class ImageStitcher:
             return SemanticBlender(use_gpu=use_gpu, options=options)
         elif method == 'pixelstitch':
             return PixelStitchBlender(use_gpu=use_gpu, options=options)
+        elif method == 'generative':
+            from core.generative_blender import GenerativeBlender
+            # Map GUI options to generative blender options
+            gen_options = {
+                'backend': options.get('gen_backend', 'hybrid'),
+                'api_key': options.get('gen_api_key'),
+                'strength': options.get('gen_strength', 0.75),
+            }
+            return GenerativeBlender(use_gpu=use_gpu, options=gen_options)
         else:
             logger.warning(f"Unknown blender method {method}, using multiband")
             return ImageBlender(use_gpu=use_gpu, method='multiband', options=options, max_panorama_pixels=max_pixels)
@@ -232,6 +274,14 @@ class ImageStitcher:
             
             logger.info(f"After duplicate removal: {len(images_data)} unique images")
         
+        # Step 1.75: Optimize images for alignment (if enabled)
+        if self.optimize_alignment:
+            self._check_cancel()
+            logger.info("Step 1.75: Optimizing images for alignment...")
+            self._update_progress(25, "Optimizing images for feature detection...")
+            images_data = self._optimize_for_alignment(images_data)
+            gc.collect()
+        
         # Step 2: Detect features
         self._check_cancel()
         logger.info("Step 2: Detecting features...")
@@ -272,6 +322,40 @@ class ImageStitcher:
         else:
             aligned_images = self.aligner.align_images(images_data, features_data, matches)
         
+        # Step 4.5: Bundle adjustment (global optimization)
+        if self.use_bundle_adjustment and len(aligned_images) >= 3:
+            self._check_cancel()
+            logger.info("Step 4.5: Bundle adjustment optimization...")
+            self._update_progress(78, "Optimizing global alignment (bundle adjustment)...")
+            aligned_images = self._run_bundle_adjustment(aligned_images, matches)
+        
+        # If alignment optimization was used, restore original images for blending
+        # (optimized images were only for better feature detection)
+        if self.optimize_alignment:
+            logger.info("Restoring original images for blending...")
+            for aligned_img in aligned_images:
+                # Get original from the source data
+                for img_data in images_data:
+                    if 'original_image' in img_data and img_data.get('path') == aligned_img.get('source_path'):
+                        # Re-warp original image with same transform
+                        if 'transform' in aligned_img:
+                            from core.alignment import ImageAligner
+                            original = img_data['original_image']
+                            h, w = original.shape[:2]
+                            transform = aligned_img['transform']
+                            
+                            # Apply the same transform to original
+                            warped = cv2.warpAffine(
+                                original, 
+                                transform[:2], 
+                                (aligned_img['image'].shape[1], aligned_img['image'].shape[0]),
+                                flags=cv2.INTER_LANCZOS4,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=(0, 0, 0)
+                            )
+                            aligned_img['image'] = warped
+                        break
+        
         # Free original images if they were replaced by warped versions
         del images_data, features_data, matches
         gc.collect()
@@ -288,6 +372,13 @@ class ImageStitcher:
         # Cleanup aligned images
         del aligned_images
         gc.collect()
+        
+        # Step 6: AI Post-processing (optional)
+        if self.blending_options.get('ai_post_processing', False):
+            self._check_cancel()
+            logger.info("Step 6: AI post-processing...")
+            self._update_progress(95, "Applying AI enhancement...")
+            panorama = self._apply_ai_post_processing(panorama)
         
         self._update_progress(100, "Stitching completed successfully!")
         logger.info("Stitching completed successfully")
@@ -452,10 +543,11 @@ class ImageStitcher:
                 excluded_high_overlap += 1
                 logger.debug(f"Excluding match {i}-{j}: overlap {overlap_pct*100:.1f}% > max {max_overlap_ratio*100:.1f}%")
                 continue
-                
-                included_indices.add(i)
-                included_indices.add(j)
-                filtered_matches.append(match)
+            
+            # Passed overlap filters; keep this match and mark images as included
+            included_indices.add(i)
+            included_indices.add(j)
+            filtered_matches.append(match)
         
         # Log exclusion stats
         if excluded_high_overlap > 0:
@@ -487,6 +579,52 @@ class ImageStitcher:
                 new_match['image_i'] = index_map[i]
                 new_match['image_j'] = index_map[j]
                 remapped_matches.append(new_match)
+        
+        # Keep only the largest connected component to avoid stray/redundant tiles
+        if remapped_matches and len(filtered_images) > 1:
+            adj = {i: set() for i in range(len(filtered_images))}
+            for m in remapped_matches:
+                a = m['image_i']
+                b = m['image_j']
+                adj[a].add(b)
+                adj[b].add(a)
+            
+            visited = set()
+            components = []
+            
+            for node in adj:
+                if node in visited:
+                    continue
+                stack = [node]
+                comp = []
+                while stack:
+                    n = stack.pop()
+                    if n in visited:
+                        continue
+                    visited.add(n)
+                    comp.append(n)
+                    for nei in adj.get(n, []):
+                        if nei not in visited:
+                            stack.append(nei)
+                components.append(comp)
+            
+            # Select largest component
+            largest = max(components, key=len) if components else []
+            if len(largest) < len(filtered_images):
+                logger.info(f"Pruning to largest connected component: keeping {len(largest)} of {len(filtered_images)} images")
+                keep_set = set(largest)
+                filtered_images = [img for idx, img in enumerate(filtered_images) if idx in keep_set]
+                filtered_features = [feat for idx, feat in enumerate(filtered_features) if idx in keep_set]
+                
+                # Remap again after pruning
+                new_index_map = {old: new for new, old in enumerate(sorted(list(keep_set)))}
+                remapped_matches = []
+                for m in filtered_matches:
+                    if m['image_i'] in keep_set and m['image_j'] in keep_set:
+                        new_m = m.copy()
+                        new_m['image_i'] = new_index_map[m['image_i']]
+                        new_m['image_j'] = new_index_map[m['image_j']]
+                        remapped_matches.append(new_m)
         
         logger.info(f"Filtered to {len(filtered_images)} images (from {len(images_data)}) with overlap {min_overlap_ratio*100:.1f}%-{max_overlap_ratio*100:.1f}%")
         
@@ -708,6 +846,298 @@ class ImageStitcher:
             self._update_progress(25, f"Removed {removed_count} duplicate images")
         
         return filtered_data
+    
+    def _optimize_for_alignment(self, images_data: List[Dict]) -> List[Dict]:
+        """
+        Optimize images for better feature detection and alignment.
+        
+        Inspired by AutoPano Giga's alignment optimization feature.
+        Applies preprocessing to improve keypoint detection:
+        - CLAHE contrast enhancement (adaptive histogram equalization)
+        - Edge enhancement for better gradient-based features
+        - Noise reduction to avoid false features
+        - Color normalization for consistent matching
+        
+        Note: Original images are preserved; optimized versions are only
+        used for feature detection, not blending.
+        """
+        logger.info(f"Optimizing {len(images_data)} images for alignment (level: {self.alignment_optimization_level})")
+        
+        # Get optimization parameters based on level
+        if self.alignment_optimization_level == 'light':
+            clahe_clip = 1.5
+            clahe_grid = (4, 4)
+            denoise_h = 3
+            edge_strength = 0.1
+            color_norm = False
+        elif self.alignment_optimization_level == 'aggressive':
+            clahe_clip = 4.0
+            clahe_grid = (16, 16)
+            denoise_h = 7
+            edge_strength = 0.3
+            color_norm = True
+        else:  # balanced (default)
+            clahe_clip = 2.5
+            clahe_grid = (8, 8)
+            denoise_h = 5
+            edge_strength = 0.2
+            color_norm = True
+        
+        optimized_data = []
+        
+        for idx, img_data in enumerate(images_data):
+            self._check_cancel()
+            
+            if idx % 10 == 0:
+                progress = 25 + int(5 * (idx / len(images_data)))
+                self._update_progress(progress, f"Optimizing image {idx+1}/{len(images_data)}...")
+            
+            # Store original for blending
+            original = img_data['image']
+            
+            try:
+                # Create optimized version for feature detection
+                optimized = self._apply_alignment_optimization(
+                    original,
+                    clahe_clip=clahe_clip,
+                    clahe_grid=clahe_grid,
+                    denoise_h=denoise_h,
+                    edge_strength=edge_strength,
+                    color_norm=color_norm
+                )
+                
+                # Store both versions
+                new_data = img_data.copy()
+                new_data['image'] = optimized
+                new_data['original_image'] = original  # Keep original for blending
+                optimized_data.append(new_data)
+                
+            except Exception as e:
+                logger.warning(f"Optimization failed for image {idx}: {e}, using original")
+                optimized_data.append(img_data)
+        
+        logger.info(f"Alignment optimization complete for {len(optimized_data)} images")
+        return optimized_data
+    
+    def _apply_ai_post_processing(self, panorama: np.ndarray) -> np.ndarray:
+        """
+        Apply AutoPano Giga-style AI post-processing.
+        
+        Includes:
+        - Color correction (gray world + CLAHE)
+        - Denoising
+        - Gap inpainting
+        - Optional super-resolution
+        """
+        try:
+            from core.autopano_features import AIPostProcessor
+            
+            processor = AIPostProcessor(use_gpu=self.use_gpu)
+            
+            # Detect gaps (white/black areas)
+            gray = cv2.cvtColor(panorama, cv2.COLOR_BGR2GRAY)
+            gap_mask = ((gray < 5) | (gray > 250)).astype(np.uint8) * 255
+            
+            # Erode to avoid edge artifacts
+            kernel = np.ones((3, 3), np.uint8)
+            gap_mask = cv2.erode(gap_mask, kernel, iterations=2)
+            
+            # Inpaint gaps
+            if np.any(gap_mask):
+                logger.info(f"Inpainting {np.sum(gap_mask > 0)} gap pixels...")
+                panorama = processor.inpaint_gaps(panorama, gap_mask)
+            
+            # Apply enhancements
+            panorama = processor.enhance(
+                panorama,
+                enable_super_res=self.blending_options.get('super_resolution', False),
+                enable_denoise=self.blending_options.get('ai_denoise', True),
+                enable_color_correct=self.blending_options.get('ai_color_correct', True)
+            )
+            
+            logger.info("AI post-processing complete")
+            return panorama
+            
+        except Exception as e:
+            logger.warning(f"AI post-processing failed: {e}")
+            return panorama
+    
+    def _run_bundle_adjustment(
+        self,
+        aligned_images: List[Dict],
+        matches: Dict
+    ) -> List[Dict]:
+        """
+        Run bundle adjustment to globally optimize alignment.
+        
+        AutoPano Giga-inspired two-stage optimization:
+        1. Coarse BA: Fast optimization with reduced parameters
+        2. Refine matches: Remove outliers based on current alignment
+        3. Fine BA: Full optimization with all parameters
+        """
+        try:
+            from core.autopano_features import TwoStageBundleAdjuster, BundleAdjuster
+            
+            if self._bundle_adjuster is None:
+                # Use two-stage bundle adjustment for better results
+                self._bundle_adjuster = TwoStageBundleAdjuster()
+            
+            # Extract transforms from aligned images
+            initial_transforms = []
+            for img_data in aligned_images:
+                transform = img_data.get('transform')
+                if transform is not None:
+                    initial_transforms.append(transform)
+                else:
+                    # Identity transform
+                    initial_transforms.append(np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64))
+            
+            # Convert matches dict to the format expected by bundle adjuster
+            matches_dict = {}
+            if isinstance(matches, list):
+                for match in matches:
+                    i, j = match.get('img_i', 0), match.get('img_j', 1)
+                    matches_dict[(i, j)] = match
+            else:
+                matches_dict = matches
+            
+            # Run optimization
+            optimized_transforms, stats = self._bundle_adjuster.optimize(
+                aligned_images,
+                matches_dict,
+                initial_transforms
+            )
+            
+            if stats.get('success', False):
+                logger.info(f"Bundle adjustment: {stats.get('improvement_percent', 0):.1f}% improvement")
+                
+                # Apply optimized transforms
+                for i, img_data in enumerate(aligned_images):
+                    if i < len(optimized_transforms):
+                        old_transform = img_data.get('transform')
+                        new_transform = optimized_transforms[i]
+                        img_data['transform'] = new_transform
+                        
+                        # Re-warp image if transform changed significantly
+                        if old_transform is not None:
+                            diff = np.abs(new_transform - old_transform[:2]).max()
+                            if diff > 1.0:  # More than 1 pixel change
+                                # Re-apply warp with new transform
+                                original = img_data.get('original_image', img_data['image'])
+                                h, w = original.shape[:2]
+                                
+                                # Calculate output size
+                                corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
+                                transformed = cv2.transform(corners.reshape(1, -1, 2), new_transform)
+                                min_x = int(transformed[0, :, 0].min())
+                                min_y = int(transformed[0, :, 1].min())
+                                max_x = int(transformed[0, :, 0].max())
+                                max_y = int(transformed[0, :, 1].max())
+                                
+                                out_w = max_x - min_x
+                                out_h = max_y - min_y
+                                
+                                # Clamp size
+                                max_dim = 10000
+                                if out_w > max_dim or out_h > max_dim:
+                                    scale = max_dim / max(out_w, out_h)
+                                    out_w = int(out_w * scale)
+                                    out_h = int(out_h * scale)
+                                
+                                if out_w > 0 and out_h > 0:
+                                    # Adjust transform for output origin
+                                    adjusted = new_transform.copy()
+                                    adjusted[0, 2] -= min_x
+                                    adjusted[1, 2] -= min_y
+                                    
+                                    warped = cv2.warpAffine(
+                                        original, adjusted, (out_w, out_h),
+                                        flags=cv2.INTER_LANCZOS4,
+                                        borderMode=cv2.BORDER_CONSTANT,
+                                        borderValue=(0, 0, 0)
+                                    )
+                                    img_data['image'] = warped
+                                    img_data['bbox'] = (min_x, min_y, max_x, max_y)
+            else:
+                logger.warning(f"Bundle adjustment failed: {stats.get('reason', 'unknown')}")
+        
+        except Exception as e:
+            logger.warning(f"Bundle adjustment error: {e}")
+        
+        return aligned_images
+    
+    def _apply_alignment_optimization(
+        self,
+        image: np.ndarray,
+        clahe_clip: float = 2.5,
+        clahe_grid: tuple = (8, 8),
+        denoise_h: int = 5,
+        edge_strength: float = 0.2,
+        color_norm: bool = True
+    ) -> np.ndarray:
+        """
+        Apply alignment optimization to a single image.
+        
+        Args:
+            image: Input BGR image
+            clahe_clip: CLAHE clip limit (higher = more contrast)
+            clahe_grid: CLAHE tile grid size
+            denoise_h: Non-local means denoising strength
+            edge_strength: Edge enhancement factor (0-1)
+            color_norm: Apply color normalization
+            
+        Returns:
+            Optimized image for feature detection
+        """
+        result = image.copy()
+        
+        # Step 1: Convert to LAB color space for better processing
+        lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        
+        # Step 2: Apply CLAHE to L channel (contrast enhancement)
+        # This is the most important step for feature detection
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_grid)
+        l_enhanced = clahe.apply(l_channel)
+        
+        # Step 3: Light denoising to reduce false features
+        # Use a small radius to preserve edges
+        if denoise_h > 0:
+            l_enhanced = cv2.fastNlMeansDenoising(l_enhanced, None, denoise_h, 7, 21)
+        
+        # Step 4: Edge enhancement using unsharp mask
+        if edge_strength > 0:
+            # Create a blurred version
+            blurred = cv2.GaussianBlur(l_enhanced, (0, 0), 3.0)
+            # Unsharp mask: enhanced = original + strength * (original - blurred)
+            l_enhanced = cv2.addWeighted(l_enhanced, 1.0 + edge_strength, blurred, -edge_strength, 0)
+        
+        # Step 5: Color normalization (optional)
+        if color_norm:
+            # Normalize a and b channels to reduce color variation impact
+            a_normalized = cv2.normalize(a_channel, None, 110, 146, cv2.NORM_MINMAX)
+            b_normalized = cv2.normalize(b_channel, None, 110, 146, cv2.NORM_MINMAX)
+        else:
+            a_normalized = a_channel
+            b_normalized = b_channel
+        
+        # Merge back
+        lab_enhanced = cv2.merge([l_enhanced, a_normalized, b_normalized])
+        result = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+        
+        # Step 6: Final contrast stretch to use full dynamic range
+        # This helps SIFT/ORB detect more features
+        for i in range(3):
+            channel = result[:, :, i]
+            min_val = np.percentile(channel, 1)
+            max_val = np.percentile(channel, 99)
+            if max_val > min_val:
+                result[:, :, i] = np.clip(
+                    255 * (channel.astype(float) - min_val) / (max_val - min_val),
+                    0, 255
+                ).astype(np.uint8)
+        
+        return result
     
     def _load_and_assess_images(self, image_paths: List[Path]) -> List[Dict]:
         """Load images and assess quality (with optional memory-efficient mode)"""
@@ -1047,9 +1477,20 @@ class ImageStitcher:
         return images_data
     
     def _detect_features(self, images_data: List[Dict]) -> List[Dict]:
-        """Detect features in all images"""
+        """Detect features in all images with adaptive optimization for large sets"""
         features_data = []
         total = len(images_data)
+        
+        # Adaptive feature count: reduce for large image sets to maintain performance
+        # More images = more total features anyway, so fewer per image is fine
+        original_max = self.max_features
+        if total > 100:
+            # Scale down features for very large sets
+            self.max_features = min(self.max_features, 2000)
+            logger.info(f"Large set ({total} images): reducing max features to {self.max_features}")
+        elif total > 50:
+            self.max_features = min(self.max_features, 3000)
+            logger.info(f"Medium set ({total} images): reducing max features to {self.max_features}")
         
         # Log image sizes for debugging
         if images_data:
@@ -1072,6 +1513,18 @@ class ImageStitcher:
                 start_time = time.time()
                 kp_array, descriptors = self.feature_detector.detect_and_compute(img_data['image'])
                 elapsed = time.time() - start_time
+
+                # If very few descriptors, try a contrast-boosted fallback to rescue low-texture/color-similar images
+                if descriptors is None or len(descriptors) < 50:
+                    try:
+                        gray = cv2.cvtColor(img_data['image'], cv2.COLOR_BGR2GRAY)
+                        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                        boosted = clahe.apply(gray)
+                        boosted_bgr = cv2.cvtColor(boosted, cv2.COLOR_GRAY2BGR)
+                        kp_array, descriptors = self.feature_detector.detect_and_compute(boosted_bgr)
+                        logger.debug(f"Fallback CLAHE detect used for image {idx}, features={0 if descriptors is None else len(descriptors)}")
+                    except Exception as e:
+                        logger.debug(f"CLAHE fallback failed for image {idx}: {e}")
                 
                 if idx == 0:
                     logger.info(f"First image feature detection took {elapsed:.2f}s (subsequent will be faster)")
@@ -1099,6 +1552,9 @@ class ImageStitcher:
                     'descriptors': np.array([])
                 })
         
+        # Restore original max features setting
+        self.max_features = original_max
+        
         return features_data
     
     def _match_features(self, features_data: List[Dict]) -> List[Dict]:
@@ -1115,21 +1571,72 @@ class ImageStitcher:
         n_images = len(features_data)
         rejected_count = 0
         
+        def compute_inlier_stats(match_list, kp_i, kp_j):
+            """Run RANSAC to reject bad links and keep only inlier pairs."""
+            if match_list is None or len(match_list) < 4:
+                return None, None, None
+            
+            pts_i = []
+            pts_j = []
+            for m in match_list:
+                qi = m.queryIdx
+                tj = m.trainIdx
+                if qi < len(kp_i) and tj < len(kp_j):
+                    pts_i.append([kp_i[qi][0], kp_i[qi][1]])
+                    pts_j.append([kp_j[tj][0], kp_j[tj][1]])
+            
+            if len(pts_i) < 4:
+                return None, None, None
+            
+            pts_i = np.float32(pts_i)
+            pts_j = np.float32(pts_j)
+            
+            # Robustly estimate similarity transform with RANSAC; reject outliers
+            _, inliers = cv2.estimateAffinePartial2D(
+                pts_i, pts_j,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=3.0,
+                confidence=0.995,
+                maxIters=2000
+            )
+            
+            if inliers is None:
+                return None, None, None
+            
+            inlier_mask = inliers.astype(bool).ravel()
+            num_inliers = int(np.sum(inlier_mask))
+            inlier_ratio = num_inliers / len(match_list) if len(match_list) > 0 else 0.0
+            
+            # Relaxed: need at least 6 inliers with 25% inlier ratio
+            if num_inliers < 6 or inlier_ratio < 0.25:
+                return None, None, None
+            
+            # Keep only inlier matches to feed alignment
+            filtered_matches = [m for m, keep in zip(match_list, inlier_mask) if keep]
+            return filtered_matches, num_inliers, inlier_ratio
+        
         # Check if matcher is a deep learning matcher that needs images
         from ml.advanced_matchers import LoFTRMatcher, SuperGlueMatcher, DISKMatcher
         is_dl_matcher = isinstance(self.matcher, (LoFTRMatcher,))
         is_superglue = isinstance(self.matcher, SuperGlueMatcher)
         
-        # For small image sets, match all pairs
-        if n_images <= 20:
+        # Determine matching strategy based on image count
+        # n² growth: 10 imgs = 45 pairs, 20 = 190, 50 = 1225, 100 = 4950
+        if n_images <= 10:
+            # Small sets: match all pairs (fast enough)
             pairs_to_match = [(i, j) for i in range(n_images) for j in range(i + 1, n_images)]
             logger.info(f"Small image set ({n_images}): matching all {len(pairs_to_match)} pairs")
         else:
-            # For large sets, use windowed matching strategy
-            pairs_to_match = self._get_smart_matching_pairs(n_images)
-            logger.info(f"Large image set ({n_images}): using smart matching with {len(pairs_to_match)} pairs")
+            # Larger sets: use smart windowed matching to avoid O(n²)
+            pairs_to_match = self._get_smart_matching_pairs(n_images, features_data)
+            logger.info(f"Image set ({n_images}): smart matching with {len(pairs_to_match)} pairs (saved {n_images*(n_images-1)//2 - len(pairs_to_match)} comparisons)")
         
         total_pairs = len(pairs_to_match)
+        
+        # Track connectivity for early termination
+        connected_images = set()
+        target_connectivity = n_images - 1  # Need n-1 edges for spanning tree
+        early_stop_check_interval = max(50, total_pairs // 10)  # Check every ~10%
         
         for pair_idx, (i, j) in enumerate(pairs_to_match):
             self._check_cancel()
@@ -1138,6 +1645,18 @@ class ImageStitcher:
             if total_pairs > 0:
                 progress = 50 + int(20 * (pair_idx / total_pairs))
                 self._update_progress(progress, f"Matching features: pair {pair_idx + 1}/{total_pairs}...")
+            
+            # Early termination check: if we have a well-connected graph, stop early
+            if n_images > 15 and pair_idx > 0 and pair_idx % early_stop_check_interval == 0:
+                if len(matches) >= target_connectivity * 1.5:
+                    # Check if graph is connected
+                    graph_nodes = set()
+                    for m in matches:
+                        graph_nodes.add(m['image_i'])
+                        graph_nodes.add(m['image_j'])
+                    if len(graph_nodes) >= n_images * 0.95:  # 95% of images connected
+                        logger.info(f"Early termination: {len(graph_nodes)}/{n_images} images connected with {len(matches)} matches")
+                        break
             
             try:
                 if is_dl_matcher:
@@ -1178,20 +1697,30 @@ class ImageStitcher:
                 inlier_ratio = match_result.get('inlier_ratio', 1.0)
                 
                 if num_matches > 0:
-                    logger.debug(f"Pair ({i}, {j}): {num_matches} matches, confidence: {match_result.get('confidence', 0.0):.4f}, inlier ratio: {inlier_ratio:.1%}")
+                    logger.debug(f"Pair ({i}, {j}): {num_matches} raw matches, confidence: {match_result.get('confidence', 0.0):.4f}")
                 
-                # Accept matches with at least 10 good matches
-                # Be lenient to avoid rejecting valid connections
-                min_matches = 10
-                if match_result and num_matches >= min_matches:
+                # Require at least 10 raw matches before RANSAC (relaxed for better coverage)
+                if match_result and num_matches >= 10:
+                    kp_i = features_data[i]['keypoints']
+                    kp_j = features_data[j]['keypoints']
+                    filtered_matches, num_inliers, inlier_ratio = compute_inlier_stats(
+                        match_result.get('matches', []),
+                        kp_i,
+                        kp_j
+                    )
+                    
+                    if filtered_matches is None:
+                        logger.debug(f"Pair ({i}, {j}) rejected by RANSAC (inliers too low)")
+                        continue
+                    
                     matches.append({
                         'image_i': i,
                         'image_j': j,
-                        'matches': match_result.get('matches', []),
-                        'num_matches': num_matches,
-                        'confidence': match_result.get('confidence', 0.0),
-                        'inliers': match_result.get('inliers', num_matches),
-                        'inlier_ratio': inlier_ratio
+                        'matches': filtered_matches,
+                        'num_matches': len(filtered_matches),
+                        'num_inliers': num_inliers,
+                        'inlier_ratio': inlier_ratio,
+                        'confidence': match_result.get('confidence', 0.0) * max(inlier_ratio, 0.1)
                     })
             except Exception as e:
                 logger.error(f"Error matching pair ({i}, {j}): {e}")
@@ -1335,48 +1864,91 @@ class ImageStitcher:
         
         return new_images, new_features, new_matches
     
-    def _get_smart_matching_pairs(self, n_images: int) -> List[Tuple[int, int]]:
+    def _get_smart_matching_pairs(self, n_images: int, features_data: List[Dict] = None) -> List[Tuple[int, int]]:
         """
         Generate smart matching pairs for large image sets.
         
-        Strategy for burst photos:
-        1. Match adjacent images (i, i+1) - these definitely overlap
-        2. Match nearby images (window of ~5) - catch slight overlaps
-        3. Add periodic "jump" connections - helps detect row transitions
+        Strategy for panoramas/microscopy (AutoPano Giga-inspired):
+        1. If grid topology detected: use O(n) neighbor-based matching
+        2. Match adjacent images (i, i+1) - these definitely overlap
+        3. Match nearby images (adaptive window) - catch overlaps
+        4. Add grid-based "jump" connections - helps detect row transitions
+        5. Use thumbnail similarity pre-filter when available
         
         This reduces O(n²) to O(n*k) where k is the window size + jumps
+        With grid detection, can achieve O(n) for regular grids.
+        
+        Complexity scaling:
+        - 10 images: ~45 pairs (all pairs)
+        - 50 images: ~400 pairs (smart) or ~100 (grid)
+        - 100 images: ~800 pairs (smart) or ~200 (grid)
+        - 500 images: ~4000 pairs (smart) or ~1000 (grid)
         """
+        # Check if we have cached grid info from previous detection
+        if hasattr(self, '_detected_grid_info') and self._detected_grid_info:
+            grid_info = self._detected_grid_info
+            from core.autopano_features import create_matching_pairs_from_grid
+            pairs = create_matching_pairs_from_grid(n_images, grid_info, 'windowed')
+            if pairs:
+                logger.info(f"Using grid topology: {len(pairs)} pairs for {n_images} images")
+                return pairs
+        
         pairs = set()
         
-        # Estimate grid dimensions (for jump calculation)
-        est_cols = int(np.ceil(np.sqrt(n_images * 1.5)))
+        # Estimate grid dimensions based on typical scanning patterns
+        # Assume roughly square-ish grid with some extra columns
+        est_cols = int(np.ceil(np.sqrt(n_images * 1.3)))
+        est_rows = int(np.ceil(n_images / est_cols))
         
-        # Window size: match images within this range
-        window = min(10, n_images // 4 + 2)
+        # Adaptive window size: smaller for very large sets
+        if n_images <= 30:
+            window = min(8, n_images // 3 + 2)
+        elif n_images <= 100:
+            window = min(6, n_images // 10 + 3)
+        elif n_images <= 500:
+            window = 5
+        else:
+            window = 4  # Very large sets need tight windows
+        
+        logger.debug(f"Smart matching: n={n_images}, est_grid={est_cols}x{est_rows}, window={window}")
         
         for i in range(n_images):
-            # 1. Match nearby images (sliding window)
+            # 1. Match nearby images (sliding window) - sequential neighbors
             for offset in range(1, window + 1):
                 j = i + offset
                 if j < n_images:
                     pairs.add((min(i, j), max(i, j)))
             
-            # 2. Add jump connections to detect row transitions
-            # If scanning left-to-right then down, image i might connect to i+cols
+            # 2. Add row transition connections (jump by estimated column count)
+            # These catch connections between rows in a grid scan
             for jump in [est_cols - 1, est_cols, est_cols + 1]:
                 j = i + jump
                 if 0 <= j < n_images and j != i:
                     pairs.add((min(i, j), max(i, j)))
             
-            # 3. For every ~20 images, try some longer jumps (helps with irregular grids)
-            if i % 20 == 0:
-                for jump in [est_cols * 2, n_images // 4]:
-                    j = i + jump
-                    if 0 <= j < n_images:
-                        pairs.add((min(i, j), max(i, j)))
+            # 3. For larger sets, add sparse long-range probes
+            # Check every Nth image for possible connections
+            if n_images > 50:
+                probe_step = max(10, n_images // 20)
+                if i % probe_step == 0:
+                    # Probe a few distant images
+                    for jump in [est_cols * 2, n_images // 3, n_images // 2]:
+                        j = i + jump
+                        if 0 <= j < n_images:
+                            pairs.add((min(i, j), max(i, j)))
         
-        # Sort pairs for consistent ordering
-        return sorted(list(pairs))
+        # 4. Ensure we have at least some coverage of the full range
+        # Add a few strategic pairs at regular intervals
+        step = max(1, n_images // 10)
+        for i in range(0, n_images, step):
+            for offset in [1, 2, est_cols]:
+                j = i + offset
+                if 0 <= j < n_images:
+                    pairs.add((min(i, j), max(i, j)))
+        
+        result = sorted(list(pairs))
+        logger.info(f"Smart matching: {n_images} images → {len(result)} pairs (vs {n_images*(n_images-1)//2} all pairs)")
+        return result
     
     def _align_with_control_points(
         self,

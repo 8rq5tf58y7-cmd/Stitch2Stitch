@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QLabel, QProgressBar, QTextEdit, QTabWidget,
     QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QSlider, QMessageBox, QSplitter, QListWidget, QListWidgetItem,
-    QScrollArea
+    QScrollArea, QLineEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QImage, QFont
@@ -144,6 +144,8 @@ class MainWindow(QMainWindow):
         self.image_paths: List[Path] = []
         self.stitcher: Optional[ImageStitcher] = None
         self.thread: Optional[StitchingThread] = None
+        self._preview_image: Optional[np.ndarray] = None
+        self._preview_zoom: float = 1.0
         try:
             self.init_ui()
             # Initialize stitcher, but don't fail if it errors (can be retried later)
@@ -280,73 +282,148 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.allow_scale_checkbox)
         
         # Match filtering group
-        filtering_group = QGroupBox("Match Filtering (Bad Link Removal)")
+        filtering_group = QGroupBox("Image Filtering & Optimization")
         filtering_layout = QVBoxLayout()
         
-        # Geometric verification checkbox
-        self.geo_verify_checkbox = QCheckBox("Geometric Verification")
+        # Row 1: Checkboxes
+        filter_checks_layout = QHBoxLayout()
+        self.geo_verify_checkbox = QCheckBox("RANSAC")
         self.geo_verify_checkbox.setChecked(True)
-        self.geo_verify_checkbox.setToolTip(
-            "Filter bad feature matches using RANSAC-based geometric verification.\n"
-            "Removes matches that don't fit a consistent spatial transformation.\n"
-            "Recommended: ON for better alignment accuracy."
-        )
-        filtering_layout.addWidget(self.geo_verify_checkbox)
+        self.geo_verify_checkbox.setToolTip("Filter bad matches with geometric verification")
+        filter_checks_layout.addWidget(self.geo_verify_checkbox)
         
-        # Optimal coverage checkbox with threshold
-        coverage_layout = QHBoxLayout()
-        self.optimal_coverage_checkbox = QCheckBox("Select Optimal Coverage")
-        self.optimal_coverage_checkbox.setChecked(False)
-        self.optimal_coverage_checkbox.setToolTip(
-            "Only use images necessary to cover the panorama area.\n"
-            "Removes redundant images that overlap too much with already-selected images.\n"
-            "Useful for large image sets with many overlapping photos."
-        )
-        coverage_layout.addWidget(self.optimal_coverage_checkbox)
-        
-        coverage_layout.addWidget(QLabel("Max Overlap:"))
-        self.max_coverage_spin = QDoubleSpinBox()
-        self.max_coverage_spin.setRange(0.1, 0.9)
-        self.max_coverage_spin.setSingleStep(0.1)
-        self.max_coverage_spin.setValue(0.5)
-        self.max_coverage_spin.setDecimals(1)
-        self.max_coverage_spin.setToolTip(
-            "Maximum allowed overlap between selected images.\n"
-            "0.3 = 30% overlap max (fewer images, faster processing)\n"
-            "0.5 = 50% overlap max (balanced)\n"
-            "0.7 = 70% overlap max (more images, better coverage)"
-        )
-        coverage_layout.addWidget(self.max_coverage_spin)
-        filtering_layout.addLayout(coverage_layout)
-        
-        # Duplicate detection for burst photos
-        dup_layout = QHBoxLayout()
-        self.remove_duplicates_checkbox = QCheckBox("Remove Duplicate Images")
+        self.remove_duplicates_checkbox = QCheckBox("Dedup")
         self.remove_duplicates_checkbox.setChecked(True)
-        self.remove_duplicates_checkbox.setToolTip(
-            "Remove duplicate/similar images from burst photo sets.\n"
-            "Improves alignment by removing redundant frames.\n"
-            "Recommended: ON for burst mode photos."
-        )
-        dup_layout.addWidget(self.remove_duplicates_checkbox)
+        self.remove_duplicates_checkbox.setToolTip("Remove duplicate burst photos")
+        filter_checks_layout.addWidget(self.remove_duplicates_checkbox)
         
-        dup_layout.addWidget(QLabel("Threshold:"))
+        self.optimal_coverage_checkbox = QCheckBox("Coverage")
+        self.optimal_coverage_checkbox.setChecked(False)
+        self.optimal_coverage_checkbox.setToolTip("Keep only necessary images")
+        filter_checks_layout.addWidget(self.optimal_coverage_checkbox)
+        
+        self.optimize_alignment_checkbox = QCheckBox("Optimize Align")
+        self.optimize_alignment_checkbox.setChecked(False)
+        self.optimize_alignment_checkbox.setToolTip(
+            "Preprocess images for better feature detection (like AutoPano Giga).\n"
+            "Improves alignment for low-contrast or challenging images.\n"
+            "Original images are preserved for final blending."
+        )
+        filter_checks_layout.addWidget(self.optimize_alignment_checkbox)
+        filter_checks_layout.addStretch()
+        filtering_layout.addLayout(filter_checks_layout)
+        
+        # Row 2: Thresholds and options
+        threshold_layout = QHBoxLayout()
+        threshold_layout.addWidget(QLabel("Dup:"))
         self.duplicate_threshold_spin = QDoubleSpinBox()
         self.duplicate_threshold_spin.setRange(0.70, 0.98)
-        self.duplicate_threshold_spin.setSingleStep(0.02)
-        self.duplicate_threshold_spin.setValue(0.92)
+        self.duplicate_threshold_spin.setValue(0.88)
         self.duplicate_threshold_spin.setDecimals(2)
-        self.duplicate_threshold_spin.setToolTip(
-            "Similarity threshold for duplicate detection.\n"
-            "0.92 = Strict (only near-identical frames)\n"
-            "0.85 = Moderate (similar frames merged)\n"
-            "0.75 = Aggressive (more frames removed)"
+        self.duplicate_threshold_spin.setToolTip("Duplicate similarity (0.92=strict, 0.85=moderate)")
+        threshold_layout.addWidget(self.duplicate_threshold_spin)
+        
+        threshold_layout.addWidget(QLabel("Overlap:"))
+        self.max_coverage_spin = QDoubleSpinBox()
+        self.max_coverage_spin.setRange(0.1, 0.9)
+        self.max_coverage_spin.setValue(0.5)
+        self.max_coverage_spin.setDecimals(1)
+        self.max_coverage_spin.setToolTip("Max overlap for coverage mode")
+        threshold_layout.addWidget(self.max_coverage_spin)
+        
+        threshold_layout.addWidget(QLabel("Opt Level:"))
+        self.optimization_level_combo = QComboBox()
+        self.optimization_level_combo.addItems(["Light", "Balanced", "Aggressive"])
+        self.optimization_level_combo.setCurrentIndex(1)  # Balanced default
+        self.optimization_level_combo.setToolTip(
+            "Alignment optimization level:\n"
+            "• Light: Subtle enhancement (fastest)\n"
+            "• Balanced: Moderate enhancement (recommended)\n"
+            "• Aggressive: Strong enhancement (for difficult images)"
         )
-        dup_layout.addWidget(self.duplicate_threshold_spin)
-        filtering_layout.addLayout(dup_layout)
+        threshold_layout.addWidget(self.optimization_level_combo)
+        filtering_layout.addLayout(threshold_layout)
         
         filtering_group.setLayout(filtering_layout)
         settings_layout.addWidget(filtering_group)
+        
+        # AutoPano Giga-inspired advanced features
+        autopano_group = QGroupBox("Advanced (AutoPano-Style)")
+        autopano_layout = QVBoxLayout()
+        
+        # Row 1: Feature toggles
+        autopano_checks = QHBoxLayout()
+        
+        self.grid_topology_checkbox = QCheckBox("Grid Detect")
+        self.grid_topology_checkbox.setChecked(True)
+        self.grid_topology_checkbox.setToolTip(
+            "Auto-detect grid structure to reduce matching from O(n²) to O(n).\n"
+            "Critical for large flat panoramas (microscope, drone, satellite)."
+        )
+        autopano_checks.addWidget(self.grid_topology_checkbox)
+        
+        self.bundle_adjust_checkbox = QCheckBox("Bundle Adjust")
+        self.bundle_adjust_checkbox.setChecked(False)
+        self.bundle_adjust_checkbox.setToolTip(
+            "Global optimization of all camera poses.\n"
+            "Minimizes reprojection error across all keypoints.\n"
+            "Improves alignment accuracy but slower."
+        )
+        autopano_checks.addWidget(self.bundle_adjust_checkbox)
+        
+        self.enhanced_detect_checkbox = QCheckBox("Enhanced Detect")
+        self.enhanced_detect_checkbox.setChecked(False)
+        self.enhanced_detect_checkbox.setToolTip(
+            "Enhanced feature detection for low-texture areas.\n"
+            "Better for skies, walls, water, repetitive patterns."
+        )
+        autopano_checks.addWidget(self.enhanced_detect_checkbox)
+        
+        self.hierarchical_checkbox = QCheckBox("Hierarchical")
+        self.hierarchical_checkbox.setChecked(False)
+        self.hierarchical_checkbox.setToolTip(
+            "Cluster-based stitching for 1000+ images.\n"
+            "Stitches clusters independently, then merges."
+        )
+        autopano_checks.addWidget(self.hierarchical_checkbox)
+        autopano_checks.addStretch()
+        autopano_layout.addLayout(autopano_checks)
+        
+        # Row 2: AI post-processing options
+        ai_post_layout = QHBoxLayout()
+        
+        self.ai_post_checkbox = QCheckBox("AI Post-Process")
+        self.ai_post_checkbox.setChecked(False)
+        self.ai_post_checkbox.setToolTip(
+            "Apply AI-powered post-processing:\n"
+            "• Color correction (auto white balance)\n"
+            "• Denoising\n"
+            "• Gap inpainting"
+        )
+        ai_post_layout.addWidget(self.ai_post_checkbox)
+        
+        self.ai_denoise_checkbox = QCheckBox("Denoise")
+        self.ai_denoise_checkbox.setChecked(True)
+        self.ai_denoise_checkbox.setToolTip("Apply AI denoising")
+        ai_post_layout.addWidget(self.ai_denoise_checkbox)
+        
+        self.ai_color_checkbox = QCheckBox("Color Fix")
+        self.ai_color_checkbox.setChecked(True)
+        self.ai_color_checkbox.setToolTip("Automatic color correction")
+        ai_post_layout.addWidget(self.ai_color_checkbox)
+        
+        self.super_res_checkbox = QCheckBox("2x Super-Res")
+        self.super_res_checkbox.setChecked(False)
+        self.super_res_checkbox.setToolTip(
+            "Apply 2x super-resolution (SLOW).\n"
+            "Doubles output resolution."
+        )
+        ai_post_layout.addWidget(self.super_res_checkbox)
+        ai_post_layout.addStretch()
+        autopano_layout.addLayout(ai_post_layout)
+        
+        autopano_group.setLayout(autopano_layout)
+        settings_layout.addWidget(autopano_group)
         
         # Feature matcher
         matcher_layout = QHBoxLayout()
@@ -371,39 +448,146 @@ class MainWindow(QMainWindow):
             "Linear",
             "Semantic (Foreground-Aware)",
             "PixelStitch (Structure-Preserving)",
-            "AutoStitch (Simple & Fast)"
+            "AutoStitch (Simple & Fast)",
+            "Generative AI (Best Quality)"
         ])
         blend_layout.addWidget(self.blend_combo)
         settings_layout.addLayout(blend_layout)
         
-        # Blending options
+        # Common blending options
         blend_options_group = QGroupBox("Blending Options")
         blend_options_layout = QVBoxLayout()
         
-        self.hdr_checkbox = QCheckBox("HDR Mode (Exposure Fusion)")
+        # Common options row
+        common_opts_layout = QHBoxLayout()
+        self.hdr_checkbox = QCheckBox("HDR")
         self.hdr_checkbox.setToolTip("Combine multiple exposures for better dynamic range")
-        blend_options_layout.addWidget(self.hdr_checkbox)
+        common_opts_layout.addWidget(self.hdr_checkbox)
         
-        self.antighost_checkbox = QCheckBox("Anti-Ghosting")
+        self.antighost_checkbox = QCheckBox("Anti-Ghost")
         self.antighost_checkbox.setToolTip("Reduce ghosting artifacts in overlapping regions")
-        blend_options_layout.addWidget(self.antighost_checkbox)
+        common_opts_layout.addWidget(self.antighost_checkbox)
+        common_opts_layout.addStretch()
+        blend_options_layout.addLayout(common_opts_layout)
         
-        pixel_select_layout = QHBoxLayout()
-        pixel_select_layout.addWidget(QLabel("Pixel Selection:"))
-        self.pixel_select_combo = QComboBox()
-        self.pixel_select_combo.addItems([
-            "Weighted Average (Default)",
-            "Strongest Signal",
-            "Median",
-            "Maximum",
-            "Minimum"
+        # Overlap handling (unified for all methods)
+        overlap_mode_layout = QHBoxLayout()
+        overlap_mode_layout.addWidget(QLabel("Overlap Handling:"))
+        self.semantic_pixel_combo = QComboBox()
+        self.semantic_pixel_combo.addItems([
+            "Blend (Smooth)",
+            "Select (Crisp)",
+            "Pairwise (Burst Fix)"
         ])
-        self.pixel_select_combo.setToolTip("Method for selecting pixel values in overlapping regions")
-        pixel_select_layout.addWidget(self.pixel_select_combo)
-        blend_options_layout.addLayout(pixel_select_layout)
+        self.semantic_pixel_combo.setToolTip(
+            "How overlapping pixels are combined:\n"
+            "• Blend: Weighted average (smooth transitions)\n"
+            "• Select: Winner-take-all (crisp, no blur)\n"
+            "• Pairwise: Best 2 only (fixes burst photo repetition)"
+        )
+        overlap_mode_layout.addWidget(self.semantic_pixel_combo)
+        
+        overlap_mode_layout.addWidget(QLabel("Padding:"))
+        self.canvas_padding_spin = QSpinBox()
+        self.canvas_padding_spin.setRange(0, 500)
+        self.canvas_padding_spin.setValue(50)
+        self.canvas_padding_spin.setSuffix("px")
+        self.canvas_padding_spin.setToolTip("Extra canvas padding")
+        overlap_mode_layout.addWidget(self.canvas_padding_spin)
+        blend_options_layout.addLayout(overlap_mode_layout)
+        
+        # Hidden pixel_select_combo for backwards compatibility (uses same value as semantic_pixel_combo)
+        self.pixel_select_combo = QComboBox()
+        self.pixel_select_combo.addItems(["Weighted Average (Default)"])
+        self.pixel_select_combo.hide()
         
         blend_options_group.setLayout(blend_options_layout)
         settings_layout.addWidget(blend_options_group)
+        
+        # Semantic blending options (shown only when Semantic is selected)
+        self.semantic_options_group = QGroupBox("Semantic Options")
+        semantic_layout = QVBoxLayout()
+        
+        semantic_mode_layout = QHBoxLayout()
+        semantic_mode_layout.addWidget(QLabel("Mode:"))
+        self.semantic_mode_combo = QComboBox()
+        self.semantic_mode_combo.addItems([
+            "Auto",
+            "SAM (Segment Anything)",
+            "DeepLab (Neural Net)",
+            "Hybrid (Microscopy)",
+            "Texture",
+            "Edge",
+            "Superpixel"
+        ])
+        self.semantic_mode_combo.setToolTip(
+            "• Auto: Best available method\n"
+            "• SAM: Works on any image\n"
+            "• DeepLab: Scenes, people, objects\n"
+            "• Hybrid: Best for microscopy/geology\n"
+            "• Texture/Edge/Superpixel: Classical methods"
+        )
+        semantic_mode_layout.addWidget(self.semantic_mode_combo)
+        semantic_layout.addLayout(semantic_mode_layout)
+        
+        self.preserve_foreground_checkbox = QCheckBox("Preserve Foreground Objects")
+        self.preserve_foreground_checkbox.setChecked(True)
+        self.preserve_foreground_checkbox.setToolTip("Prioritize detected foreground objects")
+        semantic_layout.addWidget(self.preserve_foreground_checkbox)
+        
+        self.semantic_options_group.setLayout(semantic_layout)
+        self.semantic_options_group.hide()  # Hidden by default
+        settings_layout.addWidget(self.semantic_options_group)
+        
+        # Generative AI options (shown only when Generative AI is selected)
+        self.gen_ai_group = QGroupBox("Generative AI Options")
+        gen_ai_layout = QVBoxLayout()
+        
+        gen_backend_layout = QHBoxLayout()
+        gen_backend_layout.addWidget(QLabel("Backend:"))
+        self.gen_backend_combo = QComboBox()
+        self.gen_backend_combo.addItems([
+            "Hybrid (Free)",
+            "OpenAI (Best)",
+            "Local (GPU)",
+            "Replicate"
+        ])
+        self.gen_backend_combo.setToolTip(
+            "• Hybrid: Traditional + AI seam repair (free)\n"
+            "• OpenAI: DALL-E 3 (~$0.04/edit)\n"
+            "• Local: Stable Diffusion (needs 8GB VRAM)\n"
+            "• Replicate: Cloud GPU (pay-per-use)"
+        )
+        gen_backend_layout.addWidget(self.gen_backend_combo)
+        gen_ai_layout.addLayout(gen_backend_layout)
+        
+        api_key_layout = QHBoxLayout()
+        api_key_layout.addWidget(QLabel("API Key:"))
+        self.gen_api_key_input = QLineEdit()
+        self.gen_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gen_api_key_input.setPlaceholderText("OpenAI/Replicate key...")
+        api_key_layout.addWidget(self.gen_api_key_input)
+        gen_ai_layout.addLayout(api_key_layout)
+        
+        strength_layout = QHBoxLayout()
+        strength_layout.addWidget(QLabel("Strength:"))
+        self.gen_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gen_strength_slider.setRange(1, 100)
+        self.gen_strength_slider.setValue(75)
+        strength_layout.addWidget(self.gen_strength_slider)
+        self.gen_strength_label = QLabel("75%")
+        self.gen_strength_slider.valueChanged.connect(
+            lambda v: self.gen_strength_label.setText(f"{v}%")
+        )
+        strength_layout.addWidget(self.gen_strength_label)
+        gen_ai_layout.addLayout(strength_layout)
+        
+        self.gen_ai_group.setLayout(gen_ai_layout)
+        self.gen_ai_group.hide()  # Hidden by default
+        settings_layout.addWidget(self.gen_ai_group)
+        
+        # Connect blending method change to show/hide options
+        self.blend_combo.currentTextChanged.connect(self._on_blend_method_changed)
         
         # Max images
         max_img_layout = QHBoxLayout()
@@ -415,44 +599,34 @@ class MainWindow(QMainWindow):
         max_img_layout.addWidget(self.max_images_spin)
         settings_layout.addLayout(max_img_layout)
         
-        # Overlap threshold for grid alignment
+        # Grid/alignment settings (collapsible)
+        grid_group = QGroupBox("Grid Alignment")
+        grid_layout = QVBoxLayout()
+        
         overlap_layout = QHBoxLayout()
         overlap_layout.addWidget(QLabel("Min Overlap:"))
         self.overlap_spin = QDoubleSpinBox()
         self.overlap_spin.setRange(0.0, 100.0)
-        self.overlap_spin.setSingleStep(1.0)
-        self.overlap_spin.setValue(10.0)  # Default 10%
+        self.overlap_spin.setValue(10.0)
         self.overlap_spin.setSuffix("%")
-        self.overlap_spin.setDecimals(1)
-        self.overlap_spin.setToolTip("Minimum overlap percentage for images to be included in grid alignment")
+        self.overlap_spin.setToolTip("Minimum overlap % for grid alignment")
         overlap_layout.addWidget(self.overlap_spin)
         
-        overlap_layout.addWidget(QLabel("Max:"))
-        self.max_overlap_spin = QDoubleSpinBox()
-        self.max_overlap_spin.setRange(0.0, 100.0)
-        self.max_overlap_spin.setSingleStep(5.0)
-        self.max_overlap_spin.setValue(100.0)  # Default 100% (no max limit)
-        self.max_overlap_spin.setSuffix("%")
-        self.max_overlap_spin.setDecimals(1)
-        self.max_overlap_spin.setSpecialValueText("No limit")
-        self.max_overlap_spin.setToolTip(
-            "Maximum overlap percentage (filters out near-duplicates)\n"
-            "100% = no limit, 90% = exclude >90% overlap (likely duplicates)"
-        )
-        overlap_layout.addWidget(self.max_overlap_spin)
-        settings_layout.addLayout(overlap_layout)
-        
-        # Grid spacing for exploded view
-        spacing_layout = QHBoxLayout()
-        spacing_layout.addWidget(QLabel("Grid Spacing:"))
+        overlap_layout.addWidget(QLabel("Spacing:"))
         self.grid_spacing_spin = QDoubleSpinBox()
         self.grid_spacing_spin.setRange(1.0, 3.0)
-        self.grid_spacing_spin.setSingleStep(0.1)
-        self.grid_spacing_spin.setValue(1.3)  # Default 30% gap
-        self.grid_spacing_spin.setDecimals(1)
-        self.grid_spacing_spin.setToolTip("Spacing between images in grid view.\n1.0 = touching, 1.5 = 50% gap between images")
-        spacing_layout.addWidget(self.grid_spacing_spin)
-        settings_layout.addLayout(spacing_layout)
+        self.grid_spacing_spin.setValue(1.3)
+        self.grid_spacing_spin.setToolTip("Grid spacing (1.0=touching, 1.5=50% gap)")
+        overlap_layout.addWidget(self.grid_spacing_spin)
+        grid_layout.addLayout(overlap_layout)
+        
+        # Hidden max_overlap_spin for backward compatibility
+        self.max_overlap_spin = QDoubleSpinBox()
+        self.max_overlap_spin.setValue(100.0)
+        self.max_overlap_spin.hide()
+        
+        grid_group.setLayout(grid_layout)
+        settings_layout.addWidget(grid_group)
         
         # Output settings group
         output_group = QGroupBox("Output Settings")
@@ -480,55 +654,33 @@ class MainWindow(QMainWindow):
         quality_layout.addWidget(self.output_quality_combo)
         output_layout.addLayout(quality_layout)
         
-        # Output DPI
-        dpi_layout = QHBoxLayout()
-        dpi_layout.addWidget(QLabel("DPI:"))
+        # Size limits row
+        limits_layout = QHBoxLayout()
+        limits_layout.addWidget(QLabel("DPI:"))
         self.output_dpi_spin = QSpinBox()
         self.output_dpi_spin.setRange(72, 1200)
         self.output_dpi_spin.setValue(300)
-        self.output_dpi_spin.setSingleStep(50)
-        self.output_dpi_spin.setToolTip("Output resolution in dots per inch.\n72 = screen, 150 = web, 300 = print, 600+ = high quality print")
-        dpi_layout.addWidget(self.output_dpi_spin)
-        output_layout.addLayout(dpi_layout)
+        self.output_dpi_spin.setToolTip("72=screen, 300=print")
+        limits_layout.addWidget(self.output_dpi_spin)
         
-        # Max panorama size (memory limit)
-        max_pano_layout = QHBoxLayout()
-        max_pano_layout.addWidget(QLabel("Max Panorama:"))
+        limits_layout.addWidget(QLabel("Max:"))
         self.max_panorama_spin = QSpinBox()
         self.max_panorama_spin.setRange(0, 500)
         self.max_panorama_spin.setValue(100)
-        self.max_panorama_spin.setSingleStep(25)
-        self.max_panorama_spin.setSuffix(" MP")
-        self.max_panorama_spin.setSpecialValueText("Unlimited")
-        self.max_panorama_spin.setToolTip(
-            "Maximum panorama size in megapixels (0 = unlimited)\n"
-            "Memory guidelines for blending:\n"
-            "• 50MP: ~600MB (AutoStitch) / ~2.4GB (Multiband)\n"
-            "• 100MP: ~1.2GB (AutoStitch) / ~4.8GB (Multiband)\n"
-            "• 200MP: ~2.4GB (AutoStitch) / ~9.6GB (Multiband)\n"
-            "Recommended: RAM(GB) × 15 for Multiband, RAM(GB) × 50 for AutoStitch"
-        )
-        max_pano_layout.addWidget(self.max_panorama_spin)
-        output_layout.addLayout(max_pano_layout)
+        self.max_panorama_spin.setSuffix("MP")
+        self.max_panorama_spin.setSpecialValueText("∞")
+        self.max_panorama_spin.setToolTip("Max panorama size (megapixels)")
+        limits_layout.addWidget(self.max_panorama_spin)
         
-        # Max warp size
-        max_warp_layout = QHBoxLayout()
-        max_warp_layout.addWidget(QLabel("Max Warp:"))
+        limits_layout.addWidget(QLabel("Warp:"))
         self.max_warp_spin = QSpinBox()
         self.max_warp_spin.setRange(0, 200)
         self.max_warp_spin.setValue(50)
-        self.max_warp_spin.setSingleStep(10)
-        self.max_warp_spin.setSuffix(" MP")
-        self.max_warp_spin.setSpecialValueText("Unlimited")
-        self.max_warp_spin.setToolTip(
-            "Maximum size per warped image in megapixels (0 = unlimited)\n"
-            "Memory: ~3MB per megapixel (RGB)\n"
-            "• 50MP: ~150MB per image\n"
-            "• 100MP: ~300MB per image\n"
-            "Only applies when rotation/scale is used."
-        )
-        max_warp_layout.addWidget(self.max_warp_spin)
-        output_layout.addLayout(max_warp_layout)
+        self.max_warp_spin.setSuffix("MP")
+        self.max_warp_spin.setSpecialValueText("∞")
+        self.max_warp_spin.setToolTip("Max warped image size")
+        limits_layout.addWidget(self.max_warp_spin)
+        output_layout.addLayout(limits_layout)
         
         output_group.setLayout(output_layout)
         settings_layout.addWidget(output_group)
@@ -537,108 +689,70 @@ class MainWindow(QMainWindow):
         postproc_group = QGroupBox("Post-Processing")
         postproc_layout = QVBoxLayout()
         
-        # Sharpening
-        sharpen_layout = QHBoxLayout()
+        # Checkboxes row
+        postproc_checks = QHBoxLayout()
         self.sharpen_checkbox = QCheckBox("Sharpen")
-        self.sharpen_checkbox.setToolTip("Apply unsharp mask sharpening to enhance details")
-        sharpen_layout.addWidget(self.sharpen_checkbox)
+        self.sharpen_checkbox.setToolTip("Enhance details")
+        postproc_checks.addWidget(self.sharpen_checkbox)
         
+        self.denoise_checkbox = QCheckBox("Denoise")
+        self.denoise_checkbox.setToolTip("Remove noise")
+        postproc_checks.addWidget(self.denoise_checkbox)
+        
+        self.shadow_checkbox = QCheckBox("Fix Exposure")
+        self.shadow_checkbox.setToolTip("Equalize exposure across image")
+        postproc_checks.addWidget(self.shadow_checkbox)
+        postproc_checks.addStretch()
+        postproc_layout.addLayout(postproc_checks)
+        
+        # Strength controls row
+        strength_layout = QHBoxLayout()
+        strength_layout.addWidget(QLabel("Sharpen:"))
         self.sharpen_amount_spin = QDoubleSpinBox()
         self.sharpen_amount_spin.setRange(0.0, 3.0)
         self.sharpen_amount_spin.setValue(1.0)
-        self.sharpen_amount_spin.setSingleStep(0.1)
-        self.sharpen_amount_spin.setPrefix("Amount: ")
-        self.sharpen_amount_spin.setToolTip("Sharpening strength (0.5=subtle, 1.0=normal, 2.0=strong)")
-        sharpen_layout.addWidget(self.sharpen_amount_spin)
-        postproc_layout.addLayout(sharpen_layout)
+        strength_layout.addWidget(self.sharpen_amount_spin)
         
-        # Denoising
-        denoise_layout = QHBoxLayout()
-        self.denoise_checkbox = QCheckBox("Denoise")
-        self.denoise_checkbox.setToolTip("Remove noise using non-local means denoising")
-        denoise_layout.addWidget(self.denoise_checkbox)
-        
+        strength_layout.addWidget(QLabel("Denoise:"))
         self.denoise_strength_spin = QSpinBox()
         self.denoise_strength_spin.setRange(1, 20)
         self.denoise_strength_spin.setValue(5)
-        self.denoise_strength_spin.setPrefix("h: ")
-        self.denoise_strength_spin.setToolTip("Filter strength (3=light, 5=medium, 10=strong)")
-        denoise_layout.addWidget(self.denoise_strength_spin)
-        postproc_layout.addLayout(denoise_layout)
+        strength_layout.addWidget(self.denoise_strength_spin)
+        postproc_layout.addLayout(strength_layout)
         
-        # Shadow removal / exposure equalization
-        shadow_layout = QHBoxLayout()
-        self.shadow_checkbox = QCheckBox("Remove Shadows")
-        self.shadow_checkbox.setToolTip("Equalize exposure and remove shadows across the image")
-        shadow_layout.addWidget(self.shadow_checkbox)
+        # Additional options row
+        extra_checks = QHBoxLayout()
+        self.clahe_checkbox = QCheckBox("Contrast")
+        self.clahe_checkbox.setToolTip("CLAHE adaptive contrast enhancement")
+        extra_checks.addWidget(self.clahe_checkbox)
         
+        self.deblur_checkbox = QCheckBox("Deblur")
+        self.deblur_checkbox.setToolTip("Wiener deconvolution")
+        extra_checks.addWidget(self.deblur_checkbox)
+        
+        extra_checks.addWidget(QLabel("Upscale:"))
+        self.upscale_combo = QComboBox()
+        self.upscale_combo.addItems(["1x", "1.5x", "2x", "3x", "4x"])
+        self.upscale_combo.setToolTip("Lanczos upscaling")
+        extra_checks.addWidget(self.upscale_combo)
+        postproc_layout.addLayout(extra_checks)
+        
+        # Hidden controls for backwards compatibility
         self.shadow_strength_spin = QDoubleSpinBox()
-        self.shadow_strength_spin.setRange(0.1, 1.0)
         self.shadow_strength_spin.setValue(0.5)
-        self.shadow_strength_spin.setSingleStep(0.1)
-        self.shadow_strength_spin.setPrefix("Strength: ")
-        self.shadow_strength_spin.setToolTip("Shadow removal strength (0.1=subtle, 0.5=medium, 1.0=full)")
-        shadow_layout.addWidget(self.shadow_strength_spin)
-        postproc_layout.addLayout(shadow_layout)
-        
-        # Contrast enhancement
-        clahe_layout = QHBoxLayout()
-        self.clahe_checkbox = QCheckBox("Enhance Contrast")
-        self.clahe_checkbox.setToolTip("CLAHE - Adaptive histogram equalization for improved local contrast")
-        clahe_layout.addWidget(self.clahe_checkbox)
+        self.shadow_strength_spin.hide()
         
         self.clahe_strength_spin = QDoubleSpinBox()
-        self.clahe_strength_spin.setRange(1.0, 5.0)
         self.clahe_strength_spin.setValue(2.0)
-        self.clahe_strength_spin.setSingleStep(0.5)
-        self.clahe_strength_spin.setPrefix("Clip: ")
-        self.clahe_strength_spin.setToolTip("Contrast clip limit (1.0=subtle, 2.0=default, 4.0=strong)")
-        clahe_layout.addWidget(self.clahe_strength_spin)
-        postproc_layout.addLayout(clahe_layout)
-        
-        # Deblur option
-        deblur_layout = QHBoxLayout()
-        self.deblur_checkbox = QCheckBox("Deblur")
-        self.deblur_checkbox.setToolTip("Apply Wiener deconvolution to reduce blur")
-        deblur_layout.addWidget(self.deblur_checkbox)
+        self.clahe_strength_spin.hide()
         
         self.deblur_strength_spin = QDoubleSpinBox()
-        self.deblur_strength_spin.setRange(0.5, 5.0)
         self.deblur_strength_spin.setValue(1.5)
-        self.deblur_strength_spin.setSingleStep(0.5)
-        self.deblur_strength_spin.setPrefix("Radius: ")
-        self.deblur_strength_spin.setToolTip("Blur radius estimate (larger = stronger correction)")
-        deblur_layout.addWidget(self.deblur_strength_spin)
-        postproc_layout.addLayout(deblur_layout)
+        self.deblur_strength_spin.hide()
         
-        # Upscaling
-        upscale_layout = QHBoxLayout()
-        upscale_layout.addWidget(QLabel("Upscale:"))
-        self.upscale_combo = QComboBox()
-        self.upscale_combo.addItems([
-            "1x (Original)",
-            "1.5x",
-            "2x",
-            "3x",
-            "4x"
-        ])
-        self.upscale_combo.setToolTip("Upscale output using high-quality Lanczos interpolation")
-        upscale_layout.addWidget(self.upscale_combo)
-        postproc_layout.addLayout(upscale_layout)
-        
-        # Interpolation quality
-        interp_layout = QHBoxLayout()
-        interp_layout.addWidget(QLabel("Warp Quality:"))
         self.interp_combo = QComboBox()
-        self.interp_combo.addItems([
-            "Lanczos (Best)",
-            "Cubic (High)",
-            "Linear (Fast)",
-            "Nearest (Fastest)"
-        ])
-        self.interp_combo.setToolTip("Interpolation method used during image warping.\nLanczos is highest quality but slower.")
-        interp_layout.addWidget(self.interp_combo)
-        postproc_layout.addLayout(interp_layout)
+        self.interp_combo.addItems(["Lanczos (Best)", "Cubic (High)", "Linear (Fast)", "Nearest (Fastest)"])
+        self.interp_combo.hide()  # Hidden - Lanczos always used
         
         postproc_group.setLayout(postproc_layout)
         settings_layout.addWidget(postproc_group)
@@ -706,19 +820,68 @@ class MainWindow(QMainWindow):
         preview_tab = QWidget()
         preview_layout = QVBoxLayout(preview_tab)
         
-        # Clear preview button
+        # Preview controls - zoom and clear
         preview_controls = QHBoxLayout()
+        
+        # Zoom controls
+        zoom_label = QLabel("Zoom:")
+        preview_controls.addWidget(zoom_label)
+        
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out.setFixedWidth(30)
+        self.btn_zoom_out.setToolTip("Zoom out (Ctrl+-)")
+        self.btn_zoom_out.clicked.connect(self.zoom_out)
+        preview_controls.addWidget(self.btn_zoom_out)
+        
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(10, 400)  # 10% to 400%
+        self.zoom_slider.setValue(100)  # Default 100%
+        self.zoom_slider.setFixedWidth(150)
+        self.zoom_slider.setToolTip("Drag to adjust zoom level")
+        self.zoom_slider.valueChanged.connect(self.on_zoom_changed)
+        preview_controls.addWidget(self.zoom_slider)
+        
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setFixedWidth(30)
+        self.btn_zoom_in.setToolTip("Zoom in (Ctrl++)")
+        self.btn_zoom_in.clicked.connect(self.zoom_in)
+        preview_controls.addWidget(self.btn_zoom_in)
+        
+        self.zoom_percent_label = QLabel("100%")
+        self.zoom_percent_label.setFixedWidth(45)
+        preview_controls.addWidget(self.zoom_percent_label)
+        
+        self.btn_zoom_fit = QPushButton("Fit")
+        self.btn_zoom_fit.setToolTip("Fit image to view (Ctrl+0)")
+        self.btn_zoom_fit.clicked.connect(self.zoom_fit)
+        preview_controls.addWidget(self.btn_zoom_fit)
+        
+        self.btn_zoom_100 = QPushButton("1:1")
+        self.btn_zoom_100.setToolTip("Actual size (Ctrl+1)")
+        self.btn_zoom_100.clicked.connect(self.zoom_actual)
+        preview_controls.addWidget(self.btn_zoom_100)
+        
+        preview_controls.addStretch()
+        
         self.btn_clear_preview = QPushButton("Clear Preview")
         self.btn_clear_preview.clicked.connect(self.clear_preview)
         preview_controls.addWidget(self.btn_clear_preview)
-        preview_controls.addStretch()
+        
         preview_layout.addLayout(preview_controls)
+        
+        # Preview area with scroll support
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidgetResizable(False)  # We control size manually
+        self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_scroll.setStyleSheet("border: 1px solid gray; background-color: #2d2d2d;")
         
         self.preview_label = QLabel("No preview available")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumSize(800, 600)
-        self.preview_label.setStyleSheet("border: 1px solid gray;")
-        preview_layout.addWidget(self.preview_label)
+        self.preview_label.setStyleSheet("background-color: transparent;")
+        self.preview_scroll.setWidget(self.preview_label)
+        
+        preview_layout.addWidget(self.preview_scroll)
         
         tabs.addTab(preview_tab, "Preview")
         
@@ -787,7 +950,8 @@ class MainWindow(QMainWindow):
                 "Linear": "linear",
                 "Semantic (Foreground-Aware)": "semantic",
                 "PixelStitch (Structure-Preserving)": "pixelstitch",
-                "AutoStitch (Simple & Fast)": "autostitch"
+                "AutoStitch (Simple & Fast)": "autostitch",
+                "Generative AI (Best Quality)": "generative"
             }
             
             feature_detector = detector_map.get(self.detector_combo.currentText(), "lp_sift")
@@ -795,11 +959,48 @@ class MainWindow(QMainWindow):
             blending_method = blender_map.get(self.blend_combo.currentText(), "multiband")
             max_features = self.max_features_spin.value()
             
+            # Map semantic mode selection
+            semantic_mode_map = {
+                "Auto": "auto",
+                "SAM (Segment Anything)": "sam",
+                "DeepLab (Neural Net)": "deeplab",
+                "Hybrid (Microscopy)": "hybrid",
+                "Texture": "texture",
+                "Edge": "edge",
+                "Superpixel": "superpixel"
+            }
+            semantic_mode = semantic_mode_map.get(self.semantic_mode_combo.currentText(), "auto")
+            
+            # Map generative AI backend selection
+            gen_backend_map = {
+                "Hybrid (Free)": "hybrid",
+                "OpenAI (Best)": "openai",
+                "Local (GPU)": "local",
+                "Replicate": "replicate"
+            }
+            gen_backend = gen_backend_map.get(self.gen_backend_combo.currentText(), "hybrid")
+            
             # Get blending options
             blending_options = {
                 'hdr_mode': self.hdr_checkbox.isChecked(),
                 'anti_ghosting': self.antighost_checkbox.isChecked(),
-                'pixel_selection': self.pixel_select_combo.currentText().split('(')[0].strip().lower().replace(' ', '_')
+                'pixel_selection': self.pixel_select_combo.currentText().split('(')[0].strip().lower().replace(' ', '_'),
+                'padding': self.canvas_padding_spin.value(),
+                'fit_all': True,
+                # Semantic blending options
+                'semantic_mode': semantic_mode,
+                'preserve_foreground': self.preserve_foreground_checkbox.isChecked(),
+                # Overlap pixel selection mode
+                'semantic_pixel_selection': ['blend', 'select', 'pairwise'][self.semantic_pixel_combo.currentIndex()],
+                # Generative AI options
+                'gen_backend': gen_backend,
+                'gen_api_key': self.gen_api_key_input.text() or None,
+                'gen_strength': self.gen_strength_slider.value() / 100.0,
+                # AI post-processing options (AutoPano Giga-style)
+                'ai_post_processing': self.ai_post_checkbox.isChecked(),
+                'ai_denoise': self.ai_denoise_checkbox.isChecked(),
+                'ai_color_correct': self.ai_color_checkbox.isChecked(),
+                'super_resolution': self.super_res_checkbox.isChecked()
             }
             
             allow_scale = self.allow_scale_checkbox.isChecked()
@@ -839,9 +1040,16 @@ class MainWindow(QMainWindow):
                 select_optimal_coverage=select_optimal_coverage,
                 max_coverage_overlap=max_coverage_overlap,
                 remove_duplicates=remove_duplicates,
-                duplicate_threshold=duplicate_threshold
+                duplicate_threshold=duplicate_threshold,
+                optimize_alignment=self.optimize_alignment_checkbox.isChecked(),
+                alignment_optimization_level=self.optimization_level_combo.currentText().lower(),
+                # AutoPano Giga-inspired features
+                use_grid_topology=self.grid_topology_checkbox.isChecked(),
+                use_bundle_adjustment=self.bundle_adjust_checkbox.isChecked(),
+                use_hierarchical_stitching=self.hierarchical_checkbox.isChecked(),
+                use_enhanced_detection=self.enhanced_detect_checkbox.isChecked()
             )
-            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient}, geo_verify={geometric_verify}, optimal_coverage={select_optimal_coverage}, remove_dups={remove_duplicates})")
+            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient}, geo_verify={geometric_verify}, optimal_coverage={select_optimal_coverage}, remove_dups={remove_duplicates}, optimize_align={self.optimize_alignment_checkbox.isChecked()})")
         except Exception as e:
             logger.error(f"Failed to initialize stitcher: {e}", exc_info=True)
             raise
@@ -915,7 +1123,48 @@ class MainWindow(QMainWindow):
         self.preview_label.clear()
         self.preview_label.setText("No preview available")
         self.current_result = None
+        self._preview_image = None
+        self._preview_zoom = 1.0
+        self.zoom_slider.setValue(100)
+        self.zoom_percent_label.setText("100%")
         self.log("Preview cleared")
+    
+    def zoom_in(self):
+        """Zoom in the preview by 25%"""
+        current = self.zoom_slider.value()
+        new_zoom = min(400, current + 25)
+        self.zoom_slider.setValue(new_zoom)
+    
+    def zoom_out(self):
+        """Zoom out the preview by 25%"""
+        current = self.zoom_slider.value()
+        new_zoom = max(10, current - 25)
+        self.zoom_slider.setValue(new_zoom)
+    
+    def zoom_fit(self):
+        """Fit the preview to the scroll area"""
+        if self._preview_image is None:
+            return
+        
+        h, w = self._preview_image.shape[:2]
+        scroll_w = self.preview_scroll.viewport().width() - 20
+        scroll_h = self.preview_scroll.viewport().height() - 20
+        
+        scale_w = scroll_w / w if w > 0 else 1
+        scale_h = scroll_h / h if h > 0 else 1
+        fit_scale = min(scale_w, scale_h) * 100
+        
+        self.zoom_slider.setValue(int(max(10, min(400, fit_scale))))
+    
+    def zoom_actual(self):
+        """Set zoom to 100% (actual size)"""
+        self.zoom_slider.setValue(100)
+    
+    def on_zoom_changed(self, value):
+        """Handle zoom slider value change"""
+        self._preview_zoom = value / 100.0
+        self.zoom_percent_label.setText(f"{value}%")
+        self._update_preview_zoom()
     
     def browse_output(self):
         """Browse for output file"""
@@ -1106,82 +1355,106 @@ class MainWindow(QMainWindow):
         self.progress_label.setVisible(False)
         self.progress_label.setText("")
     
+    def _on_blend_method_changed(self, text: str):
+        """Show/hide blending options based on selected method."""
+        is_semantic = "Semantic" in text
+        is_generative = "Generative" in text
+        
+        self.semantic_options_group.setVisible(is_semantic)
+        self.gen_ai_group.setVisible(is_generative)
+    
     def update_preview(self, image: np.ndarray):
-        """Update preview with image"""
+        """Update preview with image (supports live zoom)"""
         try:
             # Validate input
             if image is None:
                 logger.warning("Cannot update preview: image is None")
                 self.preview_label.setText("No preview available")
+                self._preview_image = None
                 return
             
             if not isinstance(image, np.ndarray):
                 logger.warning(f"Cannot update preview: invalid type {type(image)}")
                 self.preview_label.setText("Invalid image data")
+                self._preview_image = None
                 return
             
             if image.size == 0:
                 logger.warning("Cannot update preview: image is empty")
                 self.preview_label.setText("Empty image")
+                self._preview_image = None
                 return
             
-            # Resize for preview
             h, w = image.shape[:2]
             if w == 0 or h == 0:
                 logger.warning(f"Invalid image dimensions: {w}x{h}")
                 self.preview_label.setText("Invalid image dimensions")
                 return
             
-            max_size = 800
-            scale = min(max_size / w, max_size / h)
-            new_w = max(1, int(w * scale))
-            new_h = max(1, int(h * scale))
-            
+            # Normalize image format
             if len(image.shape) == 3:
                 if image.shape[2] != 3:
-                    logger.warning(f"Unexpected image shape: {image.shape}")
-                    # Convert to 3-channel if needed
                     if image.shape[2] == 1:
                         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
                     elif image.shape[2] == 4:
                         image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-                
-                resized = cv2.resize(image, (new_w, new_h))
-                # Convert BGR to RGB for Qt (OpenCV uses BGR)
+            
+            # Store the original image for zooming
+            self._preview_image = image.copy()
+            
+            # Update the display with current zoom
+            self._update_preview_zoom()
+            
+        except Exception as e:
+            logger.error(f"Error updating preview: {e}", exc_info=True)
+            self.preview_label.setText(f"Preview error: {str(e)}")
+    
+    def _update_preview_zoom(self):
+        """Update the preview display with current zoom level"""
+        try:
+            if self._preview_image is None:
+                return
+            
+            image = self._preview_image
+            h, w = image.shape[:2]
+            
+            # Apply zoom
+            new_w = max(1, int(w * self._preview_zoom))
+            new_h = max(1, int(h * self._preview_zoom))
+            
+            # Use appropriate interpolation based on zoom direction
+            if self._preview_zoom < 1.0:
+                interp = cv2.INTER_AREA  # Better for shrinking
+            else:
+                interp = cv2.INTER_LINEAR  # Better for enlarging
+            
+            if len(image.shape) == 3:
+                resized = cv2.resize(image, (new_w, new_h), interpolation=interp)
+                # Convert BGR to RGB for Qt
                 resized_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                # Ensure contiguous array and correct dtype
                 resized_rgb = np.ascontiguousarray(resized_rgb, dtype=np.uint8)
-                if resized_rgb.size == 0:
-                    logger.warning("Resized image is empty")
-                    self.preview_label.setText("Failed to create preview")
-                    return
                 bytes_per_line = resized_rgb.strides[0]
                 qimage = QImage(resized_rgb.data, new_w, new_h, bytes_per_line, QImage.Format.Format_RGB888)
             else:
-                resized = cv2.resize(image, (new_w, new_h))
+                resized = cv2.resize(image, (new_w, new_h), interpolation=interp)
                 resized = np.ascontiguousarray(resized, dtype=np.uint8)
-                if resized.size == 0:
-                    logger.warning("Resized image is empty")
-                    self.preview_label.setText("Failed to create preview")
-                    return
                 bytes_per_line = resized.strides[0]
                 qimage = QImage(resized.data, new_w, new_h, bytes_per_line, QImage.Format.Format_Grayscale8)
             
             if qimage.isNull():
-                logger.warning("Failed to create QImage from numpy array")
-                self.preview_label.setText("Failed to create preview")
+                logger.warning("Failed to create QImage")
                 return
             
             pixmap = QPixmap.fromImage(qimage)
             if pixmap.isNull():
-                logger.warning("Failed to create QPixmap from QImage")
-                self.preview_label.setText("Failed to create preview")
+                logger.warning("Failed to create QPixmap")
                 return
             
             self.preview_label.setPixmap(pixmap)
+            self.preview_label.resize(pixmap.size())
+            
         except Exception as e:
-            logger.error(f"Error updating preview: {e}", exc_info=True)
-            self.preview_label.setText(f"Preview error: {str(e)}")
+            logger.error(f"Error updating zoom preview: {e}", exc_info=True)
     
     def update_preview_from_grid(self, grid_layout):
         """Update preview with grid layout"""

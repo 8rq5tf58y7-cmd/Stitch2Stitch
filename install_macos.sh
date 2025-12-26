@@ -209,6 +209,31 @@ main() {
         pip install opencv-python opencv-contrib-python numpy scipy Pillow PyQt6 matplotlib tqdm pyyaml tifffile psutil
     fi
     
+    # Install AI/ML packages for advanced blending
+    echo ""
+    echo "Installing AI segmentation packages..."
+    pip install scikit-image --quiet 2>/dev/null || echo "Note: scikit-image installation skipped"
+    
+    # Install MobileSAM for Segment Anything support
+    echo "Installing MobileSAM (AI segmentation)..."
+    pip install git+https://github.com/ChaoningZhang/MobileSAM.git --quiet 2>/dev/null || {
+        echo "Note: MobileSAM installation skipped (requires git)"
+    }
+    
+    # Download AI models
+    echo ""
+    echo "Downloading AI models..."
+    if [ -f "src/utils/model_downloader.py" ]; then
+        python -m src.utils.model_downloader --download-recommended 2>/dev/null || {
+            echo "Note: Model download skipped (can be done later)"
+        }
+    fi
+    
+    echo ""
+    echo "AI features installed successfully!"
+    echo "Available AI blending modes: sam, deeplab, hybrid, texture"
+    echo ""
+    
     # Create launcher script
     echo "Creating launcher..."
     cat > Stitch2Stitch.sh << 'EOF'

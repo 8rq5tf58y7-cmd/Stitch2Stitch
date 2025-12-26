@@ -1,5 +1,5 @@
 """
-Advanced feature matching with RANSAC, geometric verification, and confidence scoring
+Advanced feature matching with RANSAC, confidence scoring, and color verification
 """
 
 import cv2
@@ -10,15 +10,47 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def compute_color_similarity(desc1: np.ndarray, desc2: np.ndarray, color_dim: int = 48) -> float:
+    """
+    Compute color similarity between two descriptors that have color info appended.
+    
+    Args:
+        desc1: First descriptor (SIFT + color)
+        desc2: Second descriptor (SIFT + color)
+        color_dim: Number of color descriptor dimensions (default 48 = 16 bins * 3 channels)
+        
+    Returns:
+        Color similarity score (0-1, higher = more similar)
+    """
+    if len(desc1) <= color_dim or len(desc2) <= color_dim:
+        return 1.0  # No color info, assume similar
+    
+    # Extract color portion (last color_dim elements)
+    color1 = desc1[-color_dim:]
+    color2 = desc2[-color_dim:]
+    
+    # Normalize
+    norm1 = np.linalg.norm(color1)
+    norm2 = np.linalg.norm(color2)
+    
+    if norm1 < 1e-6 or norm2 < 1e-6:
+        return 1.0  # Empty color descriptors
+    
+    # Cosine similarity
+    similarity = np.dot(color1, color2) / (norm1 * norm2)
+    return max(0.0, similarity)
+
+
 class AdvancedMatcher:
-    """Advanced feature matcher with geometric verification"""
+    """Advanced feature matcher with multiple algorithms and color verification"""
     
     def __init__(
         self,
         use_gpu: bool = False,
         method: str = 'flann',
         ratio_threshold: float = 0.75,
-        geometric_verify: bool = True
+        color_threshold: float = 0.3,
+        use_color_verification: bool = True
     ):
         """
         Initialize matcher
@@ -26,26 +58,35 @@ class AdvancedMatcher:
         Args:
             use_gpu: Enable GPU acceleration
             method: Matching method ('flann' or 'bf')
-            ratio_threshold: Lowe's ratio test threshold (lower = stricter)
-            geometric_verify: Apply geometric verification to filter bad matches
+            ratio_threshold: Lowe's ratio test threshold
+            color_threshold: Minimum color similarity for matches (0-1)
+            use_color_verification: Whether to verify matches using color similarity
         """
         self.use_gpu = use_gpu
-        # Standard ratio threshold (0.75 is the classic Lowe's ratio)
-        self.ratio_threshold = ratio_threshold if ratio_threshold > 0 else 0.75
-        self.geometric_verify = geometric_verify
+        self.method = method
+        # Stricter ratio threshold for better match quality (default 0.75 -> 0.7)
+        self.ratio_threshold = ratio_threshold if ratio_threshold > 0 else 0.7
+        self.color_threshold = color_threshold
+        self.use_color_verification = use_color_verification
         
-        if method == 'flann':
-            # FLANN matcher for SIFT/SURF - use LSH for binary descriptors, KDTREE for float
-            # We'll use KDTREE for SIFT (float descriptors)
+        # Will create matcher on first use (to handle different descriptor dimensions)
+        self.matcher = None
+        self._last_dim = None
+        
+        logger.info(f"Advanced matcher initialized (method: {method}, color_verification: {use_color_verification})")
+    
+    def _create_matcher(self, descriptor_dim: int):
+        """Create matcher appropriate for descriptor dimension"""
+        if self.method == 'flann':
+            # FLANN matcher for SIFT/SURF - use KDTREE for float descriptors
             FLANN_INDEX_KDTREE = 1
             index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-            search_params = dict(checks=100)  # Increased checks for better accuracy
+            search_params = dict(checks=100)
             self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
         else:
             # Brute force matcher
             self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-        
-        logger.info(f"Advanced matcher initialized (method: {method}, ratio: {self.ratio_threshold})")
+        self._last_dim = descriptor_dim
     
     def match(
         self,
@@ -53,11 +94,11 @@ class AdvancedMatcher:
         descriptors2: np.ndarray
     ) -> Dict:
         """
-        Match descriptors between two images
+        Match descriptors between two images with optional color verification
         
         Args:
-            descriptors1: Descriptors from first image
-            descriptors2: Descriptors from second image
+            descriptors1: Descriptors from first image (may include color info)
+            descriptors2: Descriptors from second image (may include color info)
             
         Returns:
             Dictionary with match results
@@ -106,20 +147,26 @@ class AdvancedMatcher:
                 'homography': None
             }
         
+        # Check if descriptors include color info (SIFT=128, SIFT+color=176)
+        has_color = descriptors1.shape[1] > 128
+        color_dim = 48 if has_color else 0
+        
         # Ensure descriptors are float32 for FLANN
         if descriptors1.dtype != np.float32:
             descriptors1 = descriptors1.astype(np.float32)
         if descriptors2.dtype != np.float32:
             descriptors2 = descriptors2.astype(np.float32)
         
+        # Create or recreate matcher if descriptor dimension changed
+        if self.matcher is None or self._last_dim != descriptors1.shape[1]:
+            self._create_matcher(descriptors1.shape[1])
+        
         try:
             # Perform matching with error handling
-            # FLANN can fail with certain descriptor types, so try-catch
             try:
                 matches = self.matcher.knnMatch(descriptors1, descriptors2, k=2)
             except cv2.error as e:
                 logger.warning(f"FLANN matching failed, falling back to brute force: {e}")
-                # Fallback to brute force matcher
                 bf_matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
                 matches = bf_matcher.knnMatch(descriptors1, descriptors2, k=2)
             
@@ -131,37 +178,54 @@ class AdvancedMatcher:
                     'homography': None
                 }
             
-            # Apply Lowe's ratio test with stricter threshold
+            # Apply Lowe's ratio test
             good_matches = []
             for match_pair in matches:
                 if len(match_pair) == 2:
                     m, n = match_pair
-                    # Stricter ratio test - only accept matches where first is significantly better
                     if m.distance < self.ratio_threshold * n.distance:
                         good_matches.append(m)
             
-            if len(good_matches) < 10:  # Require at least 10 matches for reliability
+            # Apply color verification if enabled and color info available
+            if self.use_color_verification and has_color and len(good_matches) > 0:
+                color_verified_matches = []
+                rejected_by_color = 0
+                
+                for m in good_matches:
+                    color_sim = compute_color_similarity(
+                        descriptors1[m.queryIdx],
+                        descriptors2[m.trainIdx],
+                        color_dim
+                    )
+                    
+                    if color_sim >= self.color_threshold:
+                        color_verified_matches.append(m)
+                    else:
+                        rejected_by_color += 1
+                
+                if rejected_by_color > 0:
+                    logger.debug(f"Color verification rejected {rejected_by_color} matches "
+                               f"(kept {len(color_verified_matches)}/{len(good_matches)})")
+                
+                good_matches = color_verified_matches
+            
+            if len(good_matches) < 10:
                 return {
                     'matches': good_matches,
                     'num_matches': len(good_matches),
                     'confidence': 0.0,
-                    'homography': None,
-                    'inliers': 0
+                    'homography': None
                 }
             
-            # Calculate confidence (avoid division by zero)
+            # Calculate confidence
             max_descriptors = max(len(descriptors1), len(descriptors2))
-            if max_descriptors > 0:
-                confidence = len(good_matches) / max_descriptors
-            else:
-                confidence = 0.0
+            confidence = len(good_matches) / max_descriptors if max_descriptors > 0 else 0.0
             
             return {
                 'matches': good_matches,
                 'num_matches': len(good_matches),
                 'confidence': confidence,
-                'homography': None,  # Will be calculated in alignment module
-                'inliers': len(good_matches)  # Will be updated by geometric verification
+                'homography': None
             }
         except Exception as e:
             logger.error(f"Error during feature matching: {e}", exc_info=True)
@@ -169,186 +233,6 @@ class AdvancedMatcher:
                 'matches': [],
                 'num_matches': 0,
                 'confidence': 0.0,
-                'homography': None,
-                'inliers': 0
+                'homography': None
             }
-    
-    def match_with_keypoints(
-        self,
-        keypoints1: np.ndarray,
-        descriptors1: np.ndarray,
-        keypoints2: np.ndarray,
-        descriptors2: np.ndarray
-    ) -> Dict:
-        """
-        Match descriptors with geometric verification using keypoint positions.
-        
-        This method filters out geometrically inconsistent matches using RANSAC
-        to estimate a similarity transform and reject outliers.
-        
-        Args:
-            keypoints1: Keypoints from first image (Nx2 array of [x, y])
-            descriptors1: Descriptors from first image
-            keypoints2: Keypoints from second image (Nx2 array of [x, y])
-            descriptors2: Descriptors from second image
-            
-        Returns:
-            Dictionary with verified match results including inlier information
-        """
-        # First get basic matches
-        basic_result = self.match(descriptors1, descriptors2)
-        
-        if basic_result['num_matches'] < 10 or not self.geometric_verify:
-            return basic_result
-        
-        # Extract matched keypoint positions
-        pts1 = []
-        pts2 = []
-        for m in basic_result['matches']:
-            idx1 = m.queryIdx
-            idx2 = m.trainIdx
-            if idx1 < len(keypoints1) and idx2 < len(keypoints2):
-                pts1.append(keypoints1[idx1][:2])  # x, y
-                pts2.append(keypoints2[idx2][:2])
-        
-        if len(pts1) < 4:
-            return basic_result
-        
-        pts1 = np.float32(pts1)
-        pts2 = np.float32(pts2)
-        
-        # Use RANSAC to find inliers via similarity transform
-        # This filters out matches that don't fit the geometric model
-        # Use a more lenient threshold to avoid rejecting valid matches
-        transform, inliers = cv2.estimateAffinePartial2D(
-            pts1, pts2,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=5.0,  # More lenient threshold for larger images
-            confidence=0.99,
-            maxIters=2000
-        )
-        
-        if inliers is None:
-            logger.debug("Geometric verification found no inliers, returning basic matches")
-            return basic_result  # Fall back to unverified matches
-        
-        # Filter matches to keep only inliers
-        inlier_mask = inliers.ravel().astype(bool)
-        verified_matches = [m for m, is_inlier in zip(basic_result['matches'], inlier_mask) if is_inlier]
-        
-        inlier_count = len(verified_matches)
-        total_matches = basic_result['num_matches']
-        inlier_ratio = inlier_count / total_matches if total_matches > 0 else 0
-        
-        logger.debug(f"Geometric verification: {inlier_count}/{total_matches} inliers ({inlier_ratio:.1%})")
-        
-        # Only reject if inlier ratio is very low AND we have few inliers
-        # This avoids rejecting valid matches in difficult cases
-        if inlier_ratio < 0.20 and inlier_count < 15:
-            logger.info(f"Low inlier ratio {inlier_ratio:.1%} with only {inlier_count} inliers - returning basic matches")
-            return basic_result  # Fall back rather than reject entirely
-        
-        # Check transform validity - but only warn, don't reject
-        if transform is not None:
-            scale = np.sqrt(transform[0, 0]**2 + transform[0, 1]**2)
-            rotation = np.abs(np.degrees(np.arctan2(transform[1, 0], transform[0, 0])))
-            
-            # Only reject truly extreme transforms (likely wrong)
-            if scale < 0.2 or scale > 5.0:
-                logger.info(f"Extreme scale {scale:.2f} detected - returning basic matches")
-                return basic_result  # Fall back rather than reject
-        
-        # Return verified matches if we have enough
-        if inlier_count >= 8:
-            # Update confidence based on verified matches
-            max_descriptors = max(len(descriptors1), len(descriptors2))
-            confidence = inlier_count / max_descriptors if max_descriptors > 0 else 0.0
-            
-            return {
-                'matches': verified_matches,
-                'num_matches': inlier_count,
-                'confidence': confidence,
-                'homography': transform,
-                'inliers': inlier_count,
-                'inlier_ratio': inlier_ratio
-            }
-        else:
-            # Too few inliers, fall back to basic matches
-            logger.debug(f"Only {inlier_count} inliers, returning basic matches")
-            return basic_result
-    
-    def filter_spatial_outliers(
-        self,
-        matches: List,
-        keypoints1: np.ndarray,
-        keypoints2: np.ndarray,
-        k_neighbors: int = 5
-    ) -> List:
-        """
-        Filter matches based on spatial consistency using local neighborhood voting.
-        
-        A good match should have neighbors that agree on similar displacement.
-        Bad matches have random displacements that differ from their neighbors.
-        
-        Args:
-            matches: List of cv2.DMatch objects
-            keypoints1: Keypoints from first image
-            keypoints2: Keypoints from second image
-            k_neighbors: Number of neighbors to consider
-            
-        Returns:
-            Filtered list of matches
-        """
-        if len(matches) < k_neighbors + 1:
-            return matches
-        
-        # Calculate displacement vectors for each match
-        displacements = []
-        positions1 = []
-        for m in matches:
-            idx1 = m.queryIdx
-            idx2 = m.trainIdx
-            if idx1 < len(keypoints1) and idx2 < len(keypoints2):
-                pt1 = keypoints1[idx1][:2]
-                pt2 = keypoints2[idx2][:2]
-                displacements.append(pt2 - pt1)
-                positions1.append(pt1)
-        
-        if len(displacements) < k_neighbors + 1:
-            return matches
-        
-        displacements = np.array(displacements)
-        positions1 = np.array(positions1)
-        
-        # For each match, check if its displacement is consistent with neighbors
-        consistent_mask = []
-        for i in range(len(displacements)):
-            # Find k nearest neighbors in image 1
-            distances = np.linalg.norm(positions1 - positions1[i], axis=1)
-            distances[i] = np.inf  # Exclude self
-            neighbor_indices = np.argsort(distances)[:k_neighbors]
-            
-            # Calculate median displacement of neighbors
-            neighbor_displacements = displacements[neighbor_indices]
-            median_displacement = np.median(neighbor_displacements, axis=0)
-            
-            # Check if this match's displacement is close to neighbor median
-            diff = np.linalg.norm(displacements[i] - median_displacement)
-            
-            # Adaptive threshold based on neighbor variance
-            neighbor_variance = np.std(neighbor_displacements)
-            threshold = max(30, neighbor_variance * 2.5)  # At least 30 pixels tolerance
-            
-            consistent_mask.append(diff < threshold)
-        
-        # Keep only consistent matches
-        filtered = [m for m, is_consistent in zip(matches, consistent_mask) if is_consistent]
-        
-        if len(filtered) < len(matches) * 0.5 and len(filtered) < 15:
-            # If filtering removed too many, return original (might be a difficult case)
-            logger.debug(f"Spatial filter would remove too many matches ({len(filtered)}/{len(matches)}), keeping original")
-            return matches
-        
-        logger.debug(f"Spatial filter: {len(filtered)}/{len(matches)} matches kept")
-        return filtered
 
