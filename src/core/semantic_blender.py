@@ -468,13 +468,13 @@ class SemanticBlender:
             logger.error(f"Invalid bounding box: {bbox}")
             return aligned_images[0]['image'].copy()
         
-        # Size limit
-        max_pixels = 100_000_000
-        if output_h * output_w > max_pixels:
-            scale = np.sqrt(max_pixels / (output_h * output_w))
+        # Scale to target size (500MP default)
+        max_pixels = 500_000_000
+        total_pixels = output_h * output_w
+        scale = np.sqrt(max_pixels / total_pixels)
             output_h = int(output_h * scale)
             output_w = int(output_w * scale)
-            logger.warning(f"Scaling to {output_w}x{output_h}")
+        logger.info(f"Scaling to target: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
         
         # Create output
         panorama = np.zeros((output_h, output_w, 3), dtype=np.float32)
@@ -608,14 +608,15 @@ class SemanticBlender:
             logger.error(f"Invalid bounding box: {bbox}")
             return aligned_images[0]['image'].copy()
         
-        # Size limit
-        max_pixels = 100_000_000
+        # Scale to target size (500MP default)
+        max_pixels = 500_000_000
         scale_factor = 1.0
-        if output_h * output_w > max_pixels:
-            scale_factor = np.sqrt(max_pixels / (output_h * output_w))
+        total_pixels = output_h * output_w
+        # Always scale to target for consistent output size
+        scale_factor = np.sqrt(max_pixels / total_pixels)
             output_h = int(output_h * scale_factor)
             output_w = int(output_w * scale_factor)
-            logger.warning(f"Scaling to {output_w}x{output_h}")
+        logger.info(f"Scaling to target: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
         
         # Create output canvas (white background like autostitch)
         panorama = np.ones((output_h, output_w, 3), dtype=np.uint8) * 255
@@ -680,8 +681,8 @@ class SemanticBlender:
             if scale_factor != 1.0:
                 x_off = int((bbox_img[0] - x_min) * scale_factor)
                 y_off = int((bbox_img[1] - y_min) * scale_factor)
-                scaled_w = int(w * scale_factor)
-                scaled_h = int(h * scale_factor)
+                scaled_w = max(1, int(w * scale_factor))
+                scaled_h = max(1, int(h * scale_factor))
                 if scaled_w > 0 and scaled_h > 0:
                     img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
                     alpha_mask = cv2.resize(alpha_mask.astype(np.uint8), (scaled_w, scaled_h),
@@ -798,14 +799,14 @@ class SemanticBlender:
             logger.error(f"Invalid bounding box: {bbox}")
             return aligned_images[0]['image'].copy()
         
-        # Size limit
-        max_pixels = 100_000_000
+        # Scale to target size (500MP default)
+        max_pixels = 500_000_000
         scale_factor = 1.0
-        if output_h * output_w > max_pixels:
-            scale_factor = np.sqrt(max_pixels / (output_h * output_w))
+        total_pixels = output_h * output_w
+        scale_factor = np.sqrt(max_pixels / total_pixels)
             output_h = int(output_h * scale_factor)
             output_w = int(output_w * scale_factor)
-            logger.warning(f"Scaling to {output_w}x{output_h}")
+        logger.info(f"Scaling to target: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
         
         # Create output canvas (white background)
         panorama = np.ones((output_h, output_w, 3), dtype=np.uint8) * 255
@@ -867,8 +868,8 @@ class SemanticBlender:
             if scale_factor != 1.0:
                 x_off = int((bbox_img[0] - x_min) * scale_factor)
                 y_off = int((bbox_img[1] - y_min) * scale_factor)
-                scaled_w = int(w * scale_factor)
-                scaled_h = int(h * scale_factor)
+                scaled_w = max(1, int(w * scale_factor))
+                scaled_h = max(1, int(h * scale_factor))
                 if scaled_w > 0 and scaled_h > 0:
                     img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
                     alpha_mask = cv2.resize(alpha_mask.astype(np.uint8), (scaled_w, scaled_h),

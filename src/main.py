@@ -11,6 +11,19 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Check and install dependencies before importing heavy modules
+def _ensure_dependencies():
+    """Quick dependency check at startup."""
+    try:
+        from utils.dependency_installer import ensure_dependencies
+        if not ensure_dependencies(silent=True):
+            print("Installing missing dependencies...", file=sys.stderr)
+            ensure_dependencies(silent=False)
+    except ImportError:
+        pass  # dependency_installer itself might need deps
+
+_ensure_dependencies()
+
 from gui.main_window import MainWindow
 from core.stitcher import ImageStitcher
 from utils.logger import setup_logger, get_log_file_path
@@ -133,7 +146,7 @@ def main():
         return 0
     else:
         # GUI mode
-        from PyQt6.QtWidgets import QApplication, QMessageBox
+        from PySide6.QtWidgets import QApplication, QMessageBox
         
         try:
             app = QApplication(sys.argv)

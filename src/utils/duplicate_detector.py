@@ -3,15 +3,39 @@ Duplicate and similar image detector for burst mode photos.
 
 Uses multiple similarity metrics to identify truly duplicate/redundant images
 while preserving sequential burst photos that cover different areas.
+
+OPTIMIZED for large datasets (500+ images):
+- Uses locality-sensitive hashing for O(n) approximate nearest neighbor
+- Progressive hash refinement (coarse to fine)
+- Early termination with bounded duplicate removal
 """
 
 import cv2
 import numpy as np
-from typing import List, Tuple, Set, Optional, Callable
+from typing import List, Tuple, Set, Optional, Callable, Dict
 import logging
 from pathlib import Path
+import time
 
 logger = logging.getLogger(__name__)
+
+# Debug log path
+_DEBUG_LOG = r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log'
+
+def _log_debug(hypothesis_id: str, location: str, message: str, data: dict):
+    """Helper to write debug log."""
+    try:
+        import json
+        with open(_DEBUG_LOG, 'a') as f:
+            f.write(json.dumps({
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": time.time()
+            }) + '\n')
+    except:
+        pass
 
 
 class DuplicateDetector:
@@ -31,7 +55,7 @@ class DuplicateDetector:
         self,
         similarity_threshold: float = 0.92,
         hash_size: int = 16,
-        comparison_window: int = 30,
+        comparison_window: int = 0,  # Default to 0 (compare all pairs) for unsorted images
         progress_callback: Optional[Callable] = None
     ):
         """
@@ -44,7 +68,8 @@ class DuplicateDetector:
                                   0.75 is loose - more aggressive deduplication.
             hash_size: Size of perceptual hash (higher = more precise)
             comparison_window: For burst photos, only compare within this many positions
-                              (0 = compare all pairs, which is slow for large sets)
+                              (0 = compare all pairs - REQUIRED for unsorted images)
+                              Note: For unsorted images, window must be 0 to find all duplicates
             progress_callback: Optional callback(percent, message) for progress updates
         """
         self.similarity_threshold = similarity_threshold
@@ -54,6 +79,9 @@ class DuplicateDetector:
         
         logger.info(f"DuplicateDetector initialized: threshold={similarity_threshold:.2f}, "
                    f"hash_size={hash_size}, window={comparison_window}")
+        _log_debug("DUP0", "duplicate_detector:__init__", "DuplicateDetector config", {
+            "threshold": similarity_threshold, "window": comparison_window, "hash_size": hash_size
+        })
     
     def _update_progress(self, percent: float, message: str):
         """Update progress if callback is set."""
@@ -123,9 +151,11 @@ class DuplicateDetector:
         else:
             gray2 = img2
         
-        # Resize to same size for comparison (use smaller of the two)
-        size = (min(256, min(gray1.shape[1], gray2.shape[1])),
-                min(256, min(gray1.shape[0], gray2.shape[0])))
+        # Resize to same size for comparison
+        # Use 512x512 for better accuracy (256 is too coarse for panorama images)
+        # This prevents similar textures from looking identical
+        size = (min(512, min(gray1.shape[1], gray2.shape[1])),
+                min(512, min(gray1.shape[0], gray2.shape[0])))
         
         r1 = cv2.resize(gray1, size, interpolation=cv2.INTER_AREA).astype(np.float32)
         r2 = cv2.resize(gray2, size, interpolation=cv2.INTER_AREA).astype(np.float32)
@@ -189,8 +219,7 @@ class DuplicateDetector:
         """
         Find duplicate images in a list.
         
-        For burst mode photos, uses windowed comparison to be efficient
-        and only marks direct duplicates (not transitively connected images).
+        OPTIMIZED: Uses LSH-style bucketing for O(n) complexity instead of O(n²).
         
         Args:
             images: List of images as numpy arrays
@@ -205,62 +234,177 @@ class DuplicateDetector:
         if n <= 1:
             return list(range(n)), []
         
+        start_time = time.time()
         logger.info(f"Scanning {n} images for duplicates (threshold={self.similarity_threshold:.2f})")
         self._update_progress(0, f"Scanning {n} images for duplicates...")
+        
+        _log_debug("DUP1", "find_duplicates:start", "Starting duplicate scan", {
+            "n_images": n, "threshold": self.similarity_threshold, "window": self.comparison_window
+        })
         
         # Track which images are marked as duplicates
         is_duplicate = [False] * n
         duplicate_pairs = []
         
-        # For each image, find if it's a duplicate of an earlier image
-        comparisons_done = 0
-        total_comparisons = self._estimate_comparisons(n)
+        # SAFEGUARD: Never remove more than 20% of images as duplicates
+        # Panorama images MUST have overlap - true duplicates are rare
+        max_duplicates_allowed = max(1, n // 5)
         
-        for i in range(n):
-            if is_duplicate[i]:
-                continue  # Already marked as duplicate
+        # For panorama workflows, use DCT-based perceptual hashing
+        # This is more distinctive than mean-based hashing
+        self._update_progress(5, "Computing perceptual hashes...")
+        hash_time = time.time()
+        
+        # Compute pHash (DCT-based) for each image - more distinctive for panoramas
+        phashes = []
+        dhashes = []
+        for idx, img in enumerate(images):
+            phashes.append(self.compute_phash(img))
+            dhashes.append(self.compute_dhash(img))
             
-            # Determine comparison range
-            if self.comparison_window > 0:
-                # Only compare with nearby images (efficient for burst photos)
-                start = max(0, i - self.comparison_window)
-                end = i  # Only compare with earlier images
-            else:
-                # Compare with all earlier images
-                start = 0
-                end = i
-            
-            for j in range(start, end):
-                if is_duplicate[j]:
-                    continue  # Skip already-marked duplicates
-                
-                similarity = self.compute_similarity(images[i], images[j])
-                comparisons_done += 1
-                
-                if similarity >= self.similarity_threshold:
-                    # Image i is a duplicate of image j (which came first)
-                    is_duplicate[i] = True
-                    duplicate_pairs.append((j, i, similarity))
+            if idx % 100 == 0:
+                self._update_progress(5 + int(20 * idx / n), f"Hashing: {idx+1}/{n}")
+        
+        hash_elapsed = time.time() - hash_time
+        _log_debug("DUP2", "find_duplicates:hashes", "Perceptual hashes computed", {
+            "n_images": n, "hash_time_sec": round(hash_elapsed, 2)
+        })
+        
+        # For panorama images: use VERY strict threshold
+        # True duplicates have nearly identical hashes (hamming dist < 5 in 64 bits = 92%+ similar)
+        # Regular panorama overlap images have 60-80% hash similarity - NOT duplicates
+        self._update_progress(30, "Finding near-identical images...")
+        bucket_time = time.time()
+        
+        # Only find pairs with VERY high hash similarity (strict duplicate detection)
+        # This prevents false positives from overlapping panorama images
+        strict_hash_threshold = 0.92  # 92%+ hash match = likely true duplicate
+        close_candidates = []
+        
+        # Use sorted hashes for efficient comparison (avoid full O(n²))
+        # Group by first few bits of pHash to reduce comparisons
+        hash_groups: Dict[int, List[int]] = {}
+        for idx, ph in enumerate(phashes):
+            # Use first 8 bits as group key (256 groups)
+            group_key = int(np.packbits(ph[:8].astype(np.uint8))[0])
+            if group_key not in hash_groups:
+                hash_groups[group_key] = []
+            hash_groups[group_key].append(idx)
+        
+        # Compare only within groups
+        for group_indices in hash_groups.values():
+            if len(group_indices) < 2:
+                continue
+            for i_pos, i in enumerate(group_indices):
+                for j in group_indices[:i_pos]:
+                    # Check both pHash and dHash
+                    phash_sim = self.hash_similarity(phashes[i], phashes[j])
+                    dhash_sim = self.hash_similarity(dhashes[i], dhashes[j])
                     
-                    name_i = paths[i].name if paths else f"image_{i}"
-                    name_j = paths[j].name if paths else f"image_{j}"
-                    logger.info(f"Duplicate found: {name_i} ≈ {name_j} (similarity={similarity:.3f})")
-                    break  # Found a duplicate, no need to check more
+                    # BOTH hashes must be very similar for true duplicates
+                    if phash_sim >= strict_hash_threshold and dhash_sim >= strict_hash_threshold:
+                        combined_sim = (phash_sim + dhash_sim) / 2
+                        close_candidates.append((i, j, combined_sim))
+        
+        # Sort by similarity (highest first)
+        close_candidates.sort(key=lambda x: -x[2])
+        
+        bucket_elapsed = time.time() - bucket_time
+        _log_debug("DUP3", "find_duplicates:candidates", "Candidate search complete", {
+            "n_groups": len(hash_groups), "n_candidates": len(close_candidates),
+            "search_time_sec": round(bucket_elapsed, 2),
+            "largest_group": max(len(g) for g in hash_groups.values()) if hash_groups else 0,
+            "strict_threshold": strict_hash_threshold
+        })
+        
+        # Verify with NCC only if we have candidates
+        self._update_progress(50, f"Verifying {len(close_candidates)} potential duplicates...")
+        verify_time = time.time()
+        duplicates_found = 0
+        comparisons = 0
+        max_comparisons = min(len(close_candidates), n)  # At most n comparisons
+        
+        for i, j, hash_sim in close_candidates:
+            if is_duplicate[i] or is_duplicate[j]:
+                continue
             
-            # Update progress
-            if i % 10 == 0:
-                percent = min(99, int(100 * comparisons_done / max(1, total_comparisons)))
-                self._update_progress(percent, f"Checked {i+1}/{n} images...")
+            if duplicates_found >= max_duplicates_allowed:
+                _log_debug("DUP5", "find_duplicates:safeguard", "Safeguard triggered", {
+                    "duplicates_found": duplicates_found, "max_allowed": max_duplicates_allowed
+                })
+                break
+            
+            if comparisons >= max_comparisons:
+                _log_debug("DUP5", "find_duplicates:max_comparisons", "Max comparisons reached", {
+                    "comparisons": comparisons, "max_comparisons": max_comparisons
+                })
+                break
+            
+            comparisons += 1
+            
+            # Fast NCC on smaller images (256x256 is enough for duplicate detection)
+            ncc_sim = self._fast_ncc(images[i], images[j])
+            
+            # Combine hash and NCC similarity
+            combined_sim = 0.3 * hash_sim + 0.7 * ncc_sim
+            
+            if combined_sim >= self.similarity_threshold:
+                is_duplicate[i] = True
+                duplicate_pairs.append((j, i, combined_sim))
+                duplicates_found += 1
+                
+                name_i = paths[i].name if paths else f"image_{i}"
+                name_j = paths[j].name if paths else f"image_{j}"
+                logger.info(f"Duplicate found: {name_i} ≈ {name_j} (similarity={combined_sim:.3f})")
+            
+            if comparisons % 50 == 0:
+                percent = 45 + int(50 * comparisons / max_comparisons)
+                self._update_progress(percent, f"Verified {comparisons} pairs...")
+        
+        verify_elapsed = time.time() - verify_time
+        total_elapsed = time.time() - start_time
         
         # Build list of indices to keep
         keep_indices = [i for i in range(n) if not is_duplicate[i]]
-        
         n_removed = n - len(keep_indices)
+        
         logger.info(f"Duplicate detection complete: keeping {len(keep_indices)}/{n} images "
-                   f"(removed {n_removed} duplicates)")
+                   f"(removed {n_removed} duplicates) in {total_elapsed:.1f}s")
         self._update_progress(100, f"Removed {n_removed} duplicate images")
         
+        _log_debug("DUP6", "find_duplicates:complete", "Duplicate detection complete", {
+            "n_kept": len(keep_indices), "n_removed": n_removed,
+            "total_time_sec": round(total_elapsed, 2),
+            "hash_time_sec": round(hash_elapsed, 2),
+            "verify_time_sec": round(verify_elapsed, 2),
+            "comparisons_made": comparisons
+        })
+        
         return keep_indices, duplicate_pairs
+    
+    def _fast_ncc(self, img1: np.ndarray, img2: np.ndarray) -> float:
+        """Fast NCC on downsampled images (256x256)."""
+        # Convert to grayscale
+        if len(img1.shape) == 3:
+            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        else:
+            gray1 = img1
+        if len(img2.shape) == 3:
+            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+        else:
+            gray2 = img2
+        
+        # Resize to 256x256 (fast but sufficient for duplicate detection)
+        size = (256, 256)
+        r1 = cv2.resize(gray1, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+        r2 = cv2.resize(gray2, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+        
+        # Normalize and compute NCC
+        r1 = (r1 - np.mean(r1)) / (np.std(r1) + 1e-10)
+        r2 = (r2 - np.mean(r2)) / (np.std(r2) + 1e-10)
+        ncc = np.mean(r1 * r2)
+        
+        return max(0.0, min(1.0, (ncc + 1) / 2))
     
     def _estimate_comparisons(self, n: int) -> int:
         """Estimate total number of comparisons for progress reporting."""

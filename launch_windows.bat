@@ -59,6 +59,11 @@ REM Check if we're in the project directory or need to change
 if exist "src\main.py" (
     REM We're in the project directory - run directly (main.py sets up path)
     python src\main.py %*
+    if errorlevel 1 (
+        echo.
+        echo Application exited with an error.
+        pause
+    )
 ) else if exist "%INSTALL_DIR%\src\main.py" (
     REM We're running from installed location
     cd /d "%INSTALL_DIR%"
@@ -67,6 +72,11 @@ if exist "src\main.py" (
         rmdir /s /q "src\__pycache__" 2>nul
     )
     python src\main.py %*
+    if errorlevel 1 (
+        echo.
+        echo Application exited with an error.
+        pause
+    )
 ) else (
     echo Error: Could not find src\main.py
     echo Current directory: %CD%

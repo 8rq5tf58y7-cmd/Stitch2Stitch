@@ -10,14 +10,14 @@ import gc
 
 logger = logging.getLogger(__name__)
 
-# Default maximum pixels for output panorama (100 megapixels)
-# Set to None or 0 to disable limit
+# Default maximum pixels for output panorama (500 megapixels = ~22000x22000)
+# This is generous for gigapixel output while preventing memory blowup
+# Set to None or 0 to disable limit (only if you have lots of RAM!)
 # Memory guidelines:
-#   - 50MP panorama: ~600MB RAM for blending (uint8) or ~2.4GB (float32)
 #   - 100MP panorama: ~1.2GB RAM for blending (uint8) or ~4.8GB (float32)
 #   - 200MP panorama: ~2.4GB RAM for blending (uint8) or ~9.6GB (float32)
-# Recommended: Set limit based on available RAM / 6 for float32 blending methods
-DEFAULT_MAX_PANORAMA_PIXELS = 100_000_000
+#   - 500MP panorama: ~6GB RAM for blending (uint8) or ~24GB (float32)
+DEFAULT_MAX_PANORAMA_PIXELS = 500_000_000
 
 
 class ImageBlender:
@@ -114,6 +114,12 @@ class ImageBlender:
             logger.error(f"Invalid bounding box dimensions: {bbox}")
             return aligned_images[0]['image'].copy()
         
+        # Sanity check: detect if alignment has "exploded" (canvas way too large vs content)
+        aligned_images, bbox = self._check_and_fix_exploded_alignment(aligned_images, bbox)
+        x_min, y_min, x_max, y_max = bbox
+        output_h = y_max - y_min
+        output_w = x_max - x_min
+        
         # Apply zoom factor (zoom < 1.0 = zoom out to show more, zoom > 1.0 = zoom in)
         if zoom != 1.0 and zoom > 0:
             # Adjust bounding box to show more/less area
@@ -129,14 +135,18 @@ class ImageBlender:
             output_h = y_max - y_min
             logger.info(f"Zoom {zoom}x applied: canvas size {output_w}x{output_h}")
         
-        # Check size and scale down if needed (only if limit is set)
+        # Note: We blend at native resolution first, then scale after cropping
+        # This ensures the content fills the target size properly
         total_pixels = output_h * output_w
-        scale_factor = 1.0
-        if self.max_panorama_pixels and total_pixels > self.max_panorama_pixels:
-            scale_factor = np.sqrt(self.max_panorama_pixels / total_pixels)
+        scale_factor = 1.0  # No pre-scaling
+        
+        # Only scale down if MUCH larger than target to prevent memory issues
+        max_blend_pixels = 200_000_000  # Max 200MP during blending to save memory
+        if total_pixels > max_blend_pixels:
+            scale_factor = np.sqrt(max_blend_pixels / total_pixels)
             output_h = int(output_h * scale_factor)
             output_w = int(output_w * scale_factor)
-            logger.warning(f"Panorama too large ({total_pixels/1e6:.1f}MP), scaling to {output_w}x{output_h}")
+            logger.info(f"Blending at reduced size to save memory: {output_w}x{output_h}")
         
         logger.info(f"Creating panorama canvas: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
         
@@ -186,13 +196,12 @@ class ImageBlender:
                 x_off = int((bbox_img[0] - x_min) * scale_factor)
                 y_off = int((bbox_img[1] - y_min) * scale_factor)
                 # Scale the image down too
-                scaled_w = int(w * scale_factor)
-                scaled_h = int(h * scale_factor)
-                if scaled_w > 0 and scaled_h > 0:
-                    img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
-                    alpha_mask = cv2.resize(alpha_mask.astype(np.uint8), (scaled_w, scaled_h), 
-                                           interpolation=cv2.INTER_NEAREST).astype(bool)
-                    h, w = scaled_h, scaled_w
+                scaled_w = max(1, int(w * scale_factor))
+                scaled_h = max(1, int(h * scale_factor))
+                img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+                alpha_mask = cv2.resize(alpha_mask.astype(np.uint8), (scaled_w, scaled_h), 
+                                       interpolation=cv2.INTER_NEAREST).astype(bool)
+                h, w = scaled_h, scaled_w
             else:
                 x_off = bbox_img[0] - x_min
                 y_off = bbox_img[1] - y_min
@@ -243,6 +252,20 @@ class ImageBlender:
         # Cleanup
         del filled_mask
         gc.collect()
+        
+        # Now scale the CROPPED result to target size (if scale_to_target is enabled)
+        scale_to_target = options.get('scale_to_target', True)
+        if self.max_panorama_pixels and scale_to_target:
+            h, w = panorama.shape[:2]
+            current_pixels = h * w
+            if current_pixels > 0:
+                target_scale = np.sqrt(self.max_panorama_pixels / current_pixels)
+                if abs(target_scale - 1.0) > 0.01:  # Only scale if needed
+                    new_w = int(w * target_scale)
+                    new_h = int(h * target_scale)
+                    interp = cv2.INTER_CUBIC if target_scale > 1.0 else cv2.INTER_AREA
+                    panorama = cv2.resize(panorama, (new_w, new_h), interpolation=interp)
+                    logger.info(f"Scaled to target: {w}x{h} -> {new_w}x{new_h} ({new_w*new_h/1e6:.1f}MP)")
         
         logger.info("Blending complete")
         return panorama
@@ -312,6 +335,12 @@ class ImageBlender:
             logger.error(f"Invalid bounding box dimensions: {bbox}")
             return aligned_images[0]['image'].copy()
         
+        # Sanity check: detect if alignment has "exploded"
+        aligned_images, bbox = self._check_and_fix_exploded_alignment(aligned_images, bbox)
+        x_min, y_min, x_max, y_max = bbox
+        output_h = y_max - y_min
+        output_w = x_max - x_min
+        
         # Apply zoom factor
         if zoom != 1.0 and zoom > 0:
             center_x = (x_min + x_max) / 2
@@ -326,13 +355,17 @@ class ImageBlender:
             output_h = y_max - y_min
             logger.info(f"Zoom {zoom}x applied: canvas size {output_w}x{output_h}")
         
-        # Limit maximum size to prevent memory issues (only if limit is set)
+        # Note: We blend at native resolution first, then scale after
         total_pixels = output_h * output_w
-        if self.max_panorama_pixels and total_pixels > self.max_panorama_pixels:
-            scale = np.sqrt(self.max_panorama_pixels / total_pixels)
-            output_h = int(output_h * scale)
-            output_w = int(output_w * scale)
-            logger.warning(f"Panorama too large, scaling to {output_w}x{output_h}")
+        scale_factor = 1.0  # No pre-scaling
+        
+        # Only scale down if MUCH larger than target to prevent memory issues
+        max_blend_pixels = 200_000_000  # Max 200MP during blending to save memory
+        if total_pixels > max_blend_pixels:
+            scale_factor = np.sqrt(max_blend_pixels / total_pixels)
+            output_h = int(output_h * scale_factor)
+            output_w = int(output_w * scale_factor)
+            logger.info(f"Blending at reduced size to save memory: {output_w}x{output_h}")
         
         logger.info(f"Multiband blending: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
         
@@ -358,13 +391,24 @@ class ImageBlender:
             else:
                 alpha_f = np.ones((h, w), dtype=np.float32)
             
-            # Create weight mask (distance from edges)
-            weight = self._create_weight_mask((h, w), alpha_f)
-            
             # Calculate placement
             bbox_img = img_data.get('bbox', (0, 0, w, h))
-            x_off = bbox_img[0] - x_min
-            y_off = bbox_img[1] - y_min
+            
+            # Apply scale factor if canvas was scaled
+            if scale_factor != 1.0:
+                x_off = int((bbox_img[0] - x_min) * scale_factor)
+                y_off = int((bbox_img[1] - y_min) * scale_factor)
+                scaled_w = max(1, int(w * scale_factor))
+                scaled_h = max(1, int(h * scale_factor))
+                img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+                alpha_f = cv2.resize(alpha_f, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+                h, w = scaled_h, scaled_w
+            else:
+                x_off = bbox_img[0] - x_min
+                y_off = bbox_img[1] - y_min
+            
+            # Create weight mask (distance from edges)
+            weight = self._create_weight_mask((h, w), alpha_f)
             
             # Calculate valid region
             src_x_start = max(0, -x_off)
@@ -404,8 +448,25 @@ class ImageBlender:
         del weight_sum
         gc.collect()
         
+        # Convert to uint8
+        panorama = np.clip(panorama, 0, 255).astype(np.uint8)
+        
+        # Scale the result to target size (if scale_to_target is enabled)
+        scale_to_target = options.get('scale_to_target', True)
+        if self.max_panorama_pixels and scale_to_target:
+            h, w = panorama.shape[:2]
+            current_pixels = h * w
+            if current_pixels > 0:
+                target_scale = np.sqrt(self.max_panorama_pixels / current_pixels)
+                if abs(target_scale - 1.0) > 0.01:  # Only scale if needed
+                    new_w = int(w * target_scale)
+                    new_h = int(h * target_scale)
+                    interp = cv2.INTER_CUBIC if target_scale > 1.0 else cv2.INTER_AREA
+                    panorama = cv2.resize(panorama, (new_w, new_h), interpolation=interp)
+                    logger.info(f"Scaled to target: {w}x{h} -> {new_w}x{new_h} ({new_w*new_h/1e6:.1f}MP)")
+        
         logger.info("Multiband blending complete")
-        return np.clip(panorama, 0, 255).astype(np.uint8)
+        return panorama
     
     def _feather_blend(self, aligned_images: List[Dict], options: Dict) -> np.ndarray:
         """Feather blending (simpler, faster, memory-optimized)"""
@@ -417,6 +478,12 @@ class ImageBlender:
         bbox = self._calculate_bbox(aligned_images, padding=padding if fit_all else 0)
         x_min, y_min, x_max, y_max = bbox
         
+        output_h = y_max - y_min
+        output_w = x_max - x_min
+        
+        # Sanity check: detect if alignment has "exploded"
+        aligned_images, bbox = self._check_and_fix_exploded_alignment(aligned_images, bbox)
+        x_min, y_min, x_max, y_max = bbox
         output_h = y_max - y_min
         output_w = x_max - x_min
         
@@ -433,13 +500,17 @@ class ImageBlender:
             output_w = x_max - x_min
             output_h = y_max - y_min
         
-        # Size limit (only if limit is set)
+        # Note: We blend at native resolution first, then scale after
         total_pixels = output_h * output_w
-        if self.max_panorama_pixels and total_pixels > self.max_panorama_pixels:
-            scale = np.sqrt(self.max_panorama_pixels / total_pixels)
-            output_h = int(output_h * scale)
-            output_w = int(output_w * scale)
-            logger.warning(f"Panorama too large, scaling to {output_w}x{output_h}")
+        scale_factor = 1.0  # No pre-scaling
+        
+        # Only scale down if MUCH larger than target to prevent memory issues
+        max_blend_pixels = 200_000_000  # Max 200MP during blending to save memory
+        if total_pixels > max_blend_pixels:
+            scale_factor = np.sqrt(max_blend_pixels / total_pixels)
+            output_h = int(output_h * scale_factor)
+            output_w = int(output_w * scale_factor)
+            logger.info(f"Blending at reduced size to save memory: {output_w}x{output_h}")
         
         logger.info(f"Feather blending: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
         
@@ -458,12 +529,23 @@ class ImageBlender:
             else:
                 alpha_f = np.ones((h, w), dtype=np.float32)
             
+            bbox_img = img_data.get('bbox', (0, 0, w, h))
+            
+            # Apply scale factor if canvas was scaled
+            if scale_factor != 1.0:
+                x_off = int((bbox_img[0] - x_min) * scale_factor)
+                y_off = int((bbox_img[1] - y_min) * scale_factor)
+                scaled_w = max(1, int(w * scale_factor))
+                scaled_h = max(1, int(h * scale_factor))
+                img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+                alpha_f = cv2.resize(alpha_f, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+                h, w = scaled_h, scaled_w
+            else:
+                x_off = bbox_img[0] - x_min
+                y_off = bbox_img[1] - y_min
+            
             # Simple distance-based weight
             weight = self._create_weight_mask((h, w), alpha_f, feather_size=50)
-            
-            bbox_img = img_data.get('bbox', (0, 0, w, h))
-            x_off = bbox_img[0] - x_min
-            y_off = bbox_img[1] - y_min
             
             # Calculate valid region
             src_x_start = max(0, -x_off)
@@ -501,8 +583,25 @@ class ImageBlender:
         del weight_sum
         gc.collect()
         
+        # Convert to uint8
+        panorama = np.clip(panorama, 0, 255).astype(np.uint8)
+        
+        # Scale the result to target size (if scale_to_target is enabled)
+        scale_to_target = options.get('scale_to_target', True)
+        if self.max_panorama_pixels and scale_to_target:
+            h, w = panorama.shape[:2]
+            current_pixels = h * w
+            if current_pixels > 0:
+                target_scale = np.sqrt(self.max_panorama_pixels / current_pixels)
+                if abs(target_scale - 1.0) > 0.01:  # Only scale if needed
+                    new_w = int(w * target_scale)
+                    new_h = int(h * target_scale)
+                    interp = cv2.INTER_CUBIC if target_scale > 1.0 else cv2.INTER_AREA
+                    panorama = cv2.resize(panorama, (new_w, new_h), interpolation=interp)
+                    logger.info(f"Scaled to target: {w}x{h} -> {new_w}x{new_h} ({new_w*new_h/1e6:.1f}MP)")
+        
         logger.info("Feather blending complete")
-        return np.clip(panorama, 0, 255).astype(np.uint8)
+        return panorama
     
     def _linear_blend(self, aligned_images: List[Dict], options: Dict) -> np.ndarray:
         """Simple linear blending"""
@@ -568,6 +667,102 @@ class ImageBlender:
         logger.info(f"Total bounding box: ({int(x_min)}, {int(y_min)}) to ({int(x_max)}, {int(y_max)}) = {int(x_max-x_min)}x{int(y_max-y_min)} pixels")
         
         return (int(x_min), int(y_min), int(x_max), int(y_max))
+    
+    def _check_and_fix_exploded_alignment(
+        self, 
+        aligned_images: List[Dict], 
+        bbox: Tuple[int, int, int, int]
+    ) -> Tuple[List[Dict], Tuple[int, int, int, int]]:
+        """
+        Check if alignment has 'exploded' (images spread way too far apart).
+        This happens when alignment errors accumulate with many images.
+        
+        If detected, compact the layout by creating a grid arrangement
+        that preserves approximate relative positions.
+        
+        Returns:
+            Tuple of (possibly modified aligned_images, possibly modified bbox)
+        """
+        if len(aligned_images) < 5:
+            return aligned_images, bbox
+        
+        x_min, y_min, x_max, y_max = bbox
+        canvas_area = (x_max - x_min) * (y_max - y_min)
+        
+        # Calculate total image content area
+        total_content_area = 0
+        for img_data in aligned_images:
+            h, w = img_data['image'].shape[:2]
+            total_content_area += h * w
+        
+        # Calculate expected canvas area with reasonable overlap (30%)
+        # For n images with 30% overlap, expected area ≈ content_area * 0.7 * sqrt(n)/n * n = content_area * 0.7 * sqrt(n)
+        n_images = len(aligned_images)
+        expected_area = total_content_area * 0.7 * np.sqrt(n_images)
+        
+        # If canvas is way larger than expected (>10x), alignment has exploded
+        area_ratio = canvas_area / max(expected_area, 1)
+        
+        if area_ratio > 10:
+            logger.warning(f"Alignment exploded! Canvas area {canvas_area/1e6:.1f}MP is {area_ratio:.1f}x expected {expected_area/1e6:.1f}MP")
+            logger.info("Compacting layout to create usable panorama...")
+            
+            # Get average image dimensions
+            avg_h = int(np.mean([img['image'].shape[0] for img in aligned_images]))
+            avg_w = int(np.mean([img['image'].shape[1] for img in aligned_images]))
+            
+            # Create compact grid layout
+            # Grid dimensions that approximate square arrangement
+            grid_cols = int(np.ceil(np.sqrt(n_images * avg_w / max(avg_h, 1))))
+            grid_cols = max(1, min(grid_cols, n_images))
+            grid_rows = int(np.ceil(n_images / grid_cols))
+            
+            # Overlap factor (0.2 = 20% overlap between adjacent images)
+            overlap = 0.2
+            step_x = int(avg_w * (1 - overlap))
+            step_y = int(avg_h * (1 - overlap))
+            
+            # Get original positions and sort by them to maintain some spatial coherence
+            positions = []
+            for idx, img_data in enumerate(aligned_images):
+                img_bbox = img_data.get('bbox', (0, 0, avg_w, avg_h))
+                cx = (img_bbox[0] + img_bbox[2]) / 2
+                cy = (img_bbox[1] + img_bbox[3]) / 2
+                positions.append((idx, cx, cy))
+            
+            # Sort by y then x to create a reasonable ordering
+            positions.sort(key=lambda p: (p[2] // (avg_h * 2), p[1]))
+            
+            # Assign new grid positions
+            new_min_x, new_min_y = 0, 0
+            new_max_x, new_max_y = 0, 0
+            
+            for grid_idx, (orig_idx, _, _) in enumerate(positions):
+                row = grid_idx // grid_cols
+                col = grid_idx % grid_cols
+                
+                new_x = col * step_x
+                new_y = row * step_y
+                
+                img_data = aligned_images[orig_idx]
+                h, w = img_data['image'].shape[:2]
+                
+                # Update bbox
+                img_data['bbox'] = (new_x, new_y, new_x + w, new_y + h)
+                
+                new_max_x = max(new_max_x, new_x + w)
+                new_max_y = max(new_max_y, new_y + h)
+            
+            # Update overall bbox
+            padding = 50
+            new_bbox = (new_min_x - padding, new_min_y - padding, 
+                       new_max_x + padding, new_max_y + padding)
+            
+            logger.info(f"Compacted to {grid_cols}x{grid_rows} grid: {new_max_x}x{new_max_y} pixels")
+            
+            return aligned_images, new_bbox
+        
+        return aligned_images, bbox
     
     def _apply_pixel_selection(
         self,
