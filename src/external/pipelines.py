@@ -106,12 +106,26 @@ class COLMAPPipeline(ExternalPipelineBase):
                  use_gpu: bool = True,
                  use_affine: bool = False,  # Use affine instead of homography
                  blend_method: str = "multiband",  # Blending method: multiband, feather, autostitch, linear
-                 matcher_type: str = "exhaustive",  # or "vocab_tree", "sequential"
+                 matcher_type: str = "exhaustive",  # exhaustive, sequential, vocab_tree, grid
+                 sequential_overlap: int = 10,  # For sequential matching
+                 gpu_index: int = -1,  # GPU index (-1 = auto, 0-N = specific GPU)
+                 num_threads: int = -1,  # Number of CPU threads (-1 = auto/all)
+                 max_features: int = 8192,  # Maximum SIFT features per image
+                 min_inliers: int = 0,  # Minimum inliers to include image (0 = no filter)
+                 max_images: int = 0,  # Maximum images in panorama (0 = no limit)
+                 use_source_alpha: bool = False,  # Use source image alpha for transparent backgrounds
                  progress_callback: Optional[Callable] = None):
         super().__init__(progress_callback)
         self.matcher_type = matcher_type
         self.use_affine = use_affine
         self.blend_method = blend_method
+        self.sequential_overlap = sequential_overlap
+        self.gpu_index = gpu_index
+        self.num_threads = num_threads
+        self.max_features = max_features
+        self.min_inliers = min_inliers
+        self.max_images = max_images
+        self.use_source_alpha = use_source_alpha
         self._version = None
         self._location = None
         self._has_cuda = False
@@ -181,9 +195,23 @@ class COLMAPPipeline(ExternalPipelineBase):
     
     def _process_wsl_line(self, line: str):
         """Process a single line from WSL stderr and update progress."""
+        # Handle diagnostic messages with WARNING/DEBUG tags
+        if '[WARNING]' in line:
+            msg = line.replace('[WARNING]', '').strip()
+            logger.warning(f"WSL: {msg}")
+            return
+        elif '[DEBUG]' in line:
+            msg = line.replace('[DEBUG]', '').strip()
+            logger.info(f"WSL DEBUG: {msg}")
+            return
+        elif line.strip().startswith('='):
+            # Separator lines from diagnostics - show as warnings
+            logger.warning(line.strip())
+            return
+
         if '[PROGRESS]' in line:
             msg = line.replace('[PROGRESS]', '').strip()
-            
+
             # Determine progress percentage based on stage
             if 'Copying' in msg and '/' in msg:
                 try:
@@ -275,7 +303,15 @@ class COLMAPPipeline(ExternalPipelineBase):
             "image_paths": [str(p) for p in image_paths],
             "output_dir": output_dir_str,
             "use_affine": self.use_affine,
-            "blend_method": self.blend_method
+            "blend_method": self.blend_method,
+            "matcher_type": self.matcher_type,
+            "sequential_overlap": self.sequential_overlap,
+            "gpu_index": self.gpu_index,
+            "num_threads": self.num_threads,
+            "max_features": self.max_features,
+            "min_inliers": self.min_inliers,
+            "max_images": self.max_images,
+            "use_source_alpha": self.use_source_alpha
         }
         
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -517,14 +553,22 @@ After installation, restart the application.
             with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H3","location":"pipelines.py:matching_start","message":"Starting feature matching","data":{"matcher_type":self.matcher_type},"timestamp":__import__('time').time()}) + '\n')
             # #endregion
             
+            logger.info(f"Matcher type: {self.matcher_type}")
             if self.matcher_type == "vocab_tree":
                 # Note: vocab_tree_matcher requires a vocabulary tree file
                 # For now, fall back to exhaustive if vocab tree not available
-                logger.warning("Vocab tree matcher not implemented, using exhaustive matching")
+                logger.warning("Vocab tree matcher not implemented, falling back to exhaustive matching")
                 pycolmap.match_exhaustive(database_path)
             elif self.matcher_type == "sequential":
-                pycolmap.match_sequential(database_path)
+                # Sequential matching with overlap parameter
+                logger.info(f"Using sequential matching with overlap={self.sequential_overlap}")
+                pycolmap.match_sequential(database_path, overlap=self.sequential_overlap)
+            elif self.matcher_type == "grid":
+                # Grid-aware matching - fall back to sequential for now
+                logger.warning("Grid-aware matching not fully implemented, falling back to sequential")
+                pycolmap.match_sequential(database_path, overlap=self.sequential_overlap)
             else:  # exhaustive
+                logger.info("Using exhaustive matching (all pairs)")
                 pycolmap.match_exhaustive(database_path)
             
             # #region agent log
@@ -642,23 +686,21 @@ After installation, restart the application.
     def run_2d_stitch(self, image_paths: List[Path], output_dir: Path) -> Dict:
         """
         Run PyCOLMAP for feature extraction/matching, then create a 2D panorama.
-        
+
         This uses COLMAP's robust SIFT matching but produces a flat 2D composite
         instead of a 3D reconstruction.
-        
+
         Returns:
             Dict with panorama results including the stitched image
         """
-        import cv2
-        import sqlite3
         import json
         import time
-        
+
         if not self.is_available():
             raise RuntimeError("PyCOLMAP is not installed. " + self.get_install_instructions())
-        
+
         import pycolmap
-        
+
         # #region agent log - CUDA/GPU availability check
         debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
         cuda_available = pycolmap.has_cuda if hasattr(pycolmap, 'has_cuda') else False
@@ -668,11 +710,15 @@ After installation, restart the application.
         cuda_attrs = [a for a in dir(pycolmap) if 'cuda' in a.lower() or 'gpu' in a.lower() or 'device' in a.lower()]
         with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"CUDA2","location":"pipelines.py:run_2d_stitch","message":"CUDA-related attributes in pycolmap","data":{"cuda_attrs":cuda_attrs},"timestamp":time.time()}) + '\n')
         # #endregion
-        
+
         # Use WSL for GPU if native CUDA not available but WSL CUDA is
         if self._has_wsl_cuda and not self._has_cuda:
             with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"WSL1","location":"pipelines.py:run_2d_stitch","message":"Using WSL for GPU acceleration","data":{},"timestamp":time.time()}) + '\n')
             return self._run_via_wsl(image_paths, output_dir)
+
+        # Only import these if running native (not WSL)
+        import cv2
+        import sqlite3
         
         # Create workspace
         workspace = output_dir / "colmap_workspace"
@@ -723,11 +769,40 @@ After installation, restart the application.
             import time
             start_time = time.time()
 
+            # Configure SIFT extraction options
+            sift_options = pycolmap.SiftExtractionOptions()
+            sift_options.max_num_features = self.max_features
+            logger.info(f"SIFT: max_features={self.max_features}")
+
+            # Set number of threads if specified
+            if self.num_threads > 0:
+                sift_options.num_threads = self.num_threads
+                logger.info(f"SIFT: num_threads={self.num_threads}")
+            elif self.num_threads == -1:
+                logger.info("SIFT: num_threads=auto (using all available)")
+
+            # Create extraction options (wraps SIFT options)
+            extraction_options = pycolmap.FeatureExtractionOptions()
+            extraction_options.sift = sift_options
+
+            # Configure device
+            if self.gpu_index >= 0 and cuda_available:
+                device = pycolmap.Device(f"cuda:{self.gpu_index}")
+                logger.info(f"Device: CUDA GPU {self.gpu_index}")
+            elif cuda_available:
+                device = pycolmap.Device.auto
+                logger.info("Device: CUDA auto-detect")
+            else:
+                device = pycolmap.Device.cpu
+                logger.info("Device: CPU only")
+
             pycolmap.extract_features(
                 database_path,
                 images_dir,
+                extraction_options=extraction_options,
                 camera_mode=pycolmap.CameraMode.PER_IMAGE,
-                camera_model="PINHOLE"
+                camera_model="PINHOLE",
+                device=device
             )
 
             elapsed = time.time() - start_time
