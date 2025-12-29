@@ -136,6 +136,303 @@ class GridAlignmentThread(QThread):
             self.error.emit(str(e))
 
 
+class COLMAPThread(QThread):
+    """Thread for running COLMAP pipeline operations"""
+    
+    progress = pyqtSignal(int)
+    status = pyqtSignal(str)
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+    
+    def __init__(self, image_paths: List[Path], output_dir: Path, transform_type: str = "homography", blend_method: str = "multiband"):
+        super().__init__()
+        self.image_paths = image_paths
+        self.output_dir = output_dir
+        self.transform_type = transform_type
+        self.blend_method = blend_method
+        self._cancelled = False
+    
+    def cancel(self):
+        """Cancel the operation"""
+        self._cancelled = True
+    
+    def run(self):
+        try:
+            from external.pipelines import COLMAPPipeline
+            
+            # Progress callback that emits signals
+            def progress_callback(percentage: int, message: str = ""):
+                if self._cancelled:
+                    raise InterruptedError("Operation cancelled")
+                self.progress.emit(percentage)
+                if message:
+                    self.status.emit(message)
+            
+            use_affine = self.transform_type == "affine"
+            pipeline = COLMAPPipeline(use_gpu=True, use_affine=use_affine, blend_method=self.blend_method, progress_callback=progress_callback)
+            
+            self.status.emit("Starting COLMAP 2D stitching pipeline...")
+            result = pipeline.run_2d_stitch(self.image_paths, self.output_dir)
+            
+            self.finished.emit(result)
+        except InterruptedError:
+            self.status.emit("Operation cancelled")
+            self.progress.emit(0)
+        except Exception as e:
+            import traceback
+            # #region agent log - Capture full exception
+            debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
+            import json, time
+            full_traceback = traceback.format_exc()
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"THREAD_ERR","location":"main_window.py:COLMAPThread","message":"COLMAP thread exception","data":{"error":str(e),"error_type":type(e).__name__,"traceback":full_traceback},"timestamp":time.time()}) + '\n')
+            # #endregion
+            logger.error(f"COLMAP error: {e}", exc_info=True)
+            self.error.emit(str(e))
+
+
+class HLOCInstallThread(QThread):
+    """Thread for installing HLOC in the background"""
+    
+    status = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)  # success, message
+    
+    def __init__(self):
+        super().__init__()
+    
+    def run(self):
+        import subprocess
+        import sys
+        import shutil
+        
+        try:
+            # Step 1: Check if pycolmap is installed
+            self.status.emit("Checking pycolmap installation...")
+            try:
+                import pycolmap
+                self.status.emit(f"pycolmap v{getattr(pycolmap, '__version__', 'unknown')} found")
+            except ImportError:
+                self.finished.emit(False, "pycolmap is required but not installed. Please install pycolmap first.")
+                return
+            
+            # Step 2: Check if Git is available
+            self.status.emit("Checking for Git...")
+            git_path = shutil.which("git")
+            if not git_path:
+                self.finished.emit(False, "Git is required to install HLOC.\n\nPlease install Git from: https://git-scm.com/download/win\nThen restart the application.")
+                return
+            self.status.emit(f"Git found at {git_path}")
+
+            # Step 3: Install PyTorch with CUDA support
+            self.status.emit("Checking PyTorch installation...")
+            try:
+                import torch
+                self.status.emit(f"PyTorch {torch.__version__} already installed")
+            except ImportError:
+                self.status.emit("PyTorch not found. Installing PyTorch with CUDA 11.8 support...")
+                self.status.emit("This may take 10-15 minutes and download ~2GB...")
+
+                # Install PyTorch with CUDA 11.8 (widely compatible)
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "torch", "torchvision",
+                     "--index-url", "https://download.pytorch.org/whl/cu118"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1200  # 20 minute timeout for PyTorch with CUDA
+                )
+
+                if result.returncode != 0:
+                    error_msg = result.stderr or result.stdout
+                    self.finished.emit(False, f"PyTorch installation failed:\n{error_msg[:500]}")
+                    return
+
+                self.status.emit("PyTorch installed successfully!")
+
+            # Step 4: Install additional dependencies
+            self.status.emit("Installing additional HLOC dependencies...")
+            additional_deps = ["plotly", "h5py", "kornia>=0.6.11", "gdown"]
+
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install"] + additional_deps,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+
+            if result.returncode != 0:
+                # Non-critical, log but continue
+                self.status.emit("Warning: Some additional dependencies may have failed to install")
+            else:
+                self.status.emit("Additional dependencies installed successfully!")
+
+            # Step 5: Install HLOC + LightGlue from GitHub
+            self.status.emit("Installing HLOC and LightGlue from GitHub (this may take several minutes)...")
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install",
+                 "git+https://github.com/cvg/Hierarchical-Localization.git",
+                 "lightglue@git+https://github.com/cvg/LightGlue"],
+                capture_output=True,
+                text=True,
+                timeout=900  # 15 minute timeout
+            )
+
+            if result.returncode == 0:
+                self.status.emit("HLOC installed successfully!")
+                self.finished.emit(True, "HLOC and all dependencies installed successfully!")
+            else:
+                error_msg = result.stderr or result.stdout
+                self.finished.emit(False, f"HLOC installation failed:\n{error_msg[:500]}")
+                
+        except subprocess.TimeoutExpired:
+            self.finished.emit(False, "Installation timed out after 15 minutes. Please try again or install manually.")
+        except Exception as e:
+            self.finished.emit(False, f"Installation error: {e}")
+
+
+class COLMAPInstallThread(QThread):
+    """Thread for installing PyCOLMAP (with CUDA support) in the background"""
+
+    status = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)  # success, message
+
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        import subprocess
+        import sys
+        import platform
+
+        try:
+            system = platform.system()
+
+            # Step 1: Check current pycolmap installation
+            self.status.emit("Checking for existing pycolmap installation...")
+            try:
+                import pycolmap
+                current_version = getattr(pycolmap, '__version__', 'unknown')
+                has_cuda = getattr(pycolmap, 'has_cuda', False)
+                self.status.emit(f"Found pycolmap v{current_version} (CUDA: {has_cuda})")
+
+                if has_cuda:
+                    self.finished.emit(True, f"PyCOLMAP v{current_version} with CUDA is already installed!")
+                    return
+            except ImportError:
+                self.status.emit("pycolmap not found, will install fresh")
+
+            # Step 2: Determine installation strategy based on OS
+            if system == "Windows":
+                # On Windows, try WSL CUDA installation
+                self.status.emit("Detected Windows - will install pycolmap and setup WSL CUDA support...")
+
+                # First install regular pycolmap for Windows
+                self.status.emit("Installing pycolmap for Windows...")
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "pycolmap"],
+                    capture_output=True,
+                    text=True,
+                    timeout=600  # 10 minute timeout
+                )
+
+                if result.returncode != 0:
+                    error_msg = result.stderr or result.stdout
+                    self.finished.emit(False, f"PyCOLMAP installation failed:\n{error_msg[:500]}")
+                    return
+
+                self.status.emit("pycolmap installed successfully!")
+
+                # Check if WSL is available
+                self.status.emit("Checking for WSL (Windows Subsystem for Linux)...")
+                wsl_check = subprocess.run(
+                    ["wsl", "--status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                if wsl_check.returncode == 0:
+                    self.status.emit("WSL detected! Setting up GPU-accelerated COLMAP in WSL...")
+
+                    # Install pycolmap-cuda in WSL
+                    wsl_install = subprocess.run(
+                        ["wsl", "bash", "-c", "pip3 install --upgrade pycolmap-cuda12"],
+                        capture_output=True,
+                        text=True,
+                        timeout=600
+                    )
+
+                    if wsl_install.returncode == 0:
+                        self.status.emit("WSL CUDA support configured successfully!")
+                        self.finished.emit(True,
+                            "PyCOLMAP installed with WSL GPU acceleration!\n\n"
+                            "✓ Windows: pycolmap (CPU)\n"
+                            "✓ WSL: pycolmap-cuda12 (GPU-accelerated)\n\n"
+                            "The app will automatically use GPU acceleration when available.")
+                    else:
+                        # WSL install failed, but Windows install succeeded
+                        self.status.emit("WSL CUDA setup failed, but Windows installation succeeded")
+                        self.finished.emit(True,
+                            "PyCOLMAP installed for Windows (CPU mode)!\n\n"
+                            "Note: WSL GPU setup failed. You can install it manually with:\n"
+                            "wsl bash -c 'pip3 install pycolmap-cuda12'")
+                else:
+                    self.finished.emit(True,
+                        "PyCOLMAP installed for Windows (CPU mode)!\n\n"
+                        "For GPU acceleration, install WSL2 and run:\n"
+                        "wsl bash -c 'pip3 install pycolmap-cuda12'")
+
+            elif system == "Linux":
+                # On Linux, try to install CUDA version
+                self.status.emit("Detected Linux - attempting GPU-accelerated installation...")
+
+                # Try CUDA 12 first
+                self.status.emit("Installing pycolmap-cuda12...")
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "pycolmap-cuda12"],
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+
+                if result.returncode == 0:
+                    self.status.emit("GPU-accelerated pycolmap installed successfully!")
+                    self.finished.emit(True, "PyCOLMAP installed with CUDA 12 GPU acceleration!")
+                else:
+                    # Fall back to regular pycolmap
+                    self.status.emit("CUDA installation failed, trying CPU version...")
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "--upgrade", "pycolmap"],
+                        capture_output=True,
+                        text=True,
+                        timeout=600
+                    )
+
+                    if result.returncode == 0:
+                        self.finished.emit(True, "PyCOLMAP installed (CPU mode)!")
+                    else:
+                        error_msg = result.stderr or result.stdout
+                        self.finished.emit(False, f"PyCOLMAP installation failed:\n{error_msg[:500]}")
+
+            else:  # macOS
+                self.status.emit("Detected macOS - installing pycolmap...")
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "pycolmap"],
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+
+                if result.returncode == 0:
+                    self.finished.emit(True, "PyCOLMAP installed successfully!")
+                else:
+                    error_msg = result.stderr or result.stdout
+                    self.finished.emit(False, f"PyCOLMAP installation failed:\n{error_msg[:500]}")
+
+        except subprocess.TimeoutExpired:
+            self.finished.emit(False, "Installation timed out. Please try again or check your internet connection.")
+        except Exception as e:
+            self.finished.emit(False, f"Installation error: {e}")
+
+
 class MainWindow(QMainWindow):
     """Main application window"""
     
@@ -144,6 +441,8 @@ class MainWindow(QMainWindow):
         self.image_paths: List[Path] = []
         self.stitcher: Optional[ImageStitcher] = None
         self.thread: Optional[StitchingThread] = None
+        self.colmap_thread: Optional[COLMAPThread] = None
+        self.hloc_install_thread: Optional[HLOCInstallThread] = None
         self._preview_image: Optional[np.ndarray] = None
         self._preview_zoom: float = 1.0
         try:
@@ -257,10 +556,21 @@ class MainWindow(QMainWindow):
         self.detector_combo = QComboBox()
         self.detector_combo.addItems([
             "LP-SIFT (Recommended)",
+            "SuperPoint (Deep Learning)",
             "SIFT",
             "ORB",
             "AKAZE"
         ])
+        self.detector_combo.setToolTip(
+            "Feature detection algorithm:\n\n"
+            "• LP-SIFT (Recommended) - Enhanced SIFT with edge priority\n"
+            "  Best all-around choice for most panoramas\n\n"
+            "• SuperPoint - Deep learning detector (requires PyTorch)\n"
+            "  Best for 500+ images and repetitive scenes\n\n"
+            "• SIFT - Classic scale-invariant features\n"
+            "• ORB - Fast binary features (less accurate)\n"
+            "• AKAZE - Good for texture-less regions"
+        )
         detector_layout.addWidget(self.detector_combo)
         settings_layout.addLayout(detector_layout)
         
@@ -275,155 +585,375 @@ class MainWindow(QMainWindow):
         features_layout.addWidget(self.max_features_spin)
         settings_layout.addLayout(features_layout)
         
-        # Allow scale/rotation checkbox
-        self.allow_scale_checkbox = QCheckBox("Allow Scale & Rotation")
-        self.allow_scale_checkbox.setChecked(True)
-        self.allow_scale_checkbox.setToolTip("Allow images to be scaled and rotated to match at overlaps.\nUseful when images have different resolutions, zoom levels, or orientations.")
+        # Allow scale checkbox
+        self.allow_scale_checkbox = QCheckBox("Allow Scaling")
+        self.allow_scale_checkbox.setChecked(False)
+        self.allow_scale_checkbox.setToolTip("Allow images to be scaled (stretched/shrunk) during alignment.\nDisable for flatbed scans where only rotation and translation should be applied.\nRotation is always allowed.")
         settings_layout.addWidget(self.allow_scale_checkbox)
         
-        # Match filtering group
-        filtering_group = QGroupBox("Image Filtering & Optimization")
-        filtering_layout = QVBoxLayout()
+        # ============================================================
+        # QUICK PRESETS - Guide users to right settings
+        # ============================================================
+        presets_group = QGroupBox("⚡ Quick Presets (Choose One)")
+        presets_layout = QVBoxLayout()
+        presets_layout.setSpacing(4)
         
-        # Row 1: Checkboxes
-        filter_checks_layout = QHBoxLayout()
-        self.geo_verify_checkbox = QCheckBox("RANSAC")
-        self.geo_verify_checkbox.setChecked(True)
-        self.geo_verify_checkbox.setToolTip("Filter bad matches with geometric verification")
-        filter_checks_layout.addWidget(self.geo_verify_checkbox)
+        preset_info = QLabel("Select a preset based on your images:")
+        preset_info.setStyleSheet("font-size: 10px; color: #666;")
+        presets_layout.addWidget(preset_info)
         
-        self.remove_duplicates_checkbox = QCheckBox("Dedup")
-        self.remove_duplicates_checkbox.setChecked(True)
-        self.remove_duplicates_checkbox.setToolTip("Remove duplicate burst photos")
-        filter_checks_layout.addWidget(self.remove_duplicates_checkbox)
+        preset_buttons = QHBoxLayout()
         
-        self.optimal_coverage_checkbox = QCheckBox("Coverage")
-        self.optimal_coverage_checkbox.setChecked(False)
-        self.optimal_coverage_checkbox.setToolTip("Keep only necessary images")
-        filter_checks_layout.addWidget(self.optimal_coverage_checkbox)
-        
-        self.optimize_alignment_checkbox = QCheckBox("Optimize Align")
-        self.optimize_alignment_checkbox.setChecked(False)
-        self.optimize_alignment_checkbox.setToolTip(
-            "Preprocess images for better feature detection (like AutoPano Giga).\n"
-            "Improves alignment for low-contrast or challenging images.\n"
-            "Original images are preserved for final blending."
+        self.preset_few_btn = QPushButton("📷 Few Images\n(2-50)")
+        self.preset_few_btn.setToolTip(
+            "Best for: 2-50 high-quality photos\n\n"
+            "Settings:\n"
+            "• LP-SIFT detector\n"
+            "• MAGSAC++ verification\n"
+            "• Multiband blending\n"
+            "• Fast processing"
         )
-        filter_checks_layout.addWidget(self.optimize_alignment_checkbox)
-        filter_checks_layout.addStretch()
-        filtering_layout.addLayout(filter_checks_layout)
+        self.preset_few_btn.clicked.connect(lambda: self._apply_preset("few"))
+        preset_buttons.addWidget(self.preset_few_btn)
         
-        # Row 2: Thresholds and options
-        threshold_layout = QHBoxLayout()
-        threshold_layout.addWidget(QLabel("Dup:"))
+        self.preset_medium_btn = QPushButton("🖼️ Medium Set\n(50-200)")
+        self.preset_medium_btn.setToolTip(
+            "Best for: 50-200 images\n\n"
+            "Settings:\n"
+            "• LP-SIFT detector\n"
+            "• MAGSAC++ verification\n"
+            "• Bundle adjustment ON\n"
+            "• Duplicate removal ON"
+        )
+        self.preset_medium_btn.clicked.connect(lambda: self._apply_preset("medium"))
+        preset_buttons.addWidget(self.preset_medium_btn)
+        
+        self.preset_large_btn = QPushButton("🗺️ Large Set\n(200-500)")
+        self.preset_large_btn.setToolTip(
+            "Best for: 200-500 images\n\n"
+            "Settings:\n"
+            "• SuperPoint detector (if available)\n"
+            "• MAGSAC++ verification\n"
+            "• Hierarchical matching\n"
+            "• Memory-efficient mode"
+        )
+        self.preset_large_btn.clicked.connect(lambda: self._apply_preset("large"))
+        preset_buttons.addWidget(self.preset_large_btn)
+        
+        self.preset_gigapixel_btn = QPushButton("🌍 Gigapixel\n(500+)")
+        self.preset_gigapixel_btn.setToolTip(
+            "Best for: 500+ images (gigapixel panoramas)\n\n"
+            "⚠️ RECOMMENDED: Use External Pipelines\n"
+            "(COLMAP or HLOC below)\n\n"
+            "Built-in settings:\n"
+            "• SuperPoint + MAGSAC++\n"
+            "• Hierarchical + Bundle Adjust\n"
+            "• Very slow but may work"
+        )
+        self.preset_gigapixel_btn.clicked.connect(lambda: self._apply_preset("gigapixel"))
+        self.preset_gigapixel_btn.setStyleSheet("background-color: #fff3cd;")
+        preset_buttons.addWidget(self.preset_gigapixel_btn)
+        
+        presets_layout.addLayout(preset_buttons)
+        presets_group.setLayout(presets_layout)
+        settings_layout.addWidget(presets_group)
+        
+        # ============================================================
+        # CORE SETTINGS (Simplified)
+        # ============================================================
+        core_group = QGroupBox("Core Settings")
+        core_layout = QVBoxLayout()
+        core_layout.setSpacing(4)
+        
+        # Row 1: Verification + Dedup
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Verification:"))
+        self.geo_verify_combo = QComboBox()
+        self.geo_verify_combo.addItems([
+            "MAGSAC++ (Best)",
+            "USAC++",
+            "RANSAC",
+            "None"
+        ])
+        self.geo_verify_combo.setToolTip(
+            "Outlier rejection method:\n"
+            "• MAGSAC++ - Most robust (recommended)\n"
+            "• USAC++ - Fast and accurate\n"
+            "• RANSAC - Classic, less robust\n"
+            "• None - Skip (not recommended)"
+        )
+        row1.addWidget(self.geo_verify_combo)
+        
+        self.remove_duplicates_checkbox = QCheckBox("Remove Duplicates")
+        self.remove_duplicates_checkbox.setChecked(False)  # OFF by default for panoramas
+        self.remove_duplicates_checkbox.setToolTip(
+            "Remove duplicate/similar images.\n"
+            "• For burst photos: Enable to remove redundant frames\n"
+            "• For panoramas: Usually DISABLE - overlapping images are NOT duplicates\n"
+            "• Uses perceptual hashing + NCC verification"
+        )
+        row1.addWidget(self.remove_duplicates_checkbox)
+        
         self.duplicate_threshold_spin = QDoubleSpinBox()
-        self.duplicate_threshold_spin.setRange(0.70, 0.98)
-        self.duplicate_threshold_spin.setValue(0.88)
+        self.duplicate_threshold_spin.setRange(0.85, 0.99)
+        self.duplicate_threshold_spin.setValue(0.95)  # Very strict by default
         self.duplicate_threshold_spin.setDecimals(2)
-        self.duplicate_threshold_spin.setToolTip("Duplicate similarity (0.92=strict, 0.85=moderate)")
-        threshold_layout.addWidget(self.duplicate_threshold_spin)
-        
-        threshold_layout.addWidget(QLabel("Overlap:"))
-        self.max_coverage_spin = QDoubleSpinBox()
-        self.max_coverage_spin.setRange(0.1, 0.9)
-        self.max_coverage_spin.setValue(0.5)
-        self.max_coverage_spin.setDecimals(1)
-        self.max_coverage_spin.setToolTip("Max overlap for coverage mode")
-        threshold_layout.addWidget(self.max_coverage_spin)
-        
-        threshold_layout.addWidget(QLabel("Opt Level:"))
-        self.optimization_level_combo = QComboBox()
-        self.optimization_level_combo.addItems(["Light", "Balanced", "Aggressive"])
-        self.optimization_level_combo.setCurrentIndex(1)  # Balanced default
-        self.optimization_level_combo.setToolTip(
-            "Alignment optimization level:\n"
-            "• Light: Subtle enhancement (fastest)\n"
-            "• Balanced: Moderate enhancement (recommended)\n"
-            "• Aggressive: Strong enhancement (for difficult images)"
+        self.duplicate_threshold_spin.setFixedWidth(55)
+        self.duplicate_threshold_spin.setToolTip(
+            "Similarity threshold for duplicate detection.\n"
+            "• 0.95+ = Only exact duplicates (recommended for panoramas)\n"
+            "• 0.90 = Near-identical images\n"
+            "• 0.85 = Similar images (for burst photos)"
         )
-        threshold_layout.addWidget(self.optimization_level_combo)
-        filtering_layout.addLayout(threshold_layout)
+        row1.addWidget(self.duplicate_threshold_spin)
+        row1.addStretch()
+        core_layout.addLayout(row1)
         
-        filtering_group.setLayout(filtering_layout)
-        settings_layout.addWidget(filtering_group)
-        
-        # AutoPano Giga-inspired advanced features
-        autopano_group = QGroupBox("Advanced (AutoPano-Style)")
-        autopano_layout = QVBoxLayout()
-        
-        # Row 1: Feature toggles
-        autopano_checks = QHBoxLayout()
-        
-        self.grid_topology_checkbox = QCheckBox("Grid Detect")
-        self.grid_topology_checkbox.setChecked(True)
-        self.grid_topology_checkbox.setToolTip(
-            "Auto-detect grid structure to reduce matching from O(n²) to O(n).\n"
-            "Critical for large flat panoramas (microscope, drone, satellite)."
-        )
-        autopano_checks.addWidget(self.grid_topology_checkbox)
-        
-        self.bundle_adjust_checkbox = QCheckBox("Bundle Adjust")
+        # Row 2: Bundle Adjust + Memory
+        row2 = QHBoxLayout()
+        self.bundle_adjust_checkbox = QCheckBox("Bundle Adjustment")
         self.bundle_adjust_checkbox.setChecked(False)
         self.bundle_adjust_checkbox.setToolTip(
-            "Global optimization of all camera poses.\n"
-            "Minimizes reprojection error across all keypoints.\n"
-            "Improves alignment accuracy but slower."
+            "Global optimization of camera poses.\n"
+            "Improves accuracy but slower.\n"
+            "Recommended for 50+ images."
         )
-        autopano_checks.addWidget(self.bundle_adjust_checkbox)
+        row2.addWidget(self.bundle_adjust_checkbox)
         
-        self.enhanced_detect_checkbox = QCheckBox("Enhanced Detect")
-        self.enhanced_detect_checkbox.setChecked(False)
-        self.enhanced_detect_checkbox.setToolTip(
-            "Enhanced feature detection for low-texture areas.\n"
-            "Better for skies, walls, water, repetitive patterns."
-        )
-        autopano_checks.addWidget(self.enhanced_detect_checkbox)
+        self.memory_efficient_checkbox = QCheckBox("Memory Efficient")
+        self.memory_efficient_checkbox.setChecked(True)
+        self.memory_efficient_checkbox.setToolTip("Use lazy loading to reduce RAM usage")
+        row2.addWidget(self.memory_efficient_checkbox)
+        row2.addStretch()
+        core_layout.addLayout(row2)
+        
+        core_group.setLayout(core_layout)
+        settings_layout.addWidget(core_group)
+        
+        # ============================================================
+        # ADVANCED OPTIONS (Collapsed by default in spirit - less prominent)
+        # ============================================================
+        advanced_group = QGroupBox("Advanced Options")
+        advanced_layout = QVBoxLayout()
+        advanced_layout.setSpacing(2)
+        
+        adv_row1 = QHBoxLayout()
+        
+        # Hidden/less-used options
+        self.exhaustive_match_checkbox = QCheckBox("Thorough Match")
+        self.exhaustive_match_checkbox.setChecked(True)
+        self.exhaustive_match_checkbox.setToolTip("Required for unsorted images (default ON)")
+        adv_row1.addWidget(self.exhaustive_match_checkbox)
         
         self.hierarchical_checkbox = QCheckBox("Hierarchical")
         self.hierarchical_checkbox.setChecked(False)
-        self.hierarchical_checkbox.setToolTip(
-            "Cluster-based stitching for 1000+ images.\n"
-            "Stitches clusters independently, then merges."
-        )
-        autopano_checks.addWidget(self.hierarchical_checkbox)
-        autopano_checks.addStretch()
-        autopano_layout.addLayout(autopano_checks)
+        self.hierarchical_checkbox.setToolTip("Cluster-based matching for 200+ images")
+        adv_row1.addWidget(self.hierarchical_checkbox)
         
-        # Row 2: AI post-processing options
-        ai_post_layout = QHBoxLayout()
+        self.optimize_alignment_checkbox = QCheckBox("Pre-enhance")
+        self.optimize_alignment_checkbox.setChecked(False)
+        self.optimize_alignment_checkbox.setToolTip("Enhance images before feature detection")
+        adv_row1.addWidget(self.optimize_alignment_checkbox)
+        
+        adv_row1.addStretch()
+        advanced_layout.addLayout(adv_row1)
+        
+        adv_row2 = QHBoxLayout()
         
         self.ai_post_checkbox = QCheckBox("AI Post-Process")
         self.ai_post_checkbox.setChecked(False)
-        self.ai_post_checkbox.setToolTip(
-            "Apply AI-powered post-processing:\n"
-            "• Color correction (auto white balance)\n"
-            "• Denoising\n"
-            "• Gap inpainting"
-        )
-        ai_post_layout.addWidget(self.ai_post_checkbox)
-        
-        self.ai_denoise_checkbox = QCheckBox("Denoise")
-        self.ai_denoise_checkbox.setChecked(True)
-        self.ai_denoise_checkbox.setToolTip("Apply AI denoising")
-        ai_post_layout.addWidget(self.ai_denoise_checkbox)
-        
-        self.ai_color_checkbox = QCheckBox("Color Fix")
-        self.ai_color_checkbox.setChecked(True)
-        self.ai_color_checkbox.setToolTip("Automatic color correction")
-        ai_post_layout.addWidget(self.ai_color_checkbox)
+        self.ai_post_checkbox.setToolTip("Apply AI color/denoise after stitching")
+        adv_row2.addWidget(self.ai_post_checkbox)
         
         self.super_res_checkbox = QCheckBox("2x Super-Res")
         self.super_res_checkbox.setChecked(False)
-        self.super_res_checkbox.setToolTip(
-            "Apply 2x super-resolution (SLOW).\n"
-            "Doubles output resolution."
-        )
-        ai_post_layout.addWidget(self.super_res_checkbox)
-        ai_post_layout.addStretch()
-        autopano_layout.addLayout(ai_post_layout)
+        self.super_res_checkbox.setToolTip("Double resolution (very slow)")
+        adv_row2.addWidget(self.super_res_checkbox)
         
-        autopano_group.setLayout(autopano_layout)
-        settings_layout.addWidget(autopano_group)
+        adv_row2.addStretch()
+        advanced_layout.addLayout(adv_row2)
+        
+        advanced_group.setLayout(advanced_layout)
+        advanced_group.setStyleSheet("QGroupBox { color: #888; }")
+        settings_layout.addWidget(advanced_group)
+        
+        # Hidden widgets that are still needed by the code but not shown
+        # (These maintain compatibility with existing code)
+        self.grid_topology_checkbox = QCheckBox()
+        self.grid_topology_checkbox.setChecked(False)
+        self.grid_topology_checkbox.setVisible(False)
+        
+        self.enhanced_detect_checkbox = QCheckBox()
+        self.enhanced_detect_checkbox.setChecked(False)
+        self.enhanced_detect_checkbox.setVisible(False)
+        
+        self.optimal_coverage_checkbox = QCheckBox()
+        self.optimal_coverage_checkbox.setChecked(False)
+        self.optimal_coverage_checkbox.setVisible(False)
+        
+        self.max_coverage_spin = QDoubleSpinBox()
+        self.max_coverage_spin.setValue(0.5)
+        self.max_coverage_spin.setVisible(False)
+        
+        self.optimization_level_combo = QComboBox()
+        self.optimization_level_combo.addItems(["Light", "Balanced", "Aggressive"])
+        self.optimization_level_combo.setCurrentIndex(1)
+        self.optimization_level_combo.setVisible(False)
+        
+        self.ai_denoise_checkbox = QCheckBox()
+        self.ai_denoise_checkbox.setChecked(True)
+        self.ai_denoise_checkbox.setVisible(False)
+        
+        self.ai_color_checkbox = QCheckBox()
+        self.ai_color_checkbox.setChecked(True)
+        self.ai_color_checkbox.setVisible(False)
+        
+        # External Pipeline Integration (for 500+ images)
+        external_group = QGroupBox("🚀 External Pipelines (Recommended for 500+ images)")
+        external_layout = QVBoxLayout()
+        external_layout.setSpacing(8)
+        
+        external_info = QLabel(
+            "These battle-tested tools handle large image sets much better than\n"
+            "built-in methods. Click 'Install' to set up, then 'Run' to use."
+        )
+        external_info.setStyleSheet("color: #555; font-size: 11px; padding: 4px;")
+        external_info.setWordWrap(True)
+        external_layout.addWidget(external_info)
+        
+        # --- COLMAP Row ---
+        colmap_row = QHBoxLayout()
+        colmap_row.setSpacing(6)
+        
+        self.colmap_status = QLabel("⬜")
+        self.colmap_status.setFixedWidth(20)
+        colmap_row.addWidget(self.colmap_status)
+        
+        colmap_info = QLabel("<b>COLMAP</b> - Industry standard SfM (robust matching, bundle adjustment)")
+        colmap_info.setStyleSheet("font-size: 11px;")
+        colmap_row.addWidget(colmap_info, 1)
+        
+        self.colmap_install_btn = QPushButton("Install")
+        self.colmap_install_btn.setFixedWidth(60)
+        self.colmap_install_btn.setToolTip("Automatically install PyCOLMAP with GPU support (if available)")
+        self.colmap_install_btn.clicked.connect(self._install_colmap)
+        colmap_row.addWidget(self.colmap_install_btn)
+        
+        self.colmap_btn = QPushButton("Run")
+        self.colmap_btn.setFixedWidth(50)
+        self.colmap_btn.setToolTip("Run COLMAP pipeline on loaded images")
+        self.colmap_btn.clicked.connect(self._run_colmap)
+        colmap_row.addWidget(self.colmap_btn)
+
+        external_layout.addLayout(colmap_row)
+
+        # Transform type selector for COLMAP
+        transform_layout = QHBoxLayout()
+        transform_layout.addWidget(QLabel("Transform:"))
+        self.colmap_transform_combo = QComboBox()
+        self.colmap_transform_combo.addItems([
+            "Homography (3D perspective)",
+            "Affine (2D planar)"
+        ])
+        self.colmap_transform_combo.setCurrentIndex(0)  # Default to homography
+        self.colmap_transform_combo.setToolTip(
+            "Homography: Full 3D perspective (8 DOF) - for photos/3D scenes\n"
+            "Affine: 2D planar only (6 DOF) - for flatbed scans"
+        )
+        transform_layout.addWidget(self.colmap_transform_combo)
+        external_layout.addLayout(transform_layout)
+
+        # Blending method selector for COLMAP
+        blend_layout = QHBoxLayout()
+        blend_layout.addWidget(QLabel("Blending:"))
+        self.colmap_blend_combo = QComboBox()
+        self.colmap_blend_combo.addItems([
+            "Multiband (Recommended)",
+            "Feather",
+            "AutoStitch",
+            "Linear"
+        ])
+        self.colmap_blend_combo.setCurrentIndex(0)  # Default to multiband
+        self.colmap_blend_combo.setToolTip(
+            "Multiband: Best quality, Laplacian pyramid blending\n"
+            "Feather: Smooth feathering, faster\n"
+            "AutoStitch: Puzzle-like selection, crisp seams\n"
+            "Linear: Simple averaging, fastest"
+        )
+        blend_layout.addWidget(self.colmap_blend_combo)
+        external_layout.addLayout(blend_layout)
+
+        # --- HLOC Row ---
+        hloc_row = QHBoxLayout()
+        hloc_row.setSpacing(6)
+        
+        self.hloc_status = QLabel("⬜")
+        self.hloc_status.setFixedWidth(20)
+        hloc_row.addWidget(self.hloc_status)
+        
+        hloc_info = QLabel("<b>HLOC</b> - SuperPoint + SuperGlue + NetVLAD (best for repetitive scenes)")
+        hloc_info.setStyleSheet("font-size: 11px;")
+        hloc_row.addWidget(hloc_info, 1)
+        
+        self.hloc_install_btn = QPushButton("Install")
+        self.hloc_install_btn.setFixedWidth(60)
+        self.hloc_install_btn.setToolTip("Install HLOC via pip (requires PyTorch)")
+        self.hloc_install_btn.clicked.connect(self._install_hloc)
+        hloc_row.addWidget(self.hloc_install_btn)
+        
+        self.hloc_btn = QPushButton("Run")
+        self.hloc_btn.setFixedWidth(50)
+        self.hloc_btn.setToolTip("Run HLOC pipeline on loaded images")
+        self.hloc_btn.clicked.connect(self._run_hloc)
+        hloc_row.addWidget(self.hloc_btn)
+        
+        external_layout.addLayout(hloc_row)
+        
+        # --- Meshroom Row ---
+        meshroom_row = QHBoxLayout()
+        meshroom_row.setSpacing(6)
+        
+        self.meshroom_status = QLabel("⬜")
+        self.meshroom_status.setFixedWidth(20)
+        meshroom_row.addWidget(self.meshroom_status)
+        
+        meshroom_info = QLabel("<b>Meshroom</b> - AliceVision photogrammetry (3D scanning)")
+        meshroom_info.setStyleSheet("font-size: 11px;")
+        meshroom_row.addWidget(meshroom_info, 1)
+        
+        self.meshroom_install_btn = QPushButton("Install")
+        self.meshroom_install_btn.setFixedWidth(60)
+        self.meshroom_install_btn.setToolTip("Download Meshroom (includes AliceVision)")
+        self.meshroom_install_btn.clicked.connect(self._install_meshroom)
+        meshroom_row.addWidget(self.meshroom_install_btn)
+        
+        self.meshroom_btn = QPushButton("Run")
+        self.meshroom_btn.setFixedWidth(50)
+        self.meshroom_btn.setToolTip("Run Meshroom pipeline on loaded images")
+        self.meshroom_btn.clicked.connect(self._run_meshroom)
+        meshroom_row.addWidget(self.meshroom_btn)
+        
+        external_layout.addLayout(meshroom_row)
+        
+        # Install All button
+        install_all_layout = QHBoxLayout()
+        install_all_layout.addStretch()
+        self.install_all_btn = QPushButton("📦 Install All Dependencies")
+        self.install_all_btn.setToolTip(
+            "Attempt to install all external pipeline dependencies:\n"
+            "• HLOC (pip install hloc)\n"
+            "• Opens download pages for COLMAP and Meshroom"
+        )
+        self.install_all_btn.clicked.connect(self._install_all_pipelines)
+        install_all_layout.addWidget(self.install_all_btn)
+        install_all_layout.addStretch()
+        external_layout.addLayout(install_all_layout)
+        
+        # Check availability and update button states
+        self._update_external_pipeline_availability()
+        
+        external_group.setLayout(external_layout)
+        settings_layout.addWidget(external_group)
         
         # Feature matcher
         matcher_layout = QHBoxLayout()
@@ -665,22 +1195,44 @@ class MainWindow(QMainWindow):
         
         limits_layout.addWidget(QLabel("Max:"))
         self.max_panorama_spin = QSpinBox()
-        self.max_panorama_spin.setRange(0, 500)
-        self.max_panorama_spin.setValue(100)
+        self.max_panorama_spin.setRange(0, 2000)
+        self.max_panorama_spin.setValue(500)  # 500MP = ~22000x22000 (generous gigapixel)
         self.max_panorama_spin.setSuffix("MP")
-        self.max_panorama_spin.setSpecialValueText("∞")
-        self.max_panorama_spin.setToolTip("Max panorama size (megapixels)")
+        self.max_panorama_spin.setSpecialValueText("∞ (No Limit)")
+        self.max_panorama_spin.setToolTip(
+            "Maximum final panorama size in megapixels.\n"
+            "500MP = ~22000x22000 pixels (default)\n"
+            "0 = Unlimited (warning: can use huge RAM!)\n"
+            "Increase for larger gigapixel output."
+        )
         limits_layout.addWidget(self.max_panorama_spin)
         
-        limits_layout.addWidget(QLabel("Warp:"))
-        self.max_warp_spin = QSpinBox()
-        self.max_warp_spin.setRange(0, 200)
-        self.max_warp_spin.setValue(50)
-        self.max_warp_spin.setSuffix("MP")
-        self.max_warp_spin.setSpecialValueText("∞")
-        self.max_warp_spin.setToolTip("Max warped image size")
-        limits_layout.addWidget(self.max_warp_spin)
+        self.scale_to_target_checkbox = QCheckBox("Fill")
+        self.scale_to_target_checkbox.setChecked(True)  # Default: scale to fill target
+        self.scale_to_target_checkbox.setToolTip(
+            "Scale output to fill target size.\n"
+            "ON: Output will be scaled UP or DOWN to match Max MP\n"
+            "OFF: Only scale down if exceeds limit"
+        )
+        limits_layout.addWidget(self.scale_to_target_checkbox)
         output_layout.addLayout(limits_layout)
+        
+        # Warp limit on separate row (less commonly used)
+        warp_layout = QHBoxLayout()
+        warp_layout.addWidget(QLabel("Warp Limit:"))
+        self.max_warp_spin = QSpinBox()
+        self.max_warp_spin.setRange(0, 500)
+        self.max_warp_spin.setValue(0)  # Let blender handle scaling globally
+        self.max_warp_spin.setSuffix("MP")
+        self.max_warp_spin.setSpecialValueText("∞ (Full Res)")
+        self.max_warp_spin.setToolTip(
+            "Maximum size for individual warped images.\n"
+            "0 = No limit (recommended for quality)\n"
+            "Set a limit only if running out of RAM during alignment."
+        )
+        warp_layout.addWidget(self.max_warp_spin)
+        warp_layout.addStretch()
+        output_layout.addLayout(warp_layout)
         
         output_group.setLayout(output_layout)
         settings_layout.addWidget(output_group)
@@ -934,6 +1486,7 @@ class MainWindow(QMainWindow):
             # Get algorithm selections
             detector_map = {
                 "LP-SIFT (Recommended)": "lp_sift",
+                "SuperPoint (Deep Learning)": "superpoint",
                 "SIFT": "sift",
                 "ORB": "orb",
                 "AKAZE": "akaze"
@@ -987,6 +1540,7 @@ class MainWindow(QMainWindow):
                 'pixel_selection': self.pixel_select_combo.currentText().split('(')[0].strip().lower().replace(' ', '_'),
                 'padding': self.canvas_padding_spin.value(),
                 'fit_all': True,
+                'scale_to_target': self.scale_to_target_checkbox.isChecked(),  # Scale to fill target size
                 # Semantic blending options
                 'semantic_mode': semantic_mode,
                 'preserve_foreground': self.preserve_foreground_checkbox.isChecked(),
@@ -1015,7 +1569,14 @@ class MainWindow(QMainWindow):
             memory_efficient = self.memory_efficient_checkbox.isChecked()
             
             # Match filtering options
-            geometric_verify = self.geo_verify_checkbox.isChecked()
+            geo_method_map = {
+                "MAGSAC++ (Best)": "magsac",
+                "USAC++": "usac",
+                "RANSAC": "ransac",
+                "None": None
+            }
+            geo_method = geo_method_map.get(self.geo_verify_combo.currentText(), "magsac")
+            geometric_verify = geo_method is not None
             select_optimal_coverage = self.optimal_coverage_checkbox.isChecked()
             max_coverage_overlap = self.max_coverage_spin.value()
             
@@ -1037,6 +1598,7 @@ class MainWindow(QMainWindow):
                 max_warp_pixels=max_warp_pixels,
                 memory_efficient=memory_efficient,
                 geometric_verify=geometric_verify,
+                geometric_verify_method=geo_method,  # MAGSAC++, USAC++, etc.
                 select_optimal_coverage=select_optimal_coverage,
                 max_coverage_overlap=max_coverage_overlap,
                 remove_duplicates=remove_duplicates,
@@ -1047,9 +1609,18 @@ class MainWindow(QMainWindow):
                 use_grid_topology=self.grid_topology_checkbox.isChecked(),
                 use_bundle_adjustment=self.bundle_adjust_checkbox.isChecked(),
                 use_hierarchical_stitching=self.hierarchical_checkbox.isChecked(),
-                use_enhanced_detection=self.enhanced_detect_checkbox.isChecked()
+                use_enhanced_detection=self.enhanced_detect_checkbox.isChecked(),
+                exhaustive_matching=self.exhaustive_match_checkbox.isChecked()
             )
-            logger.info(f"Stitcher initialized (max_panorama={max_panorama_mp}MP, max_warp={max_warp_mp}MP, memory_efficient={memory_efficient}, geo_verify={geometric_verify}, optimal_coverage={select_optimal_coverage}, remove_dups={remove_duplicates}, optimize_align={self.optimize_alignment_checkbox.isChecked()})")
+            logger.info(f"Stitcher initialized (detector={feature_detector}, geo_verify={geo_method}, max_panorama={max_panorama_mp}MP)")
+            
+            # #region agent log
+            try:
+                import json
+                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
+                    f.write(json.dumps({"hypothesisId":"UI","location":"main_window.py:_init_stitcher","message":"Stitcher settings","data":{"feature_detector":feature_detector,"geo_method":geo_method,"geo_verify":geometric_verify},"timestamp":__import__('time').time()}) + '\n')
+            except: pass
+            # #endregion
         except Exception as e:
             logger.error(f"Failed to initialize stitcher: {e}", exc_info=True)
             raise
@@ -1418,12 +1989,27 @@ class MainWindow(QMainWindow):
             image = self._preview_image
             h, w = image.shape[:2]
             
-            # Apply zoom
-            new_w = max(1, int(w * self._preview_zoom))
-            new_h = max(1, int(h * self._preview_zoom))
+            # Get the scroll area viewport size for auto-fit
+            viewport = self.preview_scroll.viewport()
+            viewport_w = viewport.width() - 20  # Leave some margin
+            viewport_h = viewport.height() - 20
+            
+            # If zoom is 1.0 (default), auto-fit to preview area
+            if self._preview_zoom == 1.0:
+                # Calculate scale to fit in viewport
+                scale_w = viewport_w / w if w > 0 else 1.0
+                scale_h = viewport_h / h if h > 0 else 1.0
+                auto_scale = min(scale_w, scale_h, 1.0)  # Don't upscale beyond 100%
+                new_w = max(1, int(w * auto_scale))
+                new_h = max(1, int(h * auto_scale))
+            else:
+                # Apply manual zoom
+                new_w = max(1, int(w * self._preview_zoom))
+                new_h = max(1, int(h * self._preview_zoom))
             
             # Use appropriate interpolation based on zoom direction
-            if self._preview_zoom < 1.0:
+            actual_scale = new_w / w if w > 0 else 1.0
+            if actual_scale < 1.0:
                 interp = cv2.INTER_AREA  # Better for shrinking
             else:
                 interp = cv2.INTER_LINEAR  # Better for enlarging
@@ -1654,4 +2240,527 @@ class MainWindow(QMainWindow):
         self.log_text.append(message)
         logger.info(message)
         self.statusBar().showMessage(message)
+    
+    def _update_external_pipeline_availability(self):
+        """Check and update availability of external pipelines."""
+        try:
+            from external.pipelines import check_available_pipelines
+            
+            # Get detailed info including versions and paths
+            available = check_available_pipelines(detailed=True)
+            
+            # Log detection results (only if log_text exists)
+            can_log = hasattr(self, 'log_text') and self.log_text is not None
+            if can_log:
+                self.log("Checking external pipelines...")
+            
+            # COLMAP status
+            colmap_info = available.get("colmap", {})
+            if colmap_info.get("available", False):
+                info_text = colmap_info.get("info", "COLMAP")
+                path_text = colmap_info.get("path", "")
+                self.colmap_status.setText("✅")
+                self.colmap_status.setToolTip(f"COLMAP is installed and ready\n{info_text}\nPath: {path_text}")
+                self.colmap_btn.setEnabled(True)
+                self.colmap_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+                self.colmap_install_btn.setText("✓")
+                self.colmap_install_btn.setEnabled(False)
+                if can_log:
+                    self.log(f"  ✅ COLMAP: {info_text}")
+            else:
+                self.colmap_status.setText("❌")
+                self.colmap_status.setToolTip("COLMAP is not installed\nChecked: PATH, conda envs, common locations")
+                self.colmap_btn.setEnabled(False)
+                self.colmap_btn.setStyleSheet("")
+                self.colmap_install_btn.setText("Install")
+                self.colmap_install_btn.setEnabled(True)
+                if can_log:
+                    self.log("  ❌ COLMAP: Not found")
+            
+            # HLOC status
+            hloc_info = available.get("hloc", {})
+            if hloc_info.get("available", False):
+                info_text = hloc_info.get("info", "HLOC")
+                components = []
+                if hloc_info.get("has_superpoint"):
+                    components.append("SuperPoint")
+                if hloc_info.get("has_superglue"):
+                    components.append("SuperGlue")
+                if hloc_info.get("has_netvlad"):
+                    components.append("NetVLAD")
+                    
+                self.hloc_status.setText("✅")
+                self.hloc_status.setToolTip(f"HLOC is installed and ready\n{info_text}")
+                self.hloc_btn.setEnabled(True)
+                self.hloc_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+                self.hloc_install_btn.setText("✓")
+                self.hloc_install_btn.setEnabled(False)
+                if can_log:
+                    self.log(f"  ✅ HLOC: {info_text}")
+            else:
+                self.hloc_status.setText("❌")
+                self.hloc_status.setToolTip("HLOC is not installed\nInstall with: pip install hloc")
+                self.hloc_btn.setEnabled(False)
+                self.hloc_btn.setStyleSheet("")
+                self.hloc_install_btn.setText("Install")
+                self.hloc_install_btn.setEnabled(True)
+                if can_log:
+                    self.log("  ❌ HLOC: Not found (pip install hloc)")
+            
+            # Meshroom/AliceVision status
+            alice_info = available.get("alicevision", {})
+            if alice_info.get("available", False):
+                info_text = alice_info.get("info", "AliceVision")
+                path_text = alice_info.get("path", "")
+                self.meshroom_status.setText("✅")
+                self.meshroom_status.setToolTip(f"AliceVision/Meshroom is installed\n{info_text}\nPath: {path_text}")
+                self.meshroom_btn.setEnabled(True)
+                self.meshroom_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+                self.meshroom_install_btn.setText("✓")
+                self.meshroom_install_btn.setEnabled(False)
+                if can_log:
+                    self.log(f"  ✅ AliceVision: {info_text}")
+            else:
+                self.meshroom_status.setText("❌")
+                self.meshroom_status.setToolTip("AliceVision/Meshroom is not installed\nDownload from alicevision.org")
+                self.meshroom_btn.setEnabled(False)
+                self.meshroom_btn.setStyleSheet("")
+                self.meshroom_install_btn.setText("Install")
+                self.meshroom_install_btn.setEnabled(True)
+                if can_log:
+                    self.log("  ❌ AliceVision: Not found")
+                
+        except ImportError as e:
+            if hasattr(self, 'log_text') and self.log_text is not None:
+                self.log(f"External pipelines module not available: {e}")
+    
+    def _install_colmap(self):
+        """Install PyCOLMAP automatically in background."""
+        # Disable button during installation
+        self.colmap_install_btn.setEnabled(False)
+        self.colmap_install_btn.setText("...")
+
+        self.log("Starting PyCOLMAP installation...")
+        self.statusBar().showMessage("Installing PyCOLMAP...")
+
+        # Start background installation thread
+        self.colmap_install_thread = COLMAPInstallThread()
+        self.colmap_install_thread.status.connect(self._on_colmap_install_status)
+        self.colmap_install_thread.finished.connect(self._on_colmap_install_finished)
+        self.colmap_install_thread.start()
+
+    def _on_colmap_install_status(self, message: str):
+        """Handle COLMAP installation status updates."""
+        self.log(f"COLMAP Install: {message}")
+        self.statusBar().showMessage(f"COLMAP: {message}")
+
+    def _on_colmap_install_finished(self, success: bool, message: str):
+        """Handle COLMAP installation completion."""
+        self.statusBar().showMessage("Ready")
+
+        if success:
+            self.log(f"✓ {message}")
+            QMessageBox.information(self, "COLMAP Installed", message)
+            self._update_external_pipeline_availability()
+        else:
+            self.log(f"✗ COLMAP installation failed: {message}")
+            QMessageBox.critical(self, "COLMAP Installation Failed", message)
+            # Re-enable button on failure
+            self.colmap_install_btn.setEnabled(True)
+            self.colmap_install_btn.setText("Install")
+    
+    def _install_hloc(self):
+        """Install HLOC automatically in background using pre-existing pycolmap."""
+        # Disable button during installation
+        self.hloc_install_btn.setEnabled(False)
+        self.hloc_install_btn.setText("...")
+        
+        self.log("Starting HLOC installation...")
+        self.statusBar().showMessage("Installing HLOC...")
+        
+        # Start background installation thread
+        self.hloc_install_thread = HLOCInstallThread()
+        self.hloc_install_thread.status.connect(self._on_hloc_install_status)
+        self.hloc_install_thread.finished.connect(self._on_hloc_install_finished)
+        self.hloc_install_thread.start()
+    
+    def _on_hloc_install_status(self, message: str):
+        """Handle HLOC installation status updates."""
+        self.log(f"HLOC Install: {message}")
+        self.statusBar().showMessage(f"HLOC: {message}")
+    
+    def _on_hloc_install_finished(self, success: bool, message: str):
+        """Handle HLOC installation completion."""
+        self.statusBar().showMessage("Ready")
+        
+        if success:
+            self.log(f"✓ {message}")
+            QMessageBox.information(self, "HLOC Installed", message)
+            self._update_external_pipeline_availability()
+        else:
+            self.log(f"✗ HLOC installation failed: {message}")
+            # Re-enable button on failure
+            self.hloc_install_btn.setEnabled(True)
+            self.hloc_install_btn.setText("Install")
+            QMessageBox.warning(self, "HLOC Installation Failed", message)
+    
+    def _install_meshroom(self):
+        """Open Meshroom download page."""
+        import webbrowser
+        
+        reply = QMessageBox.question(
+            self, "Install Meshroom",
+            "Meshroom (AliceVision) needs to be downloaded manually.\n\n"
+            "It's a standalone application that includes all required components.\n\n"
+            "Open the Meshroom download page?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            webbrowser.open("https://alicevision.org/#meshroom")
+    
+    def _install_all_pipelines(self):
+        """Install all available pipeline dependencies."""
+        reply = QMessageBox.question(
+            self, "Install All Dependencies",
+            "This will attempt to install all external pipeline dependencies:\n\n"
+            "• HLOC - Will be installed via pip\n"
+            "• COLMAP - Download page will be opened\n"
+            "• Meshroom - Download page will be opened\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Install HLOC first (can be done automatically)
+            self.log("Installing HLOC...")
+            import subprocess
+            import sys
+            
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "hloc"],
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+                if result.returncode == 0:
+                    self.log("HLOC installed successfully!")
+                else:
+                    self.log(f"HLOC installation failed: {result.stderr[:200]}")
+            except Exception as e:
+                self.log(f"HLOC installation error: {e}")
+            
+            # Open download pages for manual installers
+            import webbrowser
+            webbrowser.open("https://github.com/colmap/colmap/releases")
+            webbrowser.open("https://alicevision.org/#meshroom")
+            
+            QMessageBox.information(
+                self, "Installation Started",
+                "HLOC installation attempted via pip.\n\n"
+                "Download pages opened for:\n"
+                "• COLMAP\n"
+                "• Meshroom\n\n"
+                "Please complete the manual installations and restart the app."
+            )
+            
+            self._update_external_pipeline_availability()
+    
+    def _apply_preset(self, preset_name: str):
+        """Apply a quick preset configuration."""
+        self.log(f"Applying preset: {preset_name}")
+        
+        if preset_name == "few":
+            # 2-50 images: Fast, simple settings (likely burst photos)
+            self.detector_combo.setCurrentText("LP-SIFT (Recommended)")
+            self.geo_verify_combo.setCurrentText("MAGSAC++ (Best)")
+            self.remove_duplicates_checkbox.setChecked(True)  # Good for burst photos
+            self.duplicate_threshold_spin.setValue(0.90)
+            self.bundle_adjust_checkbox.setChecked(False)
+            self.hierarchical_checkbox.setChecked(False)
+            self.exhaustive_match_checkbox.setChecked(True)
+            self.memory_efficient_checkbox.setChecked(False)
+            self.blend_combo.setCurrentText("Multiband (Recommended)")
+            self.max_features_spin.setValue(5000)
+            
+        elif preset_name == "medium":
+            # 50-200 images: Balanced settings (panorama workflow)
+            self.detector_combo.setCurrentText("LP-SIFT (Recommended)")
+            self.geo_verify_combo.setCurrentText("MAGSAC++ (Best)")
+            self.remove_duplicates_checkbox.setChecked(False)  # OFF for panoramas
+            self.duplicate_threshold_spin.setValue(0.95)
+            self.bundle_adjust_checkbox.setChecked(True)
+            self.hierarchical_checkbox.setChecked(False)
+            self.exhaustive_match_checkbox.setChecked(True)
+            self.memory_efficient_checkbox.setChecked(True)
+            self.blend_combo.setCurrentText("Multiband (Recommended)")
+            self.max_features_spin.setValue(5000)
+            
+        elif preset_name == "large":
+            # 200-500 images: Robust settings (large panorama)
+            # Try SuperPoint if available
+            if self.detector_combo.findText("SuperPoint (Deep Learning)") >= 0:
+                self.detector_combo.setCurrentText("SuperPoint (Deep Learning)")
+            else:
+                self.detector_combo.setCurrentText("LP-SIFT (Recommended)")
+            self.geo_verify_combo.setCurrentText("MAGSAC++ (Best)")
+            self.remove_duplicates_checkbox.setChecked(False)  # OFF for panoramas
+            self.duplicate_threshold_spin.setValue(0.95)
+            self.bundle_adjust_checkbox.setChecked(True)
+            self.hierarchical_checkbox.setChecked(True)
+            self.exhaustive_match_checkbox.setChecked(True)
+            self.memory_efficient_checkbox.setChecked(True)
+            self.blend_combo.setCurrentText("AutoStitch (Simple & Fast)")
+            self.max_features_spin.setValue(3000)  # Fewer features for speed
+            
+        elif preset_name == "gigapixel":
+            # 500+ images: Maximum robustness
+            # Recommend external pipelines
+            reply = QMessageBox.question(
+                self, "Gigapixel Recommendation",
+                "For 500+ images, external pipelines (COLMAP or HLOC) are\n"
+                "strongly recommended for best results.\n\n"
+                "• COLMAP: Battle-tested, robust matching\n"
+                "• HLOC: SuperPoint + SuperGlue + NetVLAD\n\n"
+                "Apply built-in gigapixel settings anyway?\n"
+                "(May be slow and less accurate than external tools)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                if self.detector_combo.findText("SuperPoint (Deep Learning)") >= 0:
+                    self.detector_combo.setCurrentText("SuperPoint (Deep Learning)")
+                else:
+                    self.detector_combo.setCurrentText("LP-SIFT (Recommended)")
+                self.geo_verify_combo.setCurrentText("MAGSAC++ (Best)")
+                self.remove_duplicates_checkbox.setChecked(False)  # OFF for panoramas
+                self.duplicate_threshold_spin.setValue(0.95)
+                self.bundle_adjust_checkbox.setChecked(True)
+                self.hierarchical_checkbox.setChecked(True)
+                self.exhaustive_match_checkbox.setChecked(True)
+                self.memory_efficient_checkbox.setChecked(True)
+                self.blend_combo.setCurrentText("AutoStitch (Simple & Fast)")
+                self.max_features_spin.setValue(2000)  # Fewer features for memory
+            else:
+                # Scroll to external pipelines section
+                self.log("Consider using COLMAP or HLOC for best results with 500+ images")
+                return
+        
+        self.log(f"Preset '{preset_name}' applied successfully")
+    
+    def _run_colmap(self):
+        """Run COLMAP pipeline on current images to create a 2D panorama."""
+        if not self.image_paths:
+            QMessageBox.warning(self, "No Images", "Please load images first.")
+            return
+        
+        try:
+            from external.pipelines import COLMAPPipeline
+            
+            # Quick availability check (runs on main thread, fast)
+            pipeline = COLMAPPipeline()
+            
+            if not pipeline.is_available():
+                reply = QMessageBox.question(
+                    self, "PyCOLMAP Not Found",
+                    "PyCOLMAP is not installed.\n\n" + pipeline.get_install_instructions() + 
+                    "\n\nWould you like to install it now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open("https://pypi.org/project/pycolmap/")
+                return
+            
+            # Get output directory
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for COLMAP Panorama"
+            )
+            if not output_dir:
+                return
+            
+            # Get transform type from dropdown
+            transform_idx = self.colmap_transform_combo.currentIndex()
+            transform_type = "affine" if transform_idx == 1 else "homography"
+
+            # Get blending method from dropdown
+            blend_map = {
+                "Multiband (Recommended)": "multiband",
+                "Feather": "feather",
+                "AutoStitch": "autostitch",
+                "Linear": "linear"
+            }
+            blend_text = self.colmap_blend_combo.currentText()
+            blend_method = blend_map.get(blend_text, "multiband")
+
+            self.log("Starting COLMAP 2D stitching pipeline...")
+            self.log(f"Processing {len(self.image_paths)} images with GPU acceleration...")
+            self.log(f"Using {transform_type} transforms...")
+            self.log(f"Using {blend_method} blending...")
+            self.progress_bar.setValue(0)
+
+            # Run in background thread to keep GUI responsive
+            self.colmap_thread = COLMAPThread(self.image_paths, Path(output_dir), transform_type=transform_type, blend_method=blend_method)
+            self.colmap_thread.progress.connect(self._on_colmap_progress)
+            self.colmap_thread.status.connect(self._on_colmap_status)
+            self.colmap_thread.finished.connect(self._on_colmap_finished)
+            self.colmap_thread.error.connect(self._on_colmap_error)
+            self.colmap_thread.start()
+            
+            # Disable buttons during processing
+            self.colmap_btn.setEnabled(False)
+            self.btn_stitch.setEnabled(False)
+                
+        except Exception as e:
+            logger.error(f"COLMAP error: {e}", exc_info=True)
+            QMessageBox.critical(self, "COLMAP Error", str(e))
+    
+    def _on_colmap_progress(self, percentage: int):
+        """Handle COLMAP progress updates."""
+        self.progress_bar.setValue(percentage)
+    
+    def _on_colmap_status(self, message: str):
+        """Handle COLMAP status updates."""
+        self.log(message)
+        self.statusBar().showMessage(message)
+    
+    def _on_colmap_finished(self, result: dict):
+        """Handle COLMAP completion."""
+        # Re-enable buttons
+        self.colmap_btn.setEnabled(True)
+        self.btn_stitch.setEnabled(True)
+        
+        if result.get("success"):
+            panorama = result.get("panorama")
+            output_path = result.get("output_path", "")
+            size = result.get("size", (0, 0))
+            gpu_used = result.get("gpu_used", False)
+            
+            mode = "GPU" if gpu_used else "CPU"
+            self.log(f"COLMAP panorama complete ({mode})! Size: {size[1]}x{size[0]} pixels")
+            self.log(f"Saved to: {output_path}")
+            
+            # Store result for display/saving
+            if panorama is not None:
+                self.current_result = panorama
+                self.output_path = Path(output_path)
+                self.update_preview(panorama)
+            
+            QMessageBox.information(
+                self, "COLMAP Panorama Complete",
+                f"Panorama created successfully!\n\n"
+                f"Mode: {mode}\n"
+                f"Images stitched: {result.get('n_images', 0)}\n"
+                f"Size: {size[1]} x {size[0]} pixels\n"
+                f"Output: {output_path}"
+            )
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            self.log(f"COLMAP stitching failed: {error_msg}")
+            QMessageBox.warning(self, "COLMAP Failed", f"Stitching failed:\n{error_msg}")
+    
+    def _on_colmap_error(self, error_msg: str):
+        """Handle COLMAP errors."""
+        # Re-enable buttons
+        self.colmap_btn.setEnabled(True)
+        self.btn_stitch.setEnabled(True)
+        
+        self.log(f"COLMAP error: {error_msg}")
+        QMessageBox.critical(self, "COLMAP Error", error_msg)
+    
+    def _run_hloc(self):
+        """Run HLOC pipeline on current images."""
+        if not self.image_paths:
+            QMessageBox.warning(self, "No Images", "Please load images first.")
+            return
+        
+        try:
+            from external.pipelines import HLOCPipeline
+            
+            pipeline = HLOCPipeline(progress_callback=self._update_progress_slot)
+            
+            if not pipeline.is_available():
+                reply = QMessageBox.question(
+                    self, "HLOC Not Found",
+                    "HLOC is not installed.\n\n" + pipeline.get_install_instructions() +
+                    "\n\nWould you like to open the HLOC GitHub page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open("https://github.com/cvg/Hierarchical-Localization")
+                return
+            
+            # Get output directory
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for HLOC"
+            )
+            if not output_dir:
+                return
+            
+            self.log("Starting HLOC pipeline (SuperPoint + SuperGlue)...")
+            self.progress_bar.setValue(0)
+            
+            result = pipeline.run(self.image_paths, Path(output_dir))
+            
+            if result.get("success"):
+                self.log(f"HLOC complete! {result.get('n_images', 0)} images processed")
+                QMessageBox.information(
+                    self, "HLOC Complete",
+                    f"Reconstruction complete!\n\n"
+                    f"Images: {result.get('n_images', 0)}\n"
+                    f"Output: {result.get('workspace', '')}"
+                )
+            else:
+                self.log(f"HLOC failed: {result.get('message', 'Unknown error')}")
+                
+        except Exception as e:
+            logger.error(f"HLOC error: {e}", exc_info=True)
+            QMessageBox.critical(self, "HLOC Error", str(e))
+    
+    def _run_meshroom(self):
+        """Run AliceVision/Meshroom pipeline or open Meshroom GUI."""
+        if not self.image_paths:
+            QMessageBox.warning(self, "No Images", "Please load images first.")
+            return
+        
+        try:
+            from external.pipelines import AliceVisionPipeline
+            
+            pipeline = AliceVisionPipeline()
+            
+            if not pipeline.is_available():
+                reply = QMessageBox.question(
+                    self, "Meshroom Not Found",
+                    "Meshroom/AliceVision is not installed.\n\n" + 
+                    pipeline.get_install_instructions() +
+                    "\n\nWould you like to open the Meshroom download page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open("https://alicevision.org/#meshroom")
+                return
+            
+            # For now, suggest using Meshroom GUI directly
+            QMessageBox.information(
+                self, "Meshroom",
+                "For best results, please use Meshroom GUI directly:\n\n"
+                "1. Open Meshroom\n"
+                "2. Drag your images into the Images panel\n"
+                "3. Click 'Start' to begin reconstruction\n\n"
+                "Meshroom provides a visual pipeline editor and\n"
+                "real-time progress monitoring."
+            )
+            
+        except Exception as e:
+            logger.error(f"Meshroom error: {e}", exc_info=True)
+            QMessageBox.critical(self, "Meshroom Error", str(e))
+    
+    def _update_progress_slot(self, percent: int, message: str):
+        """Progress callback for external pipelines."""
+        self.progress_bar.setValue(percent)
+        if message:
+            self.log(message)
 
