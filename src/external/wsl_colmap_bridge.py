@@ -97,7 +97,7 @@ def run_2d_stitch(image_paths_json: str, output_dir: str, use_affine: bool = Fal
     pycolmap.extract_features(
         database_path,
         images_dir,
-        camera_mode=pycolmap.CameraMode.SINGLE,
+        camera_mode=pycolmap.CameraMode.PER_IMAGE,
         camera_model="PINHOLE"
     )
     extract_time = time.time() - extract_start

@@ -500,7 +500,7 @@ After installation, restart the application.
             pycolmap.extract_features(
                 database_path,
                 images_dir,
-                camera_mode=pycolmap.CameraMode.SINGLE,
+                camera_mode=pycolmap.CameraMode.PER_IMAGE,
                 camera_model="PINHOLE"
             )
             with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H4","location":"pipelines.py:extract_success","message":"extract_features succeeded","data":{"method":"no_sift_options"},"timestamp":__import__('time').time()}) + '\n')
@@ -726,7 +726,7 @@ After installation, restart the application.
             pycolmap.extract_features(
                 database_path,
                 images_dir,
-                camera_mode=pycolmap.CameraMode.SINGLE,
+                camera_mode=pycolmap.CameraMode.PER_IMAGE,
                 camera_model="PINHOLE"
             )
 
