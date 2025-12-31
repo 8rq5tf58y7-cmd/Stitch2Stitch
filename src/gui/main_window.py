@@ -3337,6 +3337,22 @@ class MainWindow(QMainWindow):
             self.log(f"Saved to: {output_path}")
 
             # Store result for display/saving
+            if panorama is None and output_path:
+                # WSL bridge typically returns only an output path; load it for preview/post-processing.
+                try:
+                    import cv2
+                    loaded = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+                    if loaded is None:
+                        self.log(f"[WARNING] Could not load panorama from disk for preview: {output_path}")
+                    else:
+                        # Normalize to BGR for the rest of the app
+                        if loaded.ndim == 3 and loaded.shape[2] == 4:
+                            loaded = cv2.cvtColor(loaded, cv2.COLOR_BGRA2BGR)
+                        panorama = loaded
+                        self.log("Loaded panorama from disk for preview.")
+                except Exception as e:
+                    self.log(f"[WARNING] Failed to load panorama from disk for preview: {e}")
+
             if panorama is not None:
                 self.current_result = panorama
                 self.original_result = panorama.copy()  # Store original for reset

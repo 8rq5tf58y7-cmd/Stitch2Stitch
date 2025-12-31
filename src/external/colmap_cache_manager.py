@@ -67,7 +67,7 @@ class COLMAPCacheManager:
         conn = sqlite3.connect(str(self.index_db_path))
         cursor = conn.cursor()
 
-        # Feature cache index
+        # Feature cache index with migration (adds n_keypoints when missing)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS feature_cache (
                 cache_key TEXT PRIMARY KEY,
@@ -81,15 +81,46 @@ class COLMAPCacheManager:
             )
         """)
 
+        feat_cols = [r[1] for r in cursor.execute("PRAGMA table_info(feature_cache)").fetchall()]
+        feat_required = {"cache_key", "image_name", "file_size", "max_features", "n_keypoints", "created_at", "last_used", "file_path"}
+        if not feat_required.issubset(set(feat_cols)):
+            legacy_name = f"feature_cache_legacy_{int(time.time())}"
+            try:
+                cursor.execute(f"ALTER TABLE feature_cache RENAME TO {legacy_name}")
+            except Exception:
+                cursor.execute("DROP TABLE IF EXISTS feature_cache")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS feature_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    image_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    max_features INTEGER NOT NULL,
+                    n_keypoints INTEGER,
+                    created_at REAL NOT NULL,
+                    last_used REAL NOT NULL,
+                    file_path TEXT
+                )
+            """)
+            try:
+                cursor.execute(f"""
+                    INSERT OR IGNORE INTO feature_cache
+                    (cache_key, image_name, file_size, max_features, n_keypoints, created_at, last_used, file_path)
+                    SELECT cache_key, image_name, file_size, max_features,
+                           NULL as n_keypoints, created_at, last_used, file_path
+                    FROM {legacy_name}
+                """)
+            except Exception:
+                pass
+
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_image_name ON feature_cache(image_name)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_last_used ON feature_cache(last_used)")
 
-        # Match cache index
+        # Match cache index (use img1_key/img2_key) with migration of older schemas.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS match_cache (
                 cache_key TEXT PRIMARY KEY,
-                image1_key TEXT NOT NULL,
-                image2_key TEXT NOT NULL,
+                img1_key TEXT NOT NULL,
+                img2_key TEXT NOT NULL,
                 matcher_type TEXT NOT NULL,
                 n_matches INTEGER,
                 n_inliers INTEGER,
@@ -98,7 +129,44 @@ class COLMAPCacheManager:
             )
         """)
 
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_image_keys ON match_cache(image1_key, image2_key)")
+        match_cols = [r[1] for r in cursor.execute("PRAGMA table_info(match_cache)").fetchall()]
+        match_required = {"cache_key", "img1_key", "img2_key", "matcher_type", "n_matches", "n_inliers", "created_at", "last_used"}
+        if not match_required.issubset(set(match_cols)):
+            legacy_name = f"match_cache_legacy_{int(time.time())}"
+            try:
+                cursor.execute(f"ALTER TABLE match_cache RENAME TO {legacy_name}")
+            except Exception:
+                cursor.execute("DROP TABLE IF EXISTS match_cache")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS match_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    img1_key TEXT NOT NULL,
+                    img2_key TEXT NOT NULL,
+                    matcher_type TEXT NOT NULL,
+                    n_matches INTEGER,
+                    n_inliers INTEGER,
+                    created_at REAL NOT NULL,
+                    last_used REAL NOT NULL
+                )
+            """)
+            try:
+                cursor.execute(f"""
+                    INSERT OR IGNORE INTO match_cache
+                    (cache_key, img1_key, img2_key, matcher_type, n_matches, n_inliers, created_at, last_used)
+                    SELECT cache_key,
+                           COALESCE(img1_key, image1_key),
+                           COALESCE(img2_key, image2_key),
+                           matcher_type,
+                           COALESCE(n_matches, 0),
+                           COALESCE(n_inliers, 0),
+                           created_at,
+                           last_used
+                    FROM {legacy_name}
+                """)
+            except Exception:
+                pass
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_image_keys ON match_cache(img1_key, img2_key)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_last_used ON match_cache(last_used)")
 
         conn.commit()
@@ -247,7 +315,7 @@ class COLMAPCacheManager:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO match_cache
-                (cache_key, image1_key, image2_key, matcher_type, n_matches, n_inliers, created_at, last_used)
+                (cache_key, img1_key, img2_key, matcher_type, n_matches, n_inliers, created_at, last_used)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 cache_key,
