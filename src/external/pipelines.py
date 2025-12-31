@@ -29,24 +29,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Safe debug logging - fails silently if log file can't be written
-def _safe_debug_log(hypothesis_id: str, location: str, message: str, data: dict):
-    """Write debug log entry, failing silently on error."""
-    try:
-        import time
-        debug_log_path = Path(__file__).parent.parent.parent / ".cursor" / "debug.log"
-        debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(debug_log_path, 'a') as f:
-            f.write(json.dumps({
-                "hypothesisId": hypothesis_id,
-                "location": location,
-                "message": message,
-                "data": data,
-                "timestamp": time.time()
-            }) + '\n')
-    except:
-        pass  # Fail silently - debug logging should never crash the app
-
 # Import ImageBlender for advanced blending
 try:
     from core.blender import ImageBlender
@@ -132,13 +114,7 @@ class COLMAPPipeline(ExternalPipelineBase):
                  min_inliers: int = 0,  # Minimum inliers to include image (0 = no filter)
                  max_images: int = 0,  # Maximum images in panorama (0 = no limit)
                  use_source_alpha: bool = False,  # Use source image alpha for transparent backgrounds
-                 remove_duplicates: bool = False,  # Remove duplicate images before processing
-                 duplicate_threshold: float = 0.92,  # Similarity threshold for duplicate detection
-                 warp_interpolation: str = 'linear',  # Interpolation: linear, cubic, lanczos, realesrgan
-                 erode_border: bool = True,  # Erode alpha mask to remove black borders
-                 border_erosion_pixels: int = 5,  # Pixels to erode from alpha mask edge
-                 progress_callback: Optional[Callable] = None,
-                 debug_callback: Optional[Callable] = None):
+                 progress_callback: Optional[Callable] = None):
         super().__init__(progress_callback)
         self.matcher_type = matcher_type
         self.use_affine = use_affine
@@ -150,13 +126,6 @@ class COLMAPPipeline(ExternalPipelineBase):
         self.min_inliers = min_inliers
         self.max_images = max_images
         self.use_source_alpha = use_source_alpha
-        self.remove_duplicates = remove_duplicates
-        self.duplicate_threshold = duplicate_threshold
-        self.warp_interpolation = warp_interpolation
-        self.erode_border = erode_border
-        self.border_erosion_pixels = border_erosion_pixels
-        self.debug_callback = debug_callback
-        self.wsl_stderr_log = []  # Stores all WSL stderr output
         self._version = None
         self._location = None
         self._has_cuda = False
@@ -226,32 +195,14 @@ class COLMAPPipeline(ExternalPipelineBase):
     
     def _process_wsl_line(self, line: str):
         """Process a single line from WSL stderr and update progress."""
-        # Store all lines in the log
-        self.wsl_stderr_log.append(line)
-
-        # Emit to debug callback if provided
-        if self.debug_callback:
-            self.debug_callback(line)
-
         # Handle diagnostic messages with WARNING/DEBUG tags
         if '[WARNING]' in line:
             msg = line.replace('[WARNING]', '').strip()
             logger.warning(f"WSL: {msg}")
-            # Also emit to progress so it shows in GUI
-            self._update_progress(-1, f"⚠️ {msg}")
-            return
-        elif '[CACHE]' in line:
-            # Per-image/global cache diagnostics from WSL bridge
-            msg = line.replace('[CACHE]', '').strip()
-            logger.info(f"WSL CACHE: {msg}")
-            self._update_progress(-1, f"🗄️ {msg}")
             return
         elif '[DEBUG]' in line:
             msg = line.replace('[DEBUG]', '').strip()
             logger.info(f"WSL DEBUG: {msg}")
-            # Emit DEBUG lines to progress callback so they appear in GUI
-            # Use -1 to indicate "no progress change, just status update"
-            self._update_progress(-1, f"🔍 {msg}")
             return
         elif line.strip().startswith('='):
             # Separator lines from diagnostics - show as warnings
@@ -273,29 +224,12 @@ class COLMAPPipeline(ExternalPipelineBase):
                 except:
                     pass
                 self._update_progress(5, f"WSL: {msg}")
-            elif 'Extracting features' in msg or 'WSL GPU: Extracting' in msg:
-                self._update_progress(15, f"WSL GPU: {msg}")
-            elif 'Feature extraction:' in msg:
-                # Real-time per-image extraction progress
+            elif 'Extracting features' in msg:
                 self._update_progress(15, f"WSL GPU: {msg}")
             elif 'Feature extraction complete' in msg:
                 self._update_progress(30, f"WSL GPU: {msg}")
-            elif 'Matching features' in msg or 'WSL GPU: Matching' in msg:
+            elif 'Matching features' in msg:
                 self._update_progress(35, f"WSL GPU: {msg}")
-            elif 'Feature matching:' in msg:
-                # Real-time per-pair matching progress
-                try:
-                    # Extract percentage from message like "Feature matching: 12,345/763,230 pairs (2%)"
-                    if '(' in msg and '%' in msg:
-                        pct_str = msg[msg.find('(')+1:msg.find('%')].strip()
-                        pct = int(pct_str)
-                        # Scale from 35-55% range based on matching progress
-                        scaled_pct = 35 + int((55 - 35) * pct / 100)
-                        self._update_progress(scaled_pct, f"WSL GPU: {msg}")
-                    else:
-                        self._update_progress(45, f"WSL GPU: {msg}")
-                except:
-                    self._update_progress(45, f"WSL GPU: {msg}")
             elif 'Feature matching complete' in msg:
                 self._update_progress(55, f"WSL GPU: {msg}")
             elif 'Reading matches' in msg:
@@ -329,12 +263,8 @@ class COLMAPPipeline(ExternalPipelineBase):
                 self._update_progress(92, f"WSL: {msg}")
             elif 'Complete!' in msg:
                 self._update_progress(98, f"WSL: {msg}")
-            elif 'Dedup:' in msg or 'duplicate' in msg.lower():
-                # Duplicate detection progress
-                self._update_progress(12, f"WSL: {msg}")
             else:
-                # Send all other progress messages to GUI as well
-                self._update_progress(-1, f"WSL: {msg}")
+                logger.info(f"WSL: {msg}")
         elif 'SIFT GPU' in line or 'Creating SIFT' in line:
             logger.info(f"WSL COLMAP: {line}")
         else:
@@ -344,10 +274,11 @@ class COLMAPPipeline(ExternalPipelineBase):
         """Run COLMAP processing via WSL for GPU acceleration."""
         import cv2
         import time
-
-        # Clear stderr log for this run
-        self.wsl_stderr_log = []
-
+        
+        # #region agent log
+        debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
+        # #endregion
+        
         self._update_progress(5, "COLMAP (WSL GPU): Preparing...")
         
         # Get the bridge script path
@@ -380,12 +311,7 @@ class COLMAPPipeline(ExternalPipelineBase):
             "max_features": self.max_features,
             "min_inliers": self.min_inliers,
             "max_images": self.max_images,
-            "use_source_alpha": self.use_source_alpha,
-            "remove_duplicates": self.remove_duplicates,
-            "duplicate_threshold": self.duplicate_threshold,
-            "warp_interpolation": self.warp_interpolation,
-            "erode_border": self.erode_border,
-            "border_erosion_pixels": self.border_erosion_pixels
+            "use_source_alpha": self.use_source_alpha
         }
         
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -398,20 +324,22 @@ class COLMAPPipeline(ExternalPipelineBase):
             drive = config_wsl[0].lower()
             config_wsl = f'/mnt/{drive}{config_wsl[2:]}'
         
-        _safe_debug_log("WSL3", "pipelines.py:_run_via_wsl", "Config file created",
-                       {"config_path": config_path, "config_wsl": config_wsl, "bridge_wsl": bridge_wsl, "n_images": len(image_paths)})
-
+        # #region agent log
+        with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"WSL3","location":"pipelines.py:_run_via_wsl","message":"Config file created","data":{"config_path":config_path,"config_wsl":config_wsl,"bridge_wsl":bridge_wsl,"n_images":len(image_paths)},"timestamp":time.time()}) + '\n')
+        # #endregion
+        
         # Run the WSL bridge script with config file
         # Use Popen for real-time output streaming
         try:
             cmd = ['wsl', '-e', 'python3', '-u', bridge_wsl, '--config', config_wsl]
-
+            
             # Dynamic timeout: 2 minutes per image, minimum 10 minutes
             n_images = len(image_paths)
             timeout_seconds = max(600, n_images * 120)  # 2 min per image
-
-            _safe_debug_log("WSL4", "pipelines.py:_run_via_wsl", "Running WSL command",
-                           {"cmd": cmd, "timeout": timeout_seconds, "n_images": n_images})
+            
+            # #region agent log
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"WSL4","location":"pipelines.py:_run_via_wsl","message":"Running WSL command","data":{"cmd":cmd,"timeout":timeout_seconds,"n_images":n_images},"timestamp":time.time()}) + '\n')
+            # #endregion
             
             # Use Popen for real-time stderr streaming
             process = subprocess.Popen(
@@ -479,33 +407,22 @@ class COLMAPPipeline(ExternalPipelineBase):
             
             stderr_thread.join(timeout=1)
             stderr_output = '\n'.join(stderr_lines)
-
-            _safe_debug_log("WSL5", "pipelines.py:_run_via_wsl", "WSL command result",
-                           {"returncode": process.returncode, "stdout_len": len(stdout), "stderr_lines": len(stderr_lines)})
-
+            
+            # #region agent log
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"WSL5","location":"pipelines.py:_run_via_wsl","message":"WSL command result","data":{"returncode":process.returncode,"stdout_len":len(stdout),"stderr_lines":len(stderr_lines),"stdout_preview":stdout[:500] if stdout else "","last_stderr_lines":stderr_lines[-5:] if stderr_lines else []},"timestamp":time.time()}) + '\n')
+            # #endregion
+            
             # Cleanup config file
             try:
                 os.unlink(config_path)
             except:
                 pass
-
+            
             if process.returncode != 0:
-                _safe_debug_log("WSL_ERR", "pipelines.py:_run_via_wsl", "WSL COLMAP failed",
-                               {"returncode": process.returncode, "stderr_preview": stderr_output[:1000]})
+                # #region agent log - Capture full error
+                with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"WSL_ERR","location":"pipelines.py:_run_via_wsl","message":"WSL COLMAP failed with non-zero return","data":{"returncode":process.returncode,"stderr_full":stderr_output,"stdout":stdout},"timestamp":time.time()}) + '\n')
+                # #endregion
                 logger.error(f"WSL COLMAP error (full): {stderr_output}")
-
-                # Save full stderr to a log file for debugging
-                try:
-                    stderr_log_path = output_dir / "wsl_colmap_error.log"
-                    with open(stderr_log_path, 'w') as f:
-                        f.write(f"WSL COLMAP Failed - Return code: {process.returncode}\n")
-                        f.write(f"Total stderr lines: {len(stderr_lines)}\n")
-                        f.write("=" * 60 + "\n\n")
-                        f.write(stderr_output)
-                    logger.info(f"Full WSL stderr saved to: {stderr_log_path}")
-                except Exception as e:
-                    logger.warning(f"Could not save stderr log: {e}")
-
                 # Extract the actual error from stderr - look for traceback or last few lines
                 error_lines = stderr_output.split('\n')
                 # Find lines with ERROR, Traceback, or Exception
@@ -516,10 +433,10 @@ class COLMAPPipeline(ExternalPipelineBase):
                         error_summary.extend(error_lines[max(0, i-2):min(len(error_lines), i+5)])
                         break
                 if error_summary:
-                    error_msg = '\n'.join(error_summary[-30:])  # Last 30 lines of error context
+                    error_msg = '\n'.join(error_summary[-20:])  # Last 20 lines of error context
                 else:
-                    error_msg = '\n'.join(error_lines[-50:])  # Last 50 lines if no specific error found
-                raise RuntimeError(f"WSL COLMAP failed (see {output_dir}/wsl_colmap_error.log for full output):\n{error_msg}")
+                    error_msg = stderr_output[-1000:]  # Last 1000 chars if no specific error found
+                raise RuntimeError(f"WSL COLMAP failed:\n{error_msg}")
             
             # Parse JSON result
             output = stdout.strip()
@@ -536,11 +453,7 @@ class COLMAPPipeline(ExternalPipelineBase):
             if output_path:
                 panorama = cv2.imread(output_path)
                 wsl_result['panorama'] = panorama
-
-            # Include full stderr log in result for debugging
-            wsl_result['stderr_log'] = self.wsl_stderr_log
-            wsl_result['stderr_lines'] = len(self.wsl_stderr_log)
-
+            
             self._update_progress(100, "COLMAP (WSL GPU): Complete!")
             return wsl_result
             
@@ -592,6 +505,33 @@ After installation, restart the application.
         # Feature extraction
         self._update_progress(10, "PyCOLMAP: Extracting features...")
         try:
+            # #region agent log - H1,H2,H3: Check pycolmap API attributes
+            import json
+            debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
+            sift_ext_opts = pycolmap.SiftExtractionOptions()
+            sift_ext_attrs = [a for a in dir(sift_ext_opts) if not a.startswith('_')]
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H1","location":"pipelines.py:sift_extraction","message":"SiftExtractionOptions attributes","data":{"attrs":sift_ext_attrs,"pycolmap_version":getattr(pycolmap,'__version__','unknown')},"timestamp":__import__('time').time()}) + '\n')
+            # Check if use_gpu exists on extraction options
+            has_use_gpu_ext = hasattr(sift_ext_opts, 'use_gpu')
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H2","location":"pipelines.py:use_gpu_check","message":"SiftExtractionOptions has use_gpu?","data":{"has_use_gpu":has_use_gpu_ext},"timestamp":__import__('time').time()}) + '\n')
+            # Check SiftMatchingOptions for comparison
+            sift_match_opts = pycolmap.SiftMatchingOptions()
+            sift_match_attrs = [a for a in dir(sift_match_opts) if not a.startswith('_')]
+            has_use_gpu_match = hasattr(sift_match_opts, 'use_gpu')
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H3","location":"pipelines.py:sift_matching","message":"SiftMatchingOptions comparison","data":{"attrs":sift_match_attrs,"has_use_gpu":has_use_gpu_match},"timestamp":__import__('time').time()}) + '\n')
+            # Check extract_features function signature
+            import inspect
+            try:
+                sig = str(inspect.signature(pycolmap.extract_features))
+            except:
+                sig = "unknown"
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H5","location":"pipelines.py:extract_features_sig","message":"extract_features signature","data":{"signature":sig},"timestamp":__import__('time').time()}) + '\n')
+            # Check has_cuda (it's a boolean property, not a method in pycolmap 3.13+)
+            has_cuda = pycolmap.has_cuda if hasattr(pycolmap, 'has_cuda') else 'no has_cuda attr'
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H4","location":"pipelines.py:cuda_check","message":"CUDA availability","data":{"has_cuda":has_cuda},"timestamp":__import__('time').time()}) + '\n')
+            # #endregion
+            
+            # Try calling extract_features without sift_options first (use defaults)
             # Use PINHOLE camera model (no lens distortion)
             pycolmap.extract_features(
                 database_path,
@@ -599,7 +539,7 @@ After installation, restart the application.
                 camera_mode=pycolmap.CameraMode.PER_IMAGE,
                 camera_model="PINHOLE"
             )
-            logger.info("Feature extraction completed")
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H4","location":"pipelines.py:extract_success","message":"extract_features succeeded","data":{"method":"no_sift_options"},"timestamp":__import__('time').time()}) + '\n')
         except Exception as e:
             logger.error(f"PyCOLMAP feature extraction error: {e}")
             raise RuntimeError(f"PyCOLMAP feature extraction failed: {e}")
@@ -607,39 +547,65 @@ After installation, restart the application.
         # Feature matching
         self._update_progress(30, f"PyCOLMAP: Matching features ({self.matcher_type})...")
         try:
+            # #region agent log - H3: Check matching options
+            import json
+            debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H3","location":"pipelines.py:matching_start","message":"Starting feature matching","data":{"matcher_type":self.matcher_type},"timestamp":__import__('time').time()}) + '\n')
+            # #endregion
+            
             logger.info(f"Matcher type: {self.matcher_type}")
             if self.matcher_type == "vocab_tree":
+                # Note: vocab_tree_matcher requires a vocabulary tree file
+                # For now, fall back to exhaustive if vocab tree not available
                 logger.warning("Vocab tree matcher not implemented, falling back to exhaustive matching")
                 pycolmap.match_exhaustive(database_path)
             elif self.matcher_type == "sequential":
+                # Sequential matching with overlap parameter
                 logger.info(f"Using sequential matching with overlap={self.sequential_overlap}")
                 pycolmap.match_sequential(database_path, overlap=self.sequential_overlap)
             elif self.matcher_type == "grid":
+                # Grid-aware matching - fall back to sequential for now
                 logger.warning("Grid-aware matching not fully implemented, falling back to sequential")
                 pycolmap.match_sequential(database_path, overlap=self.sequential_overlap)
             else:  # exhaustive
                 logger.info("Using exhaustive matching (all pairs)")
                 pycolmap.match_exhaustive(database_path)
-            logger.info("Feature matching completed")
+            
+            # #region agent log
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H3","location":"pipelines.py:matching_success","message":"Feature matching succeeded","data":{"matcher_type":self.matcher_type},"timestamp":__import__('time').time()}) + '\n')
+            # #endregion
         except Exception as e:
             logger.error(f"PyCOLMAP matching error: {e}")
             raise RuntimeError(f"PyCOLMAP matching failed: {e}")
-
+        
         # Sparse reconstruction (bundle adjustment)
         self._update_progress(60, "PyCOLMAP: Running bundle adjustment...")
         try:
+            # #region agent log
+            import json
+            debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H4","location":"pipelines.py:mapping_start","message":"Starting incremental mapping","data":{},"timestamp":__import__('time').time()}) + '\n')
+            # #endregion
+            
             reconstructions = pycolmap.incremental_mapping(
                 database_path,
                 images_dir,
                 sparse_dir
             )
-
+            
+            # #region agent log
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H4","location":"pipelines.py:mapping_result","message":"Incremental mapping result","data":{"num_reconstructions":len(reconstructions) if reconstructions else 0},"timestamp":__import__('time').time()}) + '\n')
+            # #endregion
+            
             if not reconstructions:
                 return {"success": False, "error": "No reconstruction found"}
-
+            
             # Write the first (best) reconstruction
             reconstructions[0].write(sparse_dir)
-            logger.info(f"Reconstruction completed: {len(reconstructions)} models")
+            
+            # #region agent log
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H4","location":"pipelines.py:write_success","message":"Reconstruction written successfully","data":{},"timestamp":__import__('time').time()}) + '\n')
+            # #endregion
         except Exception as e:
             logger.error(f"PyCOLMAP reconstruction error: {e}")
             raise RuntimeError(f"PyCOLMAP reconstruction failed: {e}")
@@ -654,10 +620,22 @@ After installation, restart the application.
     def _read_reconstruction(self, sparse_dir: Path) -> Dict:
         """Read PyCOLMAP reconstruction results."""
         import pycolmap
-
+        import json
+        
+        # #region agent log - Check Camera attributes in pycolmap 3.13
+        debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
+        # #endregion
+        
         try:
             # Load reconstruction from the sparse directory
             reconstruction = pycolmap.Reconstruction(sparse_dir)
+            
+            # #region agent log - Check Camera object attributes
+            if reconstruction.cameras:
+                first_cam = next(iter(reconstruction.cameras.values()))
+                cam_attrs = [a for a in dir(first_cam) if not a.startswith('_')]
+                with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H6","location":"pipelines.py:camera_attrs","message":"Camera object attributes","data":{"attrs":cam_attrs},"timestamp":__import__('time').time()}) + '\n')
+            # #endregion
             
             # Build camera info with compatible attribute names (pycolmap 3.13+)
             cameras_info = {}
@@ -693,7 +671,11 @@ After installation, restart the application.
                 "cameras": cameras_info,
                 "images": images_info,
             }
-
+            
+            # #region agent log
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"H6","location":"pipelines.py:read_success","message":"Reconstruction read successfully","data":{"n_images":results['n_images'],"n_points3d":results['n_points3d']},"timestamp":__import__('time').time()}) + '\n')
+            # #endregion
+            
             logger.info(f"PyCOLMAP reconstruction: {results['n_images']} images, "
                        f"{results['n_points3d']} 3D points, {results['n_cameras']} cameras")
             return results
@@ -719,12 +701,19 @@ After installation, restart the application.
 
         import pycolmap
 
+        # #region agent log - CUDA/GPU availability check
+        debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
         cuda_available = pycolmap.has_cuda if hasattr(pycolmap, 'has_cuda') else False
-        logger.info(f"PyCOLMAP CUDA available: {cuda_available}")
+        pycolmap_version = getattr(pycolmap, '__version__', 'unknown')
+        with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"CUDA1","location":"pipelines.py:run_2d_stitch","message":"CUDA availability at start","data":{"has_cuda":cuda_available,"pycolmap_version":pycolmap_version,"use_gpu_requested":self.use_gpu,"_has_cuda_attr":self._has_cuda,"_has_wsl_cuda":self._has_wsl_cuda},"timestamp":time.time()}) + '\n')
+        # Check all pycolmap module attributes related to CUDA/device
+        cuda_attrs = [a for a in dir(pycolmap) if 'cuda' in a.lower() or 'gpu' in a.lower() or 'device' in a.lower()]
+        with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"CUDA2","location":"pipelines.py:run_2d_stitch","message":"CUDA-related attributes in pycolmap","data":{"cuda_attrs":cuda_attrs},"timestamp":time.time()}) + '\n')
+        # #endregion
 
         # Use WSL for GPU if native CUDA not available but WSL CUDA is
         if self._has_wsl_cuda and not self._has_cuda:
-            logger.info("Using WSL for GPU acceleration")
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"WSL1","location":"pipelines.py:run_2d_stitch","message":"Using WSL for GPU acceleration","data":{},"timestamp":time.time()}) + '\n')
             return self._run_via_wsl(image_paths, output_dir)
 
         # Only import these if running native (not WSL)

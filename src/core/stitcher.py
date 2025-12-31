@@ -13,9 +13,6 @@ import gc
 from ml.feature_detector import LP_SIFTDetector, ORBDetector, AKAZEDetector
 from ml.matcher import AdvancedMatcher
 from ml.advanced_matchers import LoFTRMatcher, SuperGlueMatcher, DISKMatcher
-from ml.hierarchical_matcher import HierarchicalMatcher, GlobalImageRetrieval, FeatureTrackBuilder
-from ml.superpoint import SuperPointDetector
-from ml.advanced_geometry import MAGSACPlusPlus, LineFeatureDetector, CombinedFeatureDetector
 from quality.assessor import ImageQualityAssessor
 from core.alignment import ImageAligner
 from core.blender import ImageBlender
@@ -46,24 +43,21 @@ class ImageStitcher:
         progress_callback: Optional[Callable[[int, str], None]] = None,
         cancel_flag: Optional[Callable[[], bool]] = None,
         allow_scale: bool = True,
-        max_panorama_pixels: Optional[int] = 500_000_000,  # 500MP default (~22kx22k)
-        max_warp_pixels: Optional[int] = None,  # No per-image limit, let blender handle
+        max_panorama_pixels: Optional[int] = 100_000_000,
+        max_warp_pixels: Optional[int] = 50_000_000,
         memory_efficient: bool = True,
         geometric_verify: bool = True,
-        geometric_verify_method: Optional[str] = 'magsac',  # 'magsac', 'usac', 'usac_accurate', 'ransac'
         select_optimal_coverage: bool = False,
         max_coverage_overlap: float = 0.5,
         remove_duplicates: bool = True,
-        duplicate_threshold: float = 0.96,  # Stricter threshold - only near-identical images
+        duplicate_threshold: float = 0.92,
         optimize_alignment: bool = False,
         alignment_optimization_level: str = 'balanced',
         # AutoPano Giga-inspired features
         use_grid_topology: bool = True,
         use_bundle_adjustment: bool = False,
         use_hierarchical_stitching: bool = False,
-        use_enhanced_detection: bool = False,
-        # Unsorted image handling
-        exhaustive_matching: bool = True
+        use_enhanced_detection: bool = False
     ):
         """
         Initialize the stitcher
@@ -73,8 +67,7 @@ class ImageStitcher:
             quality_threshold: Minimum quality score (0.0-1.0) for image inclusion
             max_images: Maximum number of images to process (None = unlimited)
             memory_limit_gb: Memory limit in GB for processing
-            feature_detector: Feature detector algorithm ('lp_sift', 'sift', 'superpoint', 'orb', 'akaze')
-                - 'superpoint': Best for 500+ images, repetitive scenes, uses deep learning
+            feature_detector: Feature detector algorithm ('lp_sift', 'sift', 'orb', 'akaze')
             feature_matcher: Feature matcher algorithm ('flann', 'loftr', 'superglue', 'disk')
             blending_method: Blending algorithm ('multiband', 'feather', 'linear', 'semantic', 'pixelstitch')
             allow_scale: Allow uniform scaling to match images at overlaps
@@ -91,11 +84,6 @@ class ImageStitcher:
                 - Efficient: Thumbnails + compressed cache (~200-400MB)
             geometric_verify: Enable geometric verification to filter bad feature matches
                 Uses RANSAC-based similarity transform estimation to reject outliers
-            geometric_verify_method: Method for geometric verification
-                'magsac' = MAGSAC++ (best, robust to varying noise levels)
-                'usac' = USAC++ (fast and accurate)
-                'usac_accurate' = USAC Accurate (OpenCV's most accurate mode)
-                'ransac' = Classic RANSAC
             select_optimal_coverage: Only use images necessary to cover the panorama area
                 Avoids redundant images that overlap >max_coverage_overlap with already-selected images
             max_coverage_overlap: Maximum allowed overlap (0.0-1.0) between selected images
@@ -128,7 +116,6 @@ class ImageStitcher:
         self.max_warp_pixels = max_warp_pixels
         self.memory_efficient = memory_efficient
         self.geometric_verify = geometric_verify
-        self.geometric_verify_method = geometric_verify_method
         self.select_optimal_coverage = select_optimal_coverage
         self.max_coverage_overlap = max_coverage_overlap
         self.remove_duplicates = remove_duplicates
@@ -139,7 +126,6 @@ class ImageStitcher:
         self.use_bundle_adjustment = use_bundle_adjustment
         self.use_hierarchical_stitching = use_hierarchical_stitching
         self.use_enhanced_detection = use_enhanced_detection
-        self.exhaustive_matching = exhaustive_matching
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
         
         # AutoPano-inspired features (lazy loaded)
@@ -193,35 +179,15 @@ class ImageStitcher:
     def _create_feature_detector(self, method: str, use_gpu: bool, max_features: int = 5000):
         """Create feature detector based on method"""
         method = method.lower()
-        detector_type = None
-        
         if method == 'lp_sift' or method == 'sift':
-            detector_type = 'LP_SIFT'
-            detector = LP_SIFTDetector(use_gpu=use_gpu, n_features=max_features)
-        elif method == 'superpoint':
-            # SuperPoint: Best for large-scale matching and repetitive scenes
-            detector_type = 'SuperPoint'
-            detector = SuperPointDetector(use_gpu=use_gpu, n_features=max_features)
+            return LP_SIFTDetector(use_gpu=use_gpu, n_features=max_features)
         elif method == 'orb':
-            detector_type = 'ORB'
-            detector = ORBDetector(n_features=max_features)
+            return ORBDetector(n_features=max_features)
         elif method == 'akaze':
-            detector_type = 'AKAZE'
-            detector = AKAZEDetector(n_features=max_features)
+            return AKAZEDetector(n_features=max_features)
         else:
             logger.warning(f"Unknown detector method {method}, using LP-SIFT")
-            detector_type = 'LP_SIFT (fallback)'
-            detector = LP_SIFTDetector(use_gpu=use_gpu, n_features=max_features)
-        
-        # #region agent log
-        try:
-            import json
-            with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                f.write(json.dumps({"hypothesisId":"DET","location":"stitcher.py:_create_feature_detector","message":"Created detector","data":{"requested":method,"created":detector_type,"gpu":use_gpu,"features":max_features},"timestamp":__import__('time').time()}) + '\n')
-        except: pass
-        # #endregion
-        
-        return detector
+            return LP_SIFTDetector(use_gpu=use_gpu, n_features=max_features)
     
     def _create_feature_matcher(self, method: str, use_gpu: bool):
         """Create feature matcher based on method"""
@@ -294,42 +260,19 @@ class ImageStitcher:
             raise ValueError("No images passed quality assessment")
         
         logger.info(f"Selected {len(images_data)} high-quality images out of {len(image_paths)}")
-        # #region agent log
-        try:
-            import json
-            with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                f.write(json.dumps({"hypothesisId":"F","location":"stitcher.py:stitch","message":"After quality assessment","data":{"n_loaded":len(images_data),"n_input_paths":len(image_paths)},"timestamp":__import__('time').time()}) + '\n')
-        except: pass
-        # #endregion
         
         # Step 1.5: Remove duplicate/similar images (for burst photos)
         if self.remove_duplicates and len(images_data) > 2:
             self._check_cancel()
             logger.info("Step 1.5: Removing duplicate images...")
             self._update_progress(20, "Detecting and removing duplicate images...")
-            before_dedup = len(images_data)
             images_data = self._remove_duplicate_images(images_data)
             gc.collect()
             
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"A","location":"stitcher.py:after_dedup","message":"After duplicate removal","data":{"before":before_dedup,"after":len(images_data),"removed":before_dedup - len(images_data)},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
-            
             if len(images_data) < 2:
-                raise ValueError(f"Too few unique images after duplicate removal ({len(images_data)}/{before_dedup})")
+                raise ValueError("Too few unique images after duplicate removal")
             
             logger.info(f"After duplicate removal: {len(images_data)} unique images")
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"F","location":"stitcher.py:stitch","message":"After duplicate removal","data":{"n_images":len(images_data)},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
         
         # Step 1.75: Optimize images for alignment (if enabled)
         if self.optimize_alignment:
@@ -350,30 +293,11 @@ class ImageStitcher:
         self._check_cancel()
         logger.info("Step 3: Matching features...")
         self._update_progress(50, "Matching features between images...")
-        
-        # For unsorted images, we need more aggressive matching
-        # Try thumbnail-based pre-clustering for large sets to find potential neighbors
-        if len(features_data) >= 15:
-            self._update_progress(45, "Analyzing image similarity for smart matching...")
-            self._precompute_image_similarity(images_data)
-        
         matches = self._match_features(features_data)
         gc.collect()  # Free memory after matching
         
         if not matches:
             raise ValueError("No feature matches found between images")
-        
-        # Verify graph connectivity and attempt recovery if poor
-        if len(matches) > 0 and len(features_data) > 5:
-            connectivity = self._check_graph_connectivity(len(features_data), matches)
-            if connectivity < 0.9:
-                logger.warning(f"Graph connectivity is low ({connectivity:.1%}) - attempting additional matching...")
-                # Try additional matching for disconnected images
-                additional_matches = self._match_disconnected_images(features_data, matches)
-                if additional_matches:
-                    matches.extend(additional_matches)
-                    new_connectivity = self._check_graph_connectivity(len(features_data), matches)
-                    logger.info(f"After recovery: connectivity improved to {new_connectivity:.1%}")
         
         # Step 3.5: Select optimal coverage (remove redundant images)
         if self.select_optimal_coverage:
@@ -385,13 +309,6 @@ class ImageStitcher:
             )
             gc.collect()
             logger.info(f"After coverage selection: {len(images_data)} images")
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"F","location":"stitcher.py:stitch","message":"After coverage selection","data":{"n_images":len(images_data)},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
         
         # Step 4: Align images (use control points if available)
         self._check_cancel()
@@ -405,18 +322,8 @@ class ImageStitcher:
         else:
             aligned_images = self.aligner.align_images(images_data, features_data, matches)
         
-        # Verify alignment quality before proceeding
-        alignment_quality = self._verify_alignment_quality(aligned_images)
-        if alignment_quality < 0.5:
-            logger.warning(f"Alignment quality is low ({alignment_quality:.2f}) - enabling bundle adjustment")
-            # Force bundle adjustment if alignment looks bad
-            if not self.use_bundle_adjustment and len(aligned_images) >= 3:
-                self.use_bundle_adjustment = True
-        
         # Step 4.5: Bundle adjustment (global optimization)
-        # Auto-enable for large sets (>=15 images) even if not explicitly requested
-        should_bundle_adjust = self.use_bundle_adjustment or (len(aligned_images) >= 15)
-        if should_bundle_adjust and len(aligned_images) >= 3:
+        if self.use_bundle_adjustment and len(aligned_images) >= 3:
             self._check_cancel()
             logger.info("Step 4.5: Bundle adjustment optimization...")
             self._update_progress(78, "Optimizing global alignment (bundle adjustment)...")
@@ -909,12 +816,10 @@ class ImageStitcher:
             return images_data
         
         # Create detector with progress callback
-        # Use window=0 for unsorted images to compare ALL pairs (finds duplicates anywhere in list)
-        # For very large sets (500+), this is O(n²) but necessary for correctness
         detector = DuplicateDetector(
             similarity_threshold=self.duplicate_threshold,
             hash_size=16,
-            comparison_window=0,  # 0 = compare all pairs (required for unsorted images)
+            comparison_window=30,  # Compare with nearby images (efficient for burst)
             progress_callback=self._update_progress
         )
         
@@ -1060,7 +965,7 @@ class ImageStitcher:
     def _run_bundle_adjustment(
         self,
         aligned_images: List[Dict],
-        matches: List[Dict]
+        matches: Dict
     ) -> List[Dict]:
         """
         Run bundle adjustment to globally optimize alignment.
@@ -1082,34 +987,19 @@ class ImageStitcher:
             for img_data in aligned_images:
                 transform = img_data.get('transform')
                 if transform is not None:
-                    # Ensure it's 2x3 format for bundle adjuster
-                    if transform.shape == (3, 3):
-                        initial_transforms.append(transform[:2, :])
-                    else:
-                        initial_transforms.append(transform)
+                    initial_transforms.append(transform)
                 else:
                     # Identity transform
                     initial_transforms.append(np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64))
             
-            # Convert matches list to the format expected by bundle adjuster
-            # Include keypoint coordinates for optimization
+            # Convert matches dict to the format expected by bundle adjuster
             matches_dict = {}
-            for match in matches:
-                i = match.get('image_i', match.get('img_i', 0))
-                j = match.get('image_j', match.get('img_j', 1))
-                
-                match_entry = {
-                    'num_inliers': match.get('num_inliers', match.get('num_matches', 0)),
-                    'inlier_ratio': match.get('inlier_ratio', 0.5),
-                    'confidence': match.get('confidence', 0.5)
-                }
-                
-                # Include point coordinates if available (required for BA)
-                if match.get('src_pts') is not None and match.get('dst_pts') is not None:
-                    match_entry['src_pts'] = match['src_pts']
-                    match_entry['dst_pts'] = match['dst_pts']
-                
-                matches_dict[(i, j)] = match_entry
+            if isinstance(matches, list):
+                for match in matches:
+                    i, j = match.get('img_i', 0), match.get('img_j', 1)
+                    matches_dict[(i, j)] = match
+            else:
+                matches_dict = matches
             
             # Run optimization
             optimized_transforms, stats = self._bundle_adjuster.optimize(
@@ -1640,7 +1530,6 @@ class ImageStitcher:
                     logger.info(f"First image feature detection took {elapsed:.2f}s (subsequent will be faster)")
                 
                 # Validate features were detected
-                n_features = 0 if descriptors is None else len(descriptors)
                 if descriptors is None:
                     logger.warning(f"No descriptors detected for image {idx}")
                     descriptors = np.array([])
@@ -1648,15 +1537,6 @@ class ImageStitcher:
                     logger.warning(f"Empty descriptors for image {idx}")
                 else:
                     logger.debug(f"Image {idx}: detected {len(descriptors)} features")
-                
-                # #region agent log
-                try:
-                    import json
-                    with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                        img_shape = img_data['image'].shape if img_data.get('image') is not None else None
-                        f.write(json.dumps({"hypothesisId":"H1","location":"stitcher.py:_detect_features","message":"Feature detection result","data":{"image_idx":idx,"n_features":n_features,"img_shape":str(img_shape),"desc_type":str(type(descriptors).__name__) if descriptors is not None else None},"timestamp":__import__('time').time()}) + '\n')
-                except: pass
-                # #endregion
                 
                 features_data.append({
                     'image_data': img_data,
@@ -1693,14 +1573,6 @@ class ImageStitcher:
         
         def compute_inlier_stats(match_list, kp_i, kp_j):
             """Run RANSAC to reject bad links and keep only inlier pairs."""
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"H3","location":"stitcher.py:compute_inlier_stats:start","message":"Entry","data":{"match_list_len":len(match_list) if match_list else 0,"kp_i_len":len(kp_i) if kp_i is not None else 0,"kp_j_len":len(kp_j) if kp_j is not None else 0},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
-            
             if match_list is None or len(match_list) < 4:
                 return None, None, None
             
@@ -1713,134 +1585,27 @@ class ImageStitcher:
                     pts_i.append([kp_i[qi][0], kp_i[qi][1]])
                     pts_j.append([kp_j[tj][0], kp_j[tj][1]])
             
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"H3","location":"stitcher.py:compute_inlier_stats","message":"After point extraction","data":{"pts_i_len":len(pts_i),"pts_j_len":len(pts_j)},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
-            
             if len(pts_i) < 4:
                 return None, None, None
             
             pts_i = np.float32(pts_i)
             pts_j = np.float32(pts_j)
             
-            # Robustly estimate inliers using configured method
-            # MAGSAC++ > USAC++ > USAC_ACCURATE > RANSAC
-            # Note: findHomography supports USAC_MAGSAC, estimateAffinePartial2D does NOT
-            geo_method = getattr(self, 'geometric_verify_method', 'magsac') or 'ransac'
-            cv_method_name = geo_method
-            use_homography_for_inliers = False  # Use findHomography for advanced methods
-            
-            try:
-                if geo_method == 'magsac':
-                    cv_method = cv2.USAC_MAGSAC
-                    cv_method_name = 'USAC_MAGSAC'
-                    use_homography_for_inliers = True  # findHomography supports this
-                elif geo_method == 'usac':
-                    cv_method = cv2.USAC_PARALLEL
-                    cv_method_name = 'USAC_PARALLEL'
-                    use_homography_for_inliers = True
-                elif geo_method == 'usac_accurate':
-                    cv_method = cv2.USAC_ACCURATE
-                    cv_method_name = 'USAC_ACCURATE'
-                    use_homography_for_inliers = True
-                else:
-                    cv_method = cv2.RANSAC
-                    cv_method_name = 'RANSAC'
-            except AttributeError:
-                cv_method = cv2.RANSAC  # Fallback for older OpenCV
-                cv_method_name = 'RANSAC (fallback)'
-            
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"GEO","location":"stitcher.py:compute_inlier_stats","message":"Geo verification method","data":{"requested":geo_method,"using":cv_method_name,"use_homography":use_homography_for_inliers},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
-            
-            inliers = None
-            try:
-                if use_homography_for_inliers:
-                    # Use findHomography with MAGSAC++/USAC to find robust inliers
-                    # This is more robust than estimateAffinePartial2D for outlier rejection
-                    _, inliers = cv2.findHomography(
-                        pts_i, pts_j,
-                        method=cv_method,
-                        ransacReprojThreshold=3.0,
-                        confidence=0.995,
-                        maxIters=2000
-                    )
-                    # #region agent log
-                    try:
-                        import json
-                        with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                            f.write(json.dumps({"hypothesisId":"H4","location":"stitcher.py:compute_inlier_stats","message":"findHomography MAGSAC++ result","data":{"n_pts":len(pts_i),"n_inliers":int(np.sum(inliers)) if inliers is not None else 0,"method":cv_method_name},"timestamp":__import__('time').time()}) + '\n')
-                    except: pass
-                    # #endregion
-                else:
-                    # Use standard RANSAC with estimateAffinePartial2D
-                    _, inliers = cv2.estimateAffinePartial2D(
-                        pts_i, pts_j,
-                        method=cv_method,
-                        ransacReprojThreshold=3.0,
-                        confidence=0.995,
-                        maxIters=2000
-                    )
-            except Exception as geo_error:
-                # #region agent log
-                try:
-                    import json
-                    with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                        f.write(json.dumps({"hypothesisId":"H3","location":"stitcher.py:compute_inlier_stats","message":"Geo verification exception","data":{"error":str(geo_error),"method":cv_method_name,"n_pts":len(pts_i)},"timestamp":__import__('time').time()}) + '\n')
-                except: pass
-                # #endregion
-                # Fallback to standard RANSAC with estimateAffinePartial2D
-                try:
-                    _, inliers = cv2.estimateAffinePartial2D(
-                        pts_i, pts_j,
-                        method=cv2.RANSAC,
-                        ransacReprojThreshold=3.0,
-                        confidence=0.995,
-                        maxIters=2000
-                    )
-                except:
-                    return None, None, None
-            
-            # #region agent log
-            try:
-                import json
-                inlier_count = 0 if inliers is None else int(np.sum(inliers.astype(bool).ravel()))
-                total_pts = len(pts_i)
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"H3","location":"stitcher.py:compute_inlier_stats","message":"RANSAC result","data":{"n_pts":total_pts,"n_inliers":inlier_count,"inliers_is_none":inliers is None},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
+            # Robustly estimate similarity transform with RANSAC; reject outliers
+            _, inliers = cv2.estimateAffinePartial2D(
+                pts_i, pts_j,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=3.0,
+                confidence=0.995,
+                maxIters=2000
+            )
             
             if inliers is None:
-                # #region agent log
-                try:
-                    import json
-                    with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                        f.write(json.dumps({"hypothesisId":"H5","location":"stitcher.py:compute_inlier_stats","message":"inliers is None - early return","data":{},"timestamp":__import__('time').time()}) + '\n')
-                except: pass
-                # #endregion
                 return None, None, None
             
             inlier_mask = inliers.astype(bool).ravel()
             num_inliers = int(np.sum(inlier_mask))
             inlier_ratio = num_inliers / len(match_list) if len(match_list) > 0 else 0.0
-            
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"H3","location":"stitcher.py:compute_inlier_stats","message":"Inlier check","data":{"num_inliers":num_inliers,"inlier_ratio":round(inlier_ratio,4),"threshold_inliers":6,"threshold_ratio":0.25,"will_reject":(num_inliers < 6 or inlier_ratio < 0.25)},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
             
             # Relaxed: need at least 6 inliers with 25% inlier ratio
             if num_inliers < 6 or inlier_ratio < 0.25:
@@ -1855,71 +1620,18 @@ class ImageStitcher:
         is_dl_matcher = isinstance(self.matcher, (LoFTRMatcher,))
         is_superglue = isinstance(self.matcher, SuperGlueMatcher)
         
-        # Determine matching strategy based on image count and settings
+        # Determine matching strategy based on image count
         # n² growth: 10 imgs = 45 pairs, 20 = 190, 50 = 1225, 100 = 4950
-        all_pairs_count = n_images * (n_images - 1) // 2
-        
-        # For large sets (100+), use hierarchical matching with global image retrieval
-        # This is CRITICAL for avoiding false matches in repetitive scenes
-        use_hierarchical = n_images >= 100
-        hierarchical_matcher = None
-        
-        if use_hierarchical:
-            logger.info(f"Large image set ({n_images}): using hierarchical matching pipeline")
-            hierarchical_matcher = HierarchicalMatcher(
-                n_candidates=min(30, n_images // 5),  # 30 candidates or 20% of images
-                use_tracks=True,
-                use_mutual_consistency=True,
-                progress_callback=self._update_progress
-            )
-            
-            # Compute global descriptors for image retrieval
-            self._update_progress(35, "Computing global image descriptors...")
-            
-            # Need images for global descriptors - get from features_data
-            images_for_retrieval = []
-            for fd in features_data:
-                if 'image' in fd:
-                    images_for_retrieval.append({'image': fd['image']})
-                else:
-                    # Create dummy image from keypoints extent
-                    kps = fd.get('keypoints', [])
-                    if len(kps) > 0:
-                        max_x = int(max(kp[0] for kp in kps)) + 100
-                        max_y = int(max(kp[1] for kp in kps)) + 100
-                        dummy = np.zeros((max_y, max_x, 3), dtype=np.uint8)
-                        images_for_retrieval.append({'image': dummy})
-            
-            if images_for_retrieval:
-                hierarchical_matcher.compute_global_descriptors(images_for_retrieval)
-                pairs_to_match = hierarchical_matcher.get_matching_pairs(n_images)
-                logger.info(f"Hierarchical retrieval: {all_pairs_count} → {len(pairs_to_match)} pairs "
-                           f"({100*len(pairs_to_match)/max(all_pairs_count,1):.1f}% reduction)")
-            else:
-                # Fallback to smart matching
-                pairs_to_match = self._get_smart_matching_pairs(n_images, features_data)
-        elif n_images <= 10:
+        if n_images <= 10:
             # Small sets: match all pairs (fast enough)
             pairs_to_match = [(i, j) for i in range(n_images) for j in range(i + 1, n_images)]
             logger.info(f"Small image set ({n_images}): matching all {len(pairs_to_match)} pairs")
-        elif self.exhaustive_matching and n_images <= 40:
-            # Exhaustive matching enabled and manageable set size: match all pairs
-            pairs_to_match = [(i, j) for i in range(n_images) for j in range(i + 1, n_images)]
-            logger.info(f"Exhaustive matching ({n_images} images): matching all {len(pairs_to_match)} pairs")
         else:
-            # Medium sets: use smart matching based on image similarity
+            # Larger sets: use smart windowed matching to avoid O(n²)
             pairs_to_match = self._get_smart_matching_pairs(n_images, features_data)
-            logger.info(f"Smart matching ({n_images} images): {len(pairs_to_match)} pairs ({len(pairs_to_match)*100//max(all_pairs_count,1)}% of all)")
+            logger.info(f"Image set ({n_images}): smart matching with {len(pairs_to_match)} pairs (saved {n_images*(n_images-1)//2 - len(pairs_to_match)} comparisons)")
         
         total_pairs = len(pairs_to_match)
-        
-        # #region agent log
-        try:
-            import json
-            with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                f.write(json.dumps({"hypothesisId":"A","location":"stitcher.py:_match_features","message":"Matching started","data":{"n_images":n_images,"total_pairs":total_pairs,"strategy":"exhaustive" if self.exhaustive_matching else "smart"},"timestamp":__import__('time').time()}) + '\n')
-        except: pass
-        # #endregion
         
         # Track connectivity for early termination
         connected_images = set()
@@ -1976,16 +1688,6 @@ class ImageStitcher:
                         match_result = self.matcher.match(desc1, desc2)
                 
                 # Check if match was rejected by geometric verification
-                if match_result is None:
-                    # #region agent log
-                    try:
-                        import json
-                        with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                            f.write(json.dumps({"hypothesisId":"H2","location":"stitcher.py:_match_features","message":"Matcher returned None","data":{"pair":[i,j]},"timestamp":__import__('time').time()}) + '\n')
-                    except: pass
-                    # #endregion
-                    continue
-                    
                 if match_result.get('rejected_reason'):
                     logger.debug(f"Pair ({i}, {j}): rejected - {match_result['rejected_reason']}")
                     rejected_count += 1
@@ -1993,14 +1695,6 @@ class ImageStitcher:
                 
                 num_matches = match_result.get('num_matches', 0) if match_result else 0
                 inlier_ratio = match_result.get('inlier_ratio', 1.0)
-                
-                # #region agent log
-                try:
-                    import json
-                    with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                        f.write(json.dumps({"hypothesisId":"H2","location":"stitcher.py:_match_features","message":"Raw match result","data":{"pair":[i,j],"num_matches":num_matches,"confidence":match_result.get('confidence',0)},"timestamp":__import__('time').time()}) + '\n')
-                except: pass
-                # #endregion
                 
                 if num_matches > 0:
                     logger.debug(f"Pair ({i}, {j}): {num_matches} raw matches, confidence: {match_result.get('confidence', 0.0):.4f}")
@@ -2019,16 +1713,6 @@ class ImageStitcher:
                         logger.debug(f"Pair ({i}, {j}) rejected by RANSAC (inliers too low)")
                         continue
                     
-                    # Extract point coordinates for bundle adjustment
-                    src_pts = []
-                    dst_pts = []
-                    for m in filtered_matches:
-                        qi = m.queryIdx
-                        ti = m.trainIdx
-                        if qi < len(kp_i) and ti < len(kp_j):
-                            src_pts.append([kp_i[qi][0], kp_i[qi][1]])
-                            dst_pts.append([kp_j[ti][0], kp_j[ti][1]])
-                    
                     matches.append({
                         'image_i': i,
                         'image_j': j,
@@ -2036,9 +1720,7 @@ class ImageStitcher:
                         'num_matches': len(filtered_matches),
                         'num_inliers': num_inliers,
                         'inlier_ratio': inlier_ratio,
-                        'confidence': match_result.get('confidence', 0.0) * max(inlier_ratio, 0.1),
-                        'src_pts': np.array(src_pts, dtype=np.float32) if src_pts else None,
-                        'dst_pts': np.array(dst_pts, dtype=np.float32) if dst_pts else None
+                        'confidence': match_result.get('confidence', 0.0) * max(inlier_ratio, 0.1)
                     })
             except Exception as e:
                 logger.error(f"Error matching pair ({i}, {j}): {e}")
@@ -2047,29 +1729,6 @@ class ImageStitcher:
         if rejected_count > 0:
             logger.info(f"Geometric verification rejected {rejected_count} bad matches")
         logger.info(f"Found {len(matches)} valid matches from {total_pairs} pairs checked")
-        
-        # For large sets, apply track-based filtering for multi-image consistency
-        # This removes one-off matches that don't form consistent tracks
-        if use_hierarchical and hierarchical_matcher and len(matches) > 0:
-            self._update_progress(58, "Building feature tracks for consistency...")
-            
-            original_count = len(matches)
-            matches = hierarchical_matcher.post_process_matches(matches, features_data)
-            
-            track_stats = hierarchical_matcher.get_track_statistics()
-            logger.info(f"Track filtering: {original_count} → {len(matches)} matches "
-                       f"({track_stats.get('n_tracks', 0)} tracks, "
-                       f"avg length {track_stats.get('avg_track_length', 0):.1f})")
-        
-        # #region agent log
-        try:
-            import json
-            match_stats = {"total": len(matches), "inlier_ratios": [m.get('inlier_ratio', 0) for m in matches[:20]], "confidences": [m.get('confidence', 0) for m in matches[:20]], "hierarchical": use_hierarchical}
-            with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                f.write(json.dumps({"hypothesisId":"A","location":"stitcher.py:_match_features","message":"Matching complete","data":match_stats,"timestamp":__import__('time').time()}) + '\n')
-        except: pass
-        # #endregion
-        
         return matches
     
     def _select_optimal_images(
@@ -2205,390 +1864,90 @@ class ImageStitcher:
         
         return new_images, new_features, new_matches
     
-    def _precompute_image_similarity(self, images_data: List[Dict]) -> None:
-        """
-        Compute image similarity using thumbnails to identify potential neighbors.
-        This helps with unsorted/randomly named images by finding visually similar pairs.
-        
-        Uses color histograms and structural similarity for fast comparison.
-        """
-        n_images = len(images_data)
-        logger.info(f"Computing image similarity matrix for {n_images} images...")
-        
-        # Create thumbnails and compute features for similarity
-        thumb_size = 64
-        thumbnails = []
-        histograms = []
-        
-        for img_data in images_data:
-            img = img_data['image']
-            # Resize to thumbnail
-            h, w = img.shape[:2]
-            scale = thumb_size / max(h, w)
-            thumb = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-            thumbnails.append(thumb)
-            
-            # Compute color histogram (normalized)
-            hist = []
-            for channel in range(3):
-                h_channel = cv2.calcHist([thumb], [channel], None, [16], [0, 256])
-                h_channel = h_channel.flatten() / (h_channel.sum() + 1e-6)
-                hist.extend(h_channel)
-            histograms.append(np.array(hist))
-        
-        # Compute pairwise similarity (only store top-k most similar for each image)
-        k = min(20, n_images - 1)  # Top 20 most similar neighbors
-        self._image_similarity = {}
-        
-        for i in range(n_images):
-            similarities = []
-            for j in range(n_images):
-                if i == j:
-                    continue
-                # Histogram intersection (higher = more similar)
-                sim = np.minimum(histograms[i], histograms[j]).sum()
-                similarities.append((j, sim))
-            
-            # Keep top-k most similar
-            similarities.sort(key=lambda x: -x[1])
-            self._image_similarity[i] = [idx for idx, _ in similarities[:k]]
-        
-        logger.info(f"Image similarity computed: each image has ~{k} potential neighbors")
-    
-    def _match_disconnected_images(
-        self, 
-        features_data: List[Dict], 
-        existing_matches: List[Dict]
-    ) -> List[Dict]:
-        """
-        Try to connect disconnected images by matching them against the main component.
-        """
-        n_images = len(features_data)
-        
-        # Find connected components
-        adj = {i: set() for i in range(n_images)}
-        for match in existing_matches:
-            i = match.get('image_i', -1)
-            j = match.get('image_j', -1)
-            if 0 <= i < n_images and 0 <= j < n_images:
-                adj[i].add(j)
-                adj[j].add(i)
-        
-        visited = set()
-        components = []
-        
-        for start in range(n_images):
-            if start in visited:
-                continue
-            component = []
-            queue = [start]
-            while queue:
-                node = queue.pop(0)
-                if node in visited:
-                    continue
-                visited.add(node)
-                component.append(node)
-                for neighbor in adj[node]:
-                    if neighbor not in visited:
-                        queue.append(neighbor)
-            components.append(component)
-        
-        if len(components) <= 1:
-            return []  # Already connected
-        
-        # Sort components by size (largest first)
-        components.sort(key=len, reverse=True)
-        main_component = set(components[0])
-        disconnected = [img for comp in components[1:] for img in comp]
-        
-        logger.info(f"Found {len(disconnected)} disconnected images in {len(components)-1} components")
-        
-        # Try to match disconnected images to main component
-        additional_matches = []
-        
-        for disc_idx in disconnected:
-            best_match = None
-            best_confidence = 0
-            
-            # Try matching against similar images in main component
-            candidates = []
-            if hasattr(self, '_image_similarity') and disc_idx in self._image_similarity:
-                # Use precomputed similarity
-                for sim_idx in self._image_similarity[disc_idx]:
-                    if sim_idx in main_component:
-                        candidates.append(sim_idx)
-            
-            # Also try random samples from main component
-            if len(candidates) < 10:
-                import random
-                main_list = list(main_component)
-                random.shuffle(main_list)
-                candidates.extend(main_list[:10])
-            
-            candidates = list(set(candidates))[:15]  # Limit to 15 candidates
-            
-            for main_idx in candidates:
-                # Try to match
-                try:
-                    desc1 = features_data[disc_idx]['descriptors']
-                    desc2 = features_data[main_idx]['descriptors']
-                    kp1 = features_data[disc_idx]['keypoints']
-                    kp2 = features_data[main_idx]['keypoints']
-                    
-                    if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
-                        continue
-                    
-                    match_result = self.matcher.match(desc1, desc2)
-                    
-                    if match_result and match_result.get('num_matches', 0) >= 10:
-                        conf = match_result.get('confidence', 0)
-                        if conf > best_confidence:
-                            best_confidence = conf
-                            best_match = (disc_idx, main_idx, match_result)
-                except Exception as e:
-                    logger.debug(f"Match attempt failed: {e}")
-                    continue
-            
-            if best_match:
-                disc_idx, main_idx, match_result = best_match
-                additional_matches.append({
-                    'image_i': min(disc_idx, main_idx),
-                    'image_j': max(disc_idx, main_idx),
-                    'matches': match_result.get('matches', []),
-                    'num_matches': match_result.get('num_matches', 0),
-                    'num_inliers': match_result.get('num_matches', 0),
-                    'inlier_ratio': 0.5,
-                    'confidence': match_result.get('confidence', 0)
-                })
-                main_component.add(disc_idx)
-                logger.debug(f"Connected image {disc_idx} to main component via image {main_idx}")
-        
-        logger.info(f"Recovery matching found {len(additional_matches)} new connections")
-        return additional_matches
-    
-    def _check_graph_connectivity(self, n_images: int, matches: List[Dict]) -> float:
-        """
-        Check what fraction of images are connected in the match graph.
-        Returns connectivity ratio (0.0-1.0).
-        """
-        # Build adjacency list
-        adj = {i: set() for i in range(n_images)}
-        for match in matches:
-            i = match.get('image_i', -1)
-            j = match.get('image_j', -1)
-            if 0 <= i < n_images and 0 <= j < n_images:
-                adj[i].add(j)
-                adj[j].add(i)
-        
-        # Find largest connected component using BFS
-        visited = set()
-        largest_component = 0
-        
-        for start in range(n_images):
-            if start in visited:
-                continue
-            
-            # BFS from this node
-            component_size = 0
-            queue = [start]
-            while queue:
-                node = queue.pop(0)
-                if node in visited:
-                    continue
-                visited.add(node)
-                component_size += 1
-                for neighbor in adj[node]:
-                    if neighbor not in visited:
-                        queue.append(neighbor)
-            
-            largest_component = max(largest_component, component_size)
-        
-        connectivity = largest_component / max(n_images, 1)
-        
-        if connectivity < 1.0:
-            disconnected = n_images - largest_component
-            logger.warning(f"Graph has {disconnected} disconnected images ({connectivity:.1%} connectivity)")
-        
-        return connectivity
-    
-    def _verify_alignment_quality(self, aligned_images: List[Dict]) -> float:
-        """
-        Verify alignment quality by checking for common issues:
-        - Too much overlap (images stacked on top of each other)
-        - Too little overlap (images spread too far apart)
-        - Excessive rotation/scale differences
-        
-        Returns:
-            Quality score 0.0-1.0 (higher is better)
-        """
-        if len(aligned_images) < 2:
-            return 1.0
-        
-        # Collect bounding boxes
-        bboxes = []
-        for img_data in aligned_images:
-            bbox = img_data.get('bbox')
-            if bbox:
-                bboxes.append(bbox)
-            else:
-                h, w = img_data['image'].shape[:2]
-                bboxes.append((0, 0, w, h))
-        
-        if len(bboxes) < 2:
-            return 1.0
-        
-        # Check 1: Are images mostly overlapping? (bad - alignment collapsed)
-        centers = []
-        for bbox in bboxes:
-            cx = (bbox[0] + bbox[2]) / 2
-            cy = (bbox[1] + bbox[3]) / 2
-            centers.append((cx, cy))
-        
-        avg_image_size = np.mean([
-            max(bbox[2] - bbox[0], bbox[3] - bbox[1]) 
-            for bbox in bboxes
-        ])
-        
-        # Calculate spread of centers
-        center_x = [c[0] for c in centers]
-        center_y = [c[1] for c in centers]
-        spread_x = max(center_x) - min(center_x)
-        spread_y = max(center_y) - min(center_y)
-        total_spread = np.sqrt(spread_x**2 + spread_y**2)
-        
-        # Expected spread for n images with ~30% overlap
-        expected_spread = avg_image_size * 0.7 * np.sqrt(len(aligned_images))
-        spread_ratio = total_spread / max(expected_spread, 1)
-        
-        # Too little spread = images collapsed together
-        if spread_ratio < 0.3:
-            logger.warning(f"Alignment may have collapsed: spread={total_spread:.0f}, expected={expected_spread:.0f}")
-            return 0.2
-        
-        # Too much spread = images too far apart
-        if spread_ratio > 3.0:
-            logger.warning(f"Alignment too spread out: spread={total_spread:.0f}, expected={expected_spread:.0f}")
-            return 0.4
-        
-        # Check 2: Are transforms reasonable?
-        scale_issues = 0
-        rotation_issues = 0
-        
-        for img_data in aligned_images:
-            transform = img_data.get('transform')
-            if transform is not None and len(transform) >= 2:
-                scale = np.sqrt(transform[0, 0]**2 + transform[0, 1]**2)
-                rotation = abs(np.arctan2(transform[1, 0], transform[0, 0]))
-                
-                if scale < 0.5 or scale > 2.0:
-                    scale_issues += 1
-                if rotation > np.pi / 4:  # More than 45 degrees
-                    rotation_issues += 1
-        
-        transform_quality = 1.0 - (scale_issues + rotation_issues) / max(len(aligned_images), 1)
-        
-        # Combined quality
-        quality = (min(spread_ratio, 1.0) * 0.7 + transform_quality * 0.3)
-        
-        logger.info(f"Alignment quality: {quality:.2f} (spread_ratio={spread_ratio:.2f}, transform_quality={transform_quality:.2f})")
-        
-        return quality
-    
     def _get_smart_matching_pairs(self, n_images: int, features_data: List[Dict] = None) -> List[Tuple[int, int]]:
         """
-        Generate smart matching pairs for large UNSORTED image sets.
+        Generate smart matching pairs for large image sets.
         
-        Since images are randomly named/ordered, we CANNOT rely on sequential
-        ordering (i, i+1). Instead we use:
-        1. Image similarity (if precomputed) - visually similar images likely overlap
-        2. Random sampling - ensures we don't miss connections
-        3. All pairs for small sets
+        Strategy for panoramas/microscopy (AutoPano Giga-inspired):
+        1. If grid topology detected: use O(n) neighbor-based matching
+        2. Match adjacent images (i, i+1) - these definitely overlap
+        3. Match nearby images (adaptive window) - catch overlaps
+        4. Add grid-based "jump" connections - helps detect row transitions
+        5. Use thumbnail similarity pre-filter when available
         
-        For unsorted images, we need more thorough matching to find the actual neighbors.
+        This reduces O(n²) to O(n*k) where k is the window size + jumps
+        With grid detection, can achieve O(n) for regular grids.
+        
+        Complexity scaling:
+        - 10 images: ~45 pairs (all pairs)
+        - 50 images: ~400 pairs (smart) or ~100 (grid)
+        - 100 images: ~800 pairs (smart) or ~200 (grid)
+        - 500 images: ~4000 pairs (smart) or ~1000 (grid)
         """
+        # Check if we have cached grid info from previous detection
+        if hasattr(self, '_detected_grid_info') and self._detected_grid_info:
+            grid_info = self._detected_grid_info
+            from core.autopano_features import create_matching_pairs_from_grid
+            pairs = create_matching_pairs_from_grid(n_images, grid_info, 'windowed')
+            if pairs:
+                logger.info(f"Using grid topology: {len(pairs)} pairs for {n_images} images")
+                return pairs
+        
         pairs = set()
         
-        # For small sets, just match all pairs - it's fast enough
-        if n_images <= 25:
-            logger.info(f"Small set ({n_images} images): matching all {n_images*(n_images-1)//2} pairs")
-            return [(i, j) for i in range(n_images) for j in range(i + 1, n_images)]
+        # Estimate grid dimensions based on typical scanning patterns
+        # Assume roughly square-ish grid with some extra columns
+        est_cols = int(np.ceil(np.sqrt(n_images * 1.3)))
+        est_rows = int(np.ceil(n_images / est_cols))
         
-        # Strategy 1: Use precomputed image similarity if available
-        if hasattr(self, '_image_similarity') and self._image_similarity:
-            logger.info("Using image similarity for smart matching (unsorted images)")
-            
-            for i in range(n_images):
-                # Match with similar images
-                if i in self._image_similarity:
-                    for j in self._image_similarity[i]:
-                        pairs.add((min(i, j), max(i, j)))
+        # Adaptive window size: smaller for very large sets
+        if n_images <= 30:
+            window = min(8, n_images // 3 + 2)
+        elif n_images <= 100:
+            window = min(6, n_images // 10 + 3)
+        elif n_images <= 500:
+            window = 5
+        else:
+            window = 4  # Very large sets need tight windows
         
-        # Strategy 2: Random sampling to ensure coverage
-        # For each image, try k random other images
-        import random
-        k_random = min(15, n_images // 3)
+        logger.debug(f"Smart matching: n={n_images}, est_grid={est_cols}x{est_rows}, window={window}")
         
         for i in range(n_images):
-            candidates = list(range(n_images))
-            candidates.remove(i)
-            random.shuffle(candidates)
-            for j in candidates[:k_random]:
-                pairs.add((min(i, j), max(i, j)))
-        
-        # Strategy 3: Systematic coverage - ensure we sample across the entire set
-        # Divide into groups and match between groups
-        n_groups = min(10, int(np.sqrt(n_images)))
-        group_size = n_images // n_groups
-        
-        for g1 in range(n_groups):
-            for g2 in range(g1, n_groups):
-                # Sample pairs between groups
-                start1 = g1 * group_size
-                end1 = start1 + group_size if g1 < n_groups - 1 else n_images
-                start2 = g2 * group_size
-                end2 = start2 + group_size if g2 < n_groups - 1 else n_images
-                
-                group1 = list(range(start1, end1))
-                group2 = list(range(start2, end2))
-                
-                # Sample a few pairs from each group combination
-                samples_per_group = 3 if g1 != g2 else 5
-                for _ in range(samples_per_group):
-                    if group1 and group2:
-                        i = random.choice(group1)
-                        j = random.choice(group2)
-                        if i != j:
+            # 1. Match nearby images (sliding window) - sequential neighbors
+            for offset in range(1, window + 1):
+                j = i + offset
+                if j < n_images:
+                    pairs.add((min(i, j), max(i, j)))
+            
+            # 2. Add row transition connections (jump by estimated column count)
+            # These catch connections between rows in a grid scan
+            for jump in [est_cols - 1, est_cols, est_cols + 1]:
+                j = i + jump
+                if 0 <= j < n_images and j != i:
+                    pairs.add((min(i, j), max(i, j)))
+            
+            # 3. For larger sets, add sparse long-range probes
+            # Check every Nth image for possible connections
+            if n_images > 50:
+                probe_step = max(10, n_images // 20)
+                if i % probe_step == 0:
+                    # Probe a few distant images
+                    for jump in [est_cols * 2, n_images // 3, n_images // 2]:
+                        j = i + jump
+                        if 0 <= j < n_images:
                             pairs.add((min(i, j), max(i, j)))
         
-        # Strategy 4: Ensure every image has at least min_connections pairs
-        min_connections = min(8, n_images - 1)
-        connection_count = {i: 0 for i in range(n_images)}
-        for i, j in pairs:
-            connection_count[i] += 1
-            connection_count[j] += 1
-        
-        under_connected = [i for i, c in connection_count.items() if c < min_connections]
-        if under_connected:
-            logger.info(f"Adding pairs for {len(under_connected)} under-connected images")
-            for i in under_connected:
-                candidates = list(range(n_images))
-                candidates.remove(i)
-                random.shuffle(candidates)
-                needed = min_connections - connection_count[i]
-                for j in candidates[:needed]:
+        # 4. Ensure we have at least some coverage of the full range
+        # Add a few strategic pairs at regular intervals
+        step = max(1, n_images // 10)
+        for i in range(0, n_images, step):
+            for offset in [1, 2, est_cols]:
+                j = i + offset
+                if 0 <= j < n_images:
                     pairs.add((min(i, j), max(i, j)))
         
         result = sorted(list(pairs))
-        
-        # Log statistics
-        all_pairs = n_images * (n_images - 1) // 2
-        coverage = len(result) / max(all_pairs, 1) * 100
-        logger.info(f"Smart matching (unsorted): {n_images} images → {len(result)} pairs ({coverage:.1f}% of all pairs)")
-        
-        # Warn if we might need more matching
-        if len(result) < n_images * 3:
-            logger.warning(f"Low pair count ({len(result)}). If alignment fails, consider using all pairs.")
-        
+        logger.info(f"Smart matching: {n_images} images → {len(result)} pairs (vs {n_images*(n_images-1)//2} all pairs)")
         return result
     
     def _align_with_control_points(

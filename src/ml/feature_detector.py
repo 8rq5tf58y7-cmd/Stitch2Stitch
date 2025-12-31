@@ -186,45 +186,6 @@ class LP_SIFTDetector:
         
         return enhanced
     
-    def _compute_edge_priority(self, keypoints: list, image_shape: Tuple[int, int]) -> np.ndarray:
-        """
-        Compute edge-priority weights for keypoints.
-        
-        Features near image edges are more likely to be in overlap regions with adjacent
-        images in a panorama, so they should be prioritized for detection.
-        
-        Args:
-            keypoints: List of cv2.KeyPoint objects
-            image_shape: (height, width) of the image
-            
-        Returns:
-            Array of edge weights (1.0 = at edge, lower = toward center)
-        """
-        h, w = image_shape[:2]
-        if len(keypoints) == 0:
-            return np.array([])
-        
-        weights = []
-        for kp in keypoints:
-            x, y = kp.pt
-            
-            # Normalized distance from each edge (0 = at edge, 0.5 = at center)
-            dist_left = x / w
-            dist_right = 1 - x / w
-            dist_top = y / h
-            dist_bottom = 1 - y / h
-            
-            # Minimum distance to any edge
-            min_dist = min(dist_left, dist_right, dist_top, dist_bottom)
-            
-            # Edge priority: exponential decay from edge
-            # Points within 25% of edge get significant boost
-            edge_weight = np.exp(-min_dist * 4)  # ~0.37 at 25% from edge
-            
-            weights.append(edge_weight)
-        
-        return np.array(weights)
-    
     def _filter_local_peaks(
         self,
         keypoints: list,
@@ -232,80 +193,24 @@ class LP_SIFTDetector:
         image: np.ndarray
     ) -> Tuple[list, np.ndarray]:
         """
-        Filter keypoints to focus on local peaks with edge prioritization.
-        
-        This implements an enhanced LP-SIFT approach that:
-        1. Boosts features near image edges (overlap regions)
-        2. Maintains quality features throughout the image
-        3. Ensures good coverage for panorama stitching
+        Filter keypoints to focus on local peaks
+        This implements the LP-SIFT approach
         """
         if len(keypoints) == 0:
             return keypoints, descriptors
         
-        h, w = image.shape[:2]
-        
-        # Get feature responses
+        # Create response map
         responses = np.array([kp.response for kp in keypoints])
         
-        # Normalize responses to 0-1 range
-        if responses.max() > responses.min():
-            norm_responses = (responses - responses.min()) / (responses.max() - responses.min())
-        else:
-            norm_responses = np.ones_like(responses)
+        # Sort by response
+        sorted_indices = np.argsort(responses)[::-1]
         
-        # Compute edge priority weights
-        edge_weights = self._compute_edge_priority(keypoints, (h, w))
-        
-        # Combined score: 70% response quality + 30% edge priority
-        # This ensures edge features are prioritized but still requires good feature quality
-        combined_scores = 0.7 * norm_responses + 0.3 * edge_weights
-        
-        # Sort by combined score
-        sorted_indices = np.argsort(combined_scores)[::-1]
-        
-        # Keep top N features, but ensure minimum 20% are from edge regions
+        # Keep top N features
         n_keep = min(self.n_features, len(keypoints))
-        
-        # First, identify edge features (within 15% of boundary)
-        edge_threshold = 0.15
-        is_edge_feature = edge_weights > np.exp(-edge_threshold * 4)  # ~0.55 threshold
-        
-        # Count how many edge features we'd get in top N
-        top_indices = sorted_indices[:n_keep]
-        edge_count_in_top = np.sum(is_edge_feature[top_indices])
-        min_edge_features = int(n_keep * 0.2)  # Minimum 20% edge features
-        
-        # If not enough edge features, add more
-        if edge_count_in_top < min_edge_features:
-            # Get edge features not in top N, sorted by response
-            edge_indices = np.where(is_edge_feature)[0]
-            edge_not_in_top = [i for i in edge_indices if i not in top_indices]
-            edge_responses = [(i, responses[i]) for i in edge_not_in_top]
-            edge_responses.sort(key=lambda x: -x[1])
-            
-            # Add best edge features
-            n_to_add = min_edge_features - edge_count_in_top
-            additional_edge = [i for i, _ in edge_responses[:n_to_add]]
-            
-            # Replace lowest-scored non-edge features
-            non_edge_in_top = [i for i in top_indices if not is_edge_feature[i]]
-            non_edge_in_top.sort(key=lambda i: combined_scores[i])
-            
-            keep_indices = list(top_indices)
-            for add_idx in additional_edge:
-                if non_edge_in_top:
-                    remove_idx = non_edge_in_top.pop(0)
-                    keep_indices.remove(remove_idx)
-                    keep_indices.append(add_idx)
-        else:
-            keep_indices = list(top_indices)
+        keep_indices = sorted_indices[:n_keep]
         
         filtered_kp = [keypoints[i] for i in keep_indices]
         filtered_desc = descriptors[keep_indices]
-        
-        # Log edge feature statistics
-        final_edge_count = sum(1 for i in keep_indices if is_edge_feature[i])
-        logger.debug(f"Features: {len(filtered_kp)} total, {final_edge_count} ({100*final_edge_count/len(filtered_kp):.0f}%) near edges")
         
         return filtered_kp, filtered_desc
 

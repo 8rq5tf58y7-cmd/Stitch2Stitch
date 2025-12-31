@@ -140,27 +140,12 @@ class AdvancedMatcher:
             }
         
         if len(descriptors1) < 4 or len(descriptors2) < 4:
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"H2","location":"matcher.py:match","message":"Too few descriptors","data":{"len1":len(descriptors1),"len2":len(descriptors2)},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
             return {
                 'matches': [],
                 'num_matches': 0,
                 'confidence': 0.0,
                 'homography': None
             }
-        
-        # #region agent log
-        try:
-            import json
-            with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                f.write(json.dumps({"hypothesisId":"H2","location":"matcher.py:match","message":"Starting match","data":{"desc1_shape":list(descriptors1.shape),"desc2_shape":list(descriptors2.shape),"dtype":str(descriptors1.dtype)},"timestamp":__import__('time').time()}) + '\n')
-        except: pass
-        # #endregion
         
         # Check if descriptors include color info (SIFT=128, SIFT+color=176)
         has_color = descriptors1.shape[1] > 128
@@ -200,14 +185,6 @@ class AdvancedMatcher:
                     m, n = match_pair
                     if m.distance < self.ratio_threshold * n.distance:
                         good_matches.append(m)
-            
-            # #region agent log
-            try:
-                import json
-                with open(r'c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"H2","location":"matcher.py:match","message":"After ratio test","data":{"raw_matches":len(matches),"good_matches":len(good_matches),"ratio_threshold":self.ratio_threshold},"timestamp":__import__('time').time()}) + '\n')
-            except: pass
-            # #endregion
             
             # Apply color verification if enabled and color info available
             if self.use_color_verification and has_color and len(good_matches) > 0:

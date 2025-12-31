@@ -288,14 +288,13 @@ class GenerativeBlender:
         output_h = y_max - y_min
         output_w = x_max - x_min
         
-        # Scale to target size (500MP default)
-        max_pixels = 500_000_000
-        total_pixels = output_h * output_w
-        if total_pixels > max_pixels:
-            scale = np.sqrt(max_pixels / total_pixels)
+        # Limit size
+        max_pixels = 100_000_000
+        scale = 1.0
+        if output_h * output_w > max_pixels:
+            scale = np.sqrt(max_pixels / (output_h * output_w))
             output_h = int(output_h * scale)
             output_w = int(output_w * scale)
-        logger.info(f"Scaling to target: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
         
         # Create output
         panorama = np.zeros((output_h, output_w, 3), dtype=np.float32)
@@ -322,8 +321,8 @@ class GenerativeBlender:
             y_off = int((bbox_img[1] - y_min) * scale)
             
             if scale != 1.0:
-                scaled_w = max(1, int(w * scale))
-                scaled_h = max(1, int(h * scale))
+                scaled_w = int(w * scale)
+                scaled_h = int(h * scale)
                 if scaled_w > 0 and scaled_h > 0:
                     img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
                     alpha = cv2.resize(alpha, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)

@@ -24,12 +24,6 @@ tqdm>=4.65.0
 pyyaml>=6.0
 tifffile>=2023.4.0  # For large TIFF support
 psutil>=5.9.0  # For memory management
-imagehash>=4.3.0  # Perceptual image hashing for duplicate detection
-
-# External pipelines
-# For CPU: pip install pycolmap
-# For GPU (Linux only): pip install pycolmap-cuda12
-pycolmap>=0.4.0  # Python bindings for COLMAP SfM/MVS (CPU version, GPU handled by install scripts)
 
 # Optional GPU acceleration
 # Uncomment if you have CUDA installed

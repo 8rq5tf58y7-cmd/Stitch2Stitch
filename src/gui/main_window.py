@@ -148,10 +148,7 @@ class COLMAPThread(QThread):
                  blend_method: str = "multiband", matching_strategy: str = "exhaustive",
                  sequential_overlap: int = 10, gpu_indices: List[str] = None,
                  num_threads: int = -1, max_features: int = 8192,
-                 min_inliers: int = 0, max_images: int = 0, use_source_alpha: bool = False,
-                 remove_duplicates: bool = False, duplicate_threshold: float = 0.92,
-                 warp_interpolation: str = 'lanczos',
-                 erode_border: bool = True, border_erosion_pixels: int = 5):
+                 min_inliers: int = 0, max_images: int = 0, use_source_alpha: bool = False):
         super().__init__()
         self.image_paths = image_paths
         self.output_dir = output_dir
@@ -165,11 +162,6 @@ class COLMAPThread(QThread):
         self.min_inliers = min_inliers
         self.max_images = max_images
         self.use_source_alpha = use_source_alpha
-        self.remove_duplicates = remove_duplicates
-        self.duplicate_threshold = duplicate_threshold
-        self.warp_interpolation = warp_interpolation
-        self.erode_border = erode_border
-        self.border_erosion_pixels = border_erosion_pixels
         self._cancelled = False
     
     def cancel(self):
@@ -181,12 +173,10 @@ class COLMAPThread(QThread):
             from external.pipelines import COLMAPPipeline
             
             # Progress callback that emits signals
-            # percentage=-1 means "status only, no progress change"
             def progress_callback(percentage: int, message: str = ""):
                 if self._cancelled:
                     raise InterruptedError("Operation cancelled")
-                if percentage >= 0:
-                    self.progress.emit(percentage)
+                self.progress.emit(percentage)
                 if message:
                     self.status.emit(message)
             
@@ -217,11 +207,6 @@ class COLMAPThread(QThread):
                 min_inliers=self.min_inliers,
                 max_images=self.max_images,
                 use_source_alpha=self.use_source_alpha,
-                remove_duplicates=self.remove_duplicates,
-                duplicate_threshold=self.duplicate_threshold,
-                warp_interpolation=self.warp_interpolation,
-                erode_border=self.erode_border,
-                border_erosion_pixels=self.border_erosion_pixels,
                 progress_callback=progress_callback
             )
             
@@ -233,6 +218,13 @@ class COLMAPThread(QThread):
             self.status.emit("Operation cancelled")
             self.progress.emit(0)
         except Exception as e:
+            import traceback
+            # #region agent log - Capture full exception
+            debug_log_path = r"c:\Users\ryanf\OneDrive - University of Maryland\Desktop\Stitch2Stitch\Stitch2Stitch-1\.cursor\debug.log"
+            import json, time
+            full_traceback = traceback.format_exc()
+            with open(debug_log_path, 'a') as f: f.write(json.dumps({"hypothesisId":"THREAD_ERR","location":"main_window.py:COLMAPThread","message":"COLMAP thread exception","data":{"error":str(e),"error_type":type(e).__name__,"traceback":full_traceback},"timestamp":time.time()}) + '\n')
+            # #endregion
             logger.error(f"COLMAP error: {e}", exc_info=True)
             self.error.emit(str(e))
 
@@ -855,14 +847,14 @@ class MainWindow(QMainWindow):
         self.ai_color_checkbox.setChecked(True)
         self.ai_color_checkbox.setVisible(False)
         
-        # External Pipelines - Primary stitching workflows
-        external_group = QGroupBox("🚀 Stitching Pipelines")
+        # External Pipeline Integration (for 500+ images)
+        external_group = QGroupBox("🚀 External Pipelines (Recommended for 500+ images)")
         external_layout = QVBoxLayout()
         external_layout.setSpacing(8)
-
+        
         external_info = QLabel(
-            "GPU-accelerated stitching pipelines.\n"
-            "Click 'Install' to set up, then 'Run' to stitch your images."
+            "These battle-tested tools handle large image sets much better than\n"
+            "built-in methods. Click 'Install' to set up, then 'Run' to use."
         )
         external_info.setStyleSheet("color: #555; font-size: 11px; padding: 4px;")
         external_info.setWordWrap(True)
@@ -924,7 +916,7 @@ class MainWindow(QMainWindow):
         self.colmap_blend_combo.setToolTip(
             "Multiband: Best quality, Laplacian pyramid blending\n"
             "Feather: Smooth feathering, faster\n"
-            "AutoStitch: Puzzle-like selection with seam feathering\n"
+            "AutoStitch: Puzzle-like selection, crisp seams\n"
             "Linear: Simple averaging, fastest"
         )
         blend_layout.addWidget(self.colmap_blend_combo)
@@ -1039,20 +1031,10 @@ class MainWindow(QMainWindow):
         params_group.addWidget(QLabel("Max Features:"))
         self.colmap_features_spin = QSpinBox()
         self.colmap_features_spin.setMinimum(512)
-        self.colmap_features_spin.setMaximum(65536)  # Increased for better alignment
+        self.colmap_features_spin.setMaximum(32768)
         self.colmap_features_spin.setValue(8192)
-        self.colmap_features_spin.setSingleStep(1024)
-        self.colmap_features_spin.setToolTip(
-            "Maximum SIFT features per image:\n\n"
-            "Recommended by image count:\n"
-            "• 2-50 images: 8192-16384 features\n"
-            "• 50-200 images: 4096-8192 features\n"
-            "• 200-500 images: 2048-4096 features\n"
-            "• 500-1000 images: 1024-2048 features\n"
-            "• 1000+ images: 512-1024 features\n\n"
-            "Higher counts = better alignment but slower.\n"
-            "Use Quality Preset dropdown for auto-adjustment."
-        )
+        self.colmap_features_spin.setSingleStep(512)
+        self.colmap_features_spin.setToolTip("Maximum SIFT features per image\n8192 = default quality\n2048 = faster with good quality")
         params_group.addWidget(self.colmap_features_spin)
 
         perf_layout.addLayout(params_group)
@@ -1114,320 +1096,78 @@ class MainWindow(QMainWindow):
         alpha_layout.addStretch()
         external_layout.addLayout(alpha_layout)
 
-        # Border erosion for circular images
-        border_layout = QHBoxLayout()
-        self.colmap_erode_border = QCheckBox("Remove black borders")
-        self.colmap_erode_border.setChecked(True)  # On by default when using alpha
-        self.colmap_erode_border.setToolTip(
-            "Erode alpha mask to remove thin black borders from circular images\n\n"
-            "When CHECKED:\n"
-            "  - Shrinks the alpha mask inward by the specified pixels\n"
-            "  - Removes dark edge artifacts from circular scans\n"
-            "  - Only applies when 'Use source alpha' is enabled\n\n"
-            "When UNCHECKED:\n"
-            "  - Uses original alpha mask without modification"
-        )
-        border_layout.addWidget(self.colmap_erode_border)
-
-        border_layout.addWidget(QLabel("Erosion:"))
-        self.colmap_border_erosion_spin = QSpinBox()
-        self.colmap_border_erosion_spin.setRange(1, 20)
-        self.colmap_border_erosion_spin.setValue(5)
-        self.colmap_border_erosion_spin.setSuffix(" px")
-        self.colmap_border_erosion_spin.setFixedWidth(70)
-        self.colmap_border_erosion_spin.setToolTip(
-            "Number of pixels to erode from the alpha mask edge\n\n"
-            "• 1-3 px: Light erosion (thin borders)\n"
-            "• 4-6 px: Medium erosion (typical borders)\n"
-            "• 7-10 px: Heavy erosion (thick borders)\n"
-            "• 10+ px: Aggressive (use if borders still visible)\n\n"
-            "Adjust based on your image resolution and border thickness"
-        )
-        border_layout.addWidget(self.colmap_border_erosion_spin)
-        border_layout.addStretch()
-        external_layout.addLayout(border_layout)
-
-        # Duplicate removal option
-        dedup_layout = QHBoxLayout()
-        self.colmap_remove_duplicates = QCheckBox("Remove duplicates before processing")
-        self.colmap_remove_duplicates.setChecked(False)
-        self.colmap_remove_duplicates.setToolTip(
-            "Scan for and remove duplicate/near-identical images before COLMAP processing\n\n"
-            "When CHECKED:\n"
-            "  - Uses perceptual hashing and NCC to detect duplicates\n"
-            "  - Removes redundant images to speed up processing\n"
-            "  - Good for burst photos or datasets with duplicates\n\n"
-            "When UNCHECKED (default):\n"
-            "  - All images are processed\n"
-            "  - Best for curated panorama image sets"
-        )
-        dedup_layout.addWidget(self.colmap_remove_duplicates)
-
-        # Threshold slider
-        dedup_layout.addWidget(QLabel("Threshold:"))
-        self.colmap_duplicate_threshold = QSlider(Qt.Orientation.Horizontal)
-        self.colmap_duplicate_threshold.setMinimum(60)
-        self.colmap_duplicate_threshold.setMaximum(98)
-        self.colmap_duplicate_threshold.setValue(92)
-        self.colmap_duplicate_threshold.setFixedWidth(100)
-        self.colmap_duplicate_threshold.setToolTip(
-            "Similarity threshold for duplicate detection (60-98%)\n\n"
-            "Higher = stricter (only near-identical images)\n"
-            "Lower = more aggressive (similar images removed)\n\n"
-            "Recommended: 92% strict, 85% moderate, 75% aggressive\n"
-            "Warning: Below 70% may remove panorama overlap images"
-        )
-        self.colmap_duplicate_threshold_label = QLabel("92%")
-        self.colmap_duplicate_threshold.valueChanged.connect(
-            lambda v: self.colmap_duplicate_threshold_label.setText(f"{v}%")
-        )
-        dedup_layout.addWidget(self.colmap_duplicate_threshold)
-        dedup_layout.addWidget(self.colmap_duplicate_threshold_label)
-        dedup_layout.addStretch()
-        external_layout.addLayout(dedup_layout)
-
-        # --- Warp Interpolation Row ---
-        interp_layout = QHBoxLayout()
-        interp_layout.setSpacing(6)
-
-        interp_layout.addWidget(QLabel("Warp Interpolation:"))
-        self.colmap_warp_interpolation = QComboBox()
-        self.colmap_warp_interpolation.addItems(['Linear', 'Cubic', 'Lanczos', 'RealESRGAN'])
-        self.colmap_warp_interpolation.setCurrentIndex(2)  # Lanczos default
-        self.colmap_warp_interpolation.setFixedWidth(120)
-        self.colmap_warp_interpolation.setToolTip(
-            "Interpolation method for warping images during stitching:\n\n"
-            "Linear (Fast):\n"
-            "  - Bilinear interpolation\n"
-            "  - Fastest but may appear slightly soft\n"
-            "  - Good for quick previews\n\n"
-            "Cubic (Balanced):\n"
-            "  - Bicubic interpolation\n"
-            "  - Good balance of speed and quality\n"
-            "  - Sharper than linear\n\n"
-            "Lanczos (Recommended):\n"
-            "  - Highest quality traditional interpolation\n"
-            "  - Best for preserving fine details\n"
-            "  - Minimal blur, sharp results\n\n"
-            "RealESRGAN (AI Enhanced):\n"
-            "  - AI super-resolution enhancement\n"
-            "  - Best quality for microscopy/scientific images\n"
-            "  - Slower but preserves maximum detail\n"
-            "  - Requires realesrgan-ncnn-vulkan installed"
-        )
-        interp_layout.addWidget(self.colmap_warp_interpolation)
-        interp_layout.addStretch()
-        external_layout.addLayout(interp_layout)
-
         # --- HLOC Row ---
         hloc_row = QHBoxLayout()
         hloc_row.setSpacing(6)
-
+        
         self.hloc_status = QLabel("⬜")
         self.hloc_status.setFixedWidth(20)
         hloc_row.addWidget(self.hloc_status)
-
-        hloc_info = QLabel("<b>HLOC</b> - SuperPoint + SuperGlue (best for repetitive scenes)")
+        
+        hloc_info = QLabel("<b>HLOC</b> - SuperPoint + SuperGlue + NetVLAD (best for repetitive scenes)")
         hloc_info.setStyleSheet("font-size: 11px;")
         hloc_row.addWidget(hloc_info, 1)
-
+        
         self.hloc_install_btn = QPushButton("Install")
         self.hloc_install_btn.setFixedWidth(60)
         self.hloc_install_btn.setToolTip("Install HLOC via pip (requires PyTorch)")
         self.hloc_install_btn.clicked.connect(self._install_hloc)
         hloc_row.addWidget(self.hloc_install_btn)
-
+        
         self.hloc_btn = QPushButton("Run")
         self.hloc_btn.setFixedWidth(50)
         self.hloc_btn.setToolTip("Run HLOC pipeline on loaded images")
         self.hloc_btn.clicked.connect(self._run_hloc)
         hloc_row.addWidget(self.hloc_btn)
-
+        
         external_layout.addLayout(hloc_row)
-
-        # --- Meshroom Row (Hidden - 3D scanning, not 2D stitching) ---
+        
+        # --- Meshroom Row ---
+        meshroom_row = QHBoxLayout()
+        meshroom_row.setSpacing(6)
+        
         self.meshroom_status = QLabel("⬜")
+        self.meshroom_status.setFixedWidth(20)
+        meshroom_row.addWidget(self.meshroom_status)
+        
+        meshroom_info = QLabel("<b>Meshroom</b> - AliceVision photogrammetry (3D scanning)")
+        meshroom_info.setStyleSheet("font-size: 11px;")
+        meshroom_row.addWidget(meshroom_info, 1)
+        
         self.meshroom_install_btn = QPushButton("Install")
+        self.meshroom_install_btn.setFixedWidth(60)
+        self.meshroom_install_btn.setToolTip("Download Meshroom (includes AliceVision)")
         self.meshroom_install_btn.clicked.connect(self._install_meshroom)
+        meshroom_row.addWidget(self.meshroom_install_btn)
+        
         self.meshroom_btn = QPushButton("Run")
+        self.meshroom_btn.setFixedWidth(50)
+        self.meshroom_btn.setToolTip("Run Meshroom pipeline on loaded images")
         self.meshroom_btn.clicked.connect(self._run_meshroom)
-
-        # Install All button (Hidden)
+        meshroom_row.addWidget(self.meshroom_btn)
+        
+        external_layout.addLayout(meshroom_row)
+        
+        # Install All button
+        install_all_layout = QHBoxLayout()
+        install_all_layout.addStretch()
         self.install_all_btn = QPushButton("📦 Install All Dependencies")
+        self.install_all_btn.setToolTip(
+            "Attempt to install all external pipeline dependencies:\n"
+            "• HLOC (pip install hloc)\n"
+            "• Opens download pages for COLMAP and Meshroom"
+        )
         self.install_all_btn.clicked.connect(self._install_all_pipelines)
+        install_all_layout.addWidget(self.install_all_btn)
+        install_all_layout.addStretch()
+        external_layout.addLayout(install_all_layout)
         
         # Check availability and update button states
         self._update_external_pipeline_availability()
-
+        
         external_group.setLayout(external_layout)
-        # Store as instance variable - will be added to main layout separately
-        self.external_group = external_group
-
-        # ============================================================
-        # OUTPUT POST-PROCESSING PANEL (visible, applies to COLMAP output)
-        # ============================================================
-        postproc_output_group = QGroupBox("🎨 Output Post-Processing")
-        postproc_output_layout = QVBoxLayout()
-        postproc_output_layout.setSpacing(6)
-
-        # Auto-apply toggle
-        auto_row = QHBoxLayout()
-        self.auto_postproc_checkbox = QCheckBox("Auto-apply after stitching")
-        self.auto_postproc_checkbox.setChecked(False)
-        self.auto_postproc_checkbox.setToolTip(
-            "Automatically apply post-processing after COLMAP completes.\n"
-            "If unchecked, use 'Apply Post-Processing' button manually."
-        )
-        auto_row.addWidget(self.auto_postproc_checkbox)
-        auto_row.addStretch()
-        postproc_output_layout.addLayout(auto_row)
-
-        # Row 1: Basic corrections
-        basic_row = QHBoxLayout()
-
-        self.pp_sharpen_checkbox = QCheckBox("Sharpen")
-        self.pp_sharpen_checkbox.setToolTip("Enhance details with unsharp mask")
-        basic_row.addWidget(self.pp_sharpen_checkbox)
-
-        self.pp_sharpen_spin = QDoubleSpinBox()
-        self.pp_sharpen_spin.setRange(0.1, 3.0)
-        self.pp_sharpen_spin.setValue(1.0)
-        self.pp_sharpen_spin.setSingleStep(0.1)
-        self.pp_sharpen_spin.setFixedWidth(55)
-        self.pp_sharpen_spin.setToolTip("Sharpening strength (0.5=subtle, 1.0=normal, 2.0=strong)")
-        basic_row.addWidget(self.pp_sharpen_spin)
-
-        self.pp_denoise_checkbox = QCheckBox("Denoise")
-        self.pp_denoise_checkbox.setToolTip("Remove noise with non-local means")
-        basic_row.addWidget(self.pp_denoise_checkbox)
-
-        self.pp_denoise_spin = QSpinBox()
-        self.pp_denoise_spin.setRange(1, 20)
-        self.pp_denoise_spin.setValue(5)
-        self.pp_denoise_spin.setFixedWidth(45)
-        self.pp_denoise_spin.setToolTip("Denoise strength (3-5=subtle, 10+=aggressive)")
-        basic_row.addWidget(self.pp_denoise_spin)
-
-        basic_row.addStretch()
-        postproc_output_layout.addLayout(basic_row)
-
-        # Row 2: Contrast and color
-        contrast_row = QHBoxLayout()
-
-        self.pp_clahe_checkbox = QCheckBox("Contrast (CLAHE)")
-        self.pp_clahe_checkbox.setToolTip("Adaptive histogram equalization for local contrast")
-        contrast_row.addWidget(self.pp_clahe_checkbox)
-
-        self.pp_clahe_spin = QDoubleSpinBox()
-        self.pp_clahe_spin.setRange(1.0, 5.0)
-        self.pp_clahe_spin.setValue(2.0)
-        self.pp_clahe_spin.setSingleStep(0.5)
-        self.pp_clahe_spin.setFixedWidth(55)
-        self.pp_clahe_spin.setToolTip("CLAHE clip limit (1.0=subtle, 2.0=normal, 4.0=strong)")
-        contrast_row.addWidget(self.pp_clahe_spin)
-
-        self.pp_shadow_checkbox = QCheckBox("Fix Exposure")
-        self.pp_shadow_checkbox.setToolTip("Equalize exposure across the panorama")
-        contrast_row.addWidget(self.pp_shadow_checkbox)
-
-        self.pp_shadow_spin = QDoubleSpinBox()
-        self.pp_shadow_spin.setRange(0.1, 1.0)
-        self.pp_shadow_spin.setValue(0.5)
-        self.pp_shadow_spin.setSingleStep(0.1)
-        self.pp_shadow_spin.setFixedWidth(55)
-        self.pp_shadow_spin.setToolTip("Exposure fix strength (0.3=subtle, 0.5=moderate, 0.8=strong)")
-        contrast_row.addWidget(self.pp_shadow_spin)
-
-        contrast_row.addStretch()
-        postproc_output_layout.addLayout(contrast_row)
-
-        # Row 3: Advanced corrections
-        advanced_row = QHBoxLayout()
-
-        self.pp_deblur_checkbox = QCheckBox("Deblur")
-        self.pp_deblur_checkbox.setToolTip("Wiener deconvolution to reduce blur")
-        advanced_row.addWidget(self.pp_deblur_checkbox)
-
-        self.pp_deblur_spin = QDoubleSpinBox()
-        self.pp_deblur_spin.setRange(0.5, 5.0)
-        self.pp_deblur_spin.setValue(1.5)
-        self.pp_deblur_spin.setSingleStep(0.5)
-        self.pp_deblur_spin.setFixedWidth(55)
-        self.pp_deblur_spin.setToolTip("Estimated blur radius")
-        advanced_row.addWidget(self.pp_deblur_spin)
-
-        self.pp_white_balance_checkbox = QCheckBox("White Balance")
-        self.pp_white_balance_checkbox.setToolTip("Auto white balance correction")
-        advanced_row.addWidget(self.pp_white_balance_checkbox)
-
-        self.pp_vignette_checkbox = QCheckBox("Remove Vignette")
-        self.pp_vignette_checkbox.setToolTip("Remove lens vignetting (dark corners)")
-        advanced_row.addWidget(self.pp_vignette_checkbox)
-
-        advanced_row.addStretch()
-        postproc_output_layout.addLayout(advanced_row)
-
-        # Row 4: AI enhancements and upscale
-        ai_row = QHBoxLayout()
-
-        self.pp_ai_color_checkbox = QCheckBox("AI Color")
-        self.pp_ai_color_checkbox.setToolTip("AI-powered automatic color correction")
-        ai_row.addWidget(self.pp_ai_color_checkbox)
-
-        self.pp_ai_denoise_checkbox = QCheckBox("AI Denoise")
-        self.pp_ai_denoise_checkbox.setToolTip("AI-powered noise reduction")
-        ai_row.addWidget(self.pp_ai_denoise_checkbox)
-
-        self.pp_super_res_checkbox = QCheckBox("Super Res (AI)")
-        self.pp_super_res_checkbox.setToolTip(
-            "Real-ESRGAN AI super-resolution (2x or 4x)\n\n"
-            "• Much better quality than Lanczos upscaling\n"
-            "• Requires: pip install realesrgan\n"
-            "• GPU recommended (slow on CPU)\n"
-            "• Auto-downloads model on first use (~64MB)"
-        )
-        ai_row.addWidget(self.pp_super_res_checkbox)
-
-        self.pp_super_res_scale_combo = QComboBox()
-        self.pp_super_res_scale_combo.addItems(["2x", "4x"])
-        self.pp_super_res_scale_combo.setToolTip("Super-resolution scale factor")
-        self.pp_super_res_scale_combo.setFixedWidth(50)
-        ai_row.addWidget(self.pp_super_res_scale_combo)
-
-        ai_row.addWidget(QLabel("Lanczos:"))
-        self.pp_upscale_combo = QComboBox()
-        self.pp_upscale_combo.addItems(["1x", "1.5x", "2x", "3x", "4x"])
-        self.pp_upscale_combo.setToolTip(
-            "Traditional Lanczos upscaling (fast)\n"
-            "Use INSTEAD of AI Super Res for speed"
-        )
-        self.pp_upscale_combo.setFixedWidth(55)
-        ai_row.addWidget(self.pp_upscale_combo)
-
-        ai_row.addStretch()
-        postproc_output_layout.addLayout(ai_row)
-
-        # Row 5: Action buttons
-        button_row = QHBoxLayout()
-
-        self.apply_postproc_btn = QPushButton("Apply Post-Processing")
-        self.apply_postproc_btn.setToolTip("Apply post-processing to current result")
-        self.apply_postproc_btn.clicked.connect(self._apply_postprocessing)
-        self.apply_postproc_btn.setEnabled(False)  # Enabled when result exists
-        button_row.addWidget(self.apply_postproc_btn)
-
-        self.reset_postproc_btn = QPushButton("Reset to Original")
-        self.reset_postproc_btn.setToolTip("Revert to original panorama (before post-processing)")
-        self.reset_postproc_btn.clicked.connect(self._reset_postprocessing)
-        self.reset_postproc_btn.setEnabled(False)
-        button_row.addWidget(self.reset_postproc_btn)
-
-        button_row.addStretch()
-        postproc_output_layout.addLayout(button_row)
-
-        postproc_output_group.setLayout(postproc_output_layout)
-        self.postproc_output_group = postproc_output_group
-
+        settings_layout.addWidget(external_group)
+        
         # Feature matcher
         matcher_layout = QHBoxLayout()
         matcher_layout.addWidget(QLabel("Feature Matcher:"))
@@ -1796,14 +1536,6 @@ class MainWindow(QMainWindow):
         # Note: upscale not in live preview (too slow for large images)
         
         settings_group.setLayout(settings_layout)
-
-        # Add external pipelines group BEFORE settings (it was moved out of settings_group)
-        layout.addWidget(self.external_group)
-
-        # Add post-processing group after external pipelines
-        layout.addWidget(self.postproc_output_group)
-
-        # Legacy settings group (hidden by default - see end of function)
         layout.addWidget(settings_group)
         
         # Processing
@@ -1834,26 +1566,9 @@ class MainWindow(QMainWindow):
         
         process_group.setLayout(process_layout)
         layout.addWidget(process_group)
-
+        
         layout.addStretch()
-
-        # ============================================================
-        # HIDE LEGACY/NON-PIPELINE FEATURES
-        # The COLMAP pipeline is now the primary workflow.
-        # Legacy internal stitching features are hidden but preserved
-        # for backward compatibility with existing code.
-        # ============================================================
-
-        # Hide legacy settings (kept visible: Image Selection, External Pipelines, Processing)
-        settings_group.setVisible(False)  # Quality, GPU, Feature Detector, etc.
-
-        # Hide legacy processing buttons (keep Stop button visible via process_group)
-        self.btn_grid.setVisible(False)  # Grid Alignment button
-        self.btn_stitch.setVisible(False)  # Legacy Stitch button
-
-        # Rename process group to be clearer
-        process_group.setTitle("Controls")
-
+        
         # Set panel as scroll area content
         scroll_area.setWidget(panel)
         return scroll_area
@@ -1969,8 +1684,7 @@ class MainWindow(QMainWindow):
         
         self.output_path: Optional[Path] = None
         self.current_result = None
-        self.original_result = None  # Store original for post-processing reset
-
+        
         return panel
     
     def init_stitcher(self):
@@ -2166,7 +1880,7 @@ class MainWindow(QMainWindow):
                 added_count += 1
         
         self.log(f"Added {added_count} image(s) from folder. Total: {len(self.image_paths)}")
-
+        
         if added_count < len(image_files):
             QMessageBox.information(
                 self,
@@ -2181,7 +1895,7 @@ class MainWindow(QMainWindow):
             self.image_paths.pop(current)
             self.image_list.takeItem(current)
             self.log("Removed image from list")
-
+    
     def clear_images(self):
         """Clear all images"""
         self.image_paths.clear()
@@ -2397,16 +2111,11 @@ class MainWindow(QMainWindow):
                 raise ValueError(f"Invalid panorama shape: {panorama.shape}")
             
             self.current_result = panorama
-            self.original_result = panorama.copy()  # Store for post-processing reset
             self.update_preview(panorama)
-
-            # Enable post-processing buttons
-            self.apply_postproc_btn.setEnabled(True)
-            self.reset_postproc_btn.setEnabled(True)
-
+            
             self.reset_ui_after_processing()
             self.btn_save.setEnabled(True)
-
+            
             QMessageBox.information(self, "Success", "Stitching completed successfully!")
         except Exception as e:
             logger.error(f"Error handling stitching completion: {e}", exc_info=True)
@@ -3237,17 +2946,6 @@ class MainWindow(QMainWindow):
             # Get alpha handling option
             use_source_alpha = self.colmap_use_source_alpha.isChecked()
 
-            # Get duplicate removal settings
-            remove_duplicates = self.colmap_remove_duplicates.isChecked()
-            duplicate_threshold = self.colmap_duplicate_threshold.value() / 100.0
-
-            # Get warp interpolation setting
-            warp_interpolation = self.colmap_warp_interpolation.currentText().lower()
-
-            # Get border erosion settings
-            erode_border = self.colmap_erode_border.isChecked()
-            border_erosion_pixels = self.colmap_border_erosion_spin.value()
-
             self.log("Starting COLMAP 2D stitching pipeline...")
             self.log(f"Processing {len(self.image_paths)} images...")
             self.log(f"Transform: {transform_type}")
@@ -3261,11 +2959,6 @@ class MainWindow(QMainWindow):
                 self.log(f"Filtering: Max images={max_images}")
             if use_source_alpha:
                 self.log("Alpha: Using source image alpha (transparent backgrounds)")
-                if erode_border:
-                    self.log(f"Border erosion: {border_erosion_pixels}px")
-            if remove_duplicates:
-                self.log(f"Duplicate removal: Enabled (threshold={duplicate_threshold:.0%})")
-            self.log(f"Warp interpolation: {warp_interpolation.capitalize()}")
             self.progress_bar.setValue(0)
 
             # Run in background thread to keep GUI responsive
@@ -3281,12 +2974,7 @@ class MainWindow(QMainWindow):
                 max_features=max_features,
                 min_inliers=min_inliers,
                 max_images=max_images,
-                use_source_alpha=use_source_alpha,
-                remove_duplicates=remove_duplicates,
-                duplicate_threshold=duplicate_threshold,
-                warp_interpolation=warp_interpolation,
-                erode_border=erode_border,
-                border_erosion_pixels=border_erosion_pixels
+                use_source_alpha=use_source_alpha
             )
             self.colmap_thread.progress.connect(self._on_colmap_progress)
             self.colmap_thread.status.connect(self._on_colmap_status)
@@ -3316,43 +3004,23 @@ class MainWindow(QMainWindow):
         # Re-enable buttons
         self.colmap_btn.setEnabled(True)
         self.btn_stitch.setEnabled(True)
-
+        
         if result.get("success"):
             panorama = result.get("panorama")
             output_path = result.get("output_path", "")
             size = result.get("size", (0, 0))
             gpu_used = result.get("gpu_used", False)
-            n_images = result.get("n_images", 0)
-            n_images_original = result.get("n_images_original", 0)
-            n_duplicates_removed = result.get("n_duplicates_removed", 0)
-
+            
             mode = "GPU" if gpu_used else "CPU"
             self.log(f"COLMAP panorama complete ({mode})! Size: {size[1]}x{size[0]} pixels")
-
-            # Report image filtering stats
-            if n_duplicates_removed > 0:
-                filter_msg = f"Processed {n_images}/{n_images_original} images ({n_duplicates_removed} duplicates removed)"
-                self.log(filter_msg)
-
             self.log(f"Saved to: {output_path}")
-
+            
             # Store result for display/saving
             if panorama is not None:
                 self.current_result = panorama
-                self.original_result = panorama.copy()  # Store original for reset
                 self.output_path = Path(output_path)
-
-                # Enable post-processing buttons
-                self.apply_postproc_btn.setEnabled(True)
-                self.reset_postproc_btn.setEnabled(True)
-
-                # Auto-apply post-processing if enabled
-                if self.auto_postproc_checkbox.isChecked() and self._should_apply_postproc():
-                    self.log("Auto-applying post-processing...")
-                    self._apply_postprocessing()
-                else:
-                    self.update_preview(panorama)
-
+                self.update_preview(panorama)
+            
             QMessageBox.information(
                 self, "COLMAP Panorama Complete",
                 f"Panorama created successfully!\n\n"
@@ -3371,240 +3039,10 @@ class MainWindow(QMainWindow):
         # Re-enable buttons
         self.colmap_btn.setEnabled(True)
         self.btn_stitch.setEnabled(True)
-
+        
         self.log(f"COLMAP error: {error_msg}")
         QMessageBox.critical(self, "COLMAP Error", error_msg)
-
-    # ============================================================
-    # POST-PROCESSING METHODS
-    # ============================================================
-
-    def _should_apply_postproc(self) -> bool:
-        """Check if any post-processing option is enabled."""
-        return (
-            self.pp_sharpen_checkbox.isChecked() or
-            self.pp_denoise_checkbox.isChecked() or
-            self.pp_clahe_checkbox.isChecked() or
-            self.pp_shadow_checkbox.isChecked() or
-            self.pp_deblur_checkbox.isChecked() or
-            self.pp_white_balance_checkbox.isChecked() or
-            self.pp_vignette_checkbox.isChecked() or
-            self.pp_ai_color_checkbox.isChecked() or
-            self.pp_ai_denoise_checkbox.isChecked() or
-            self.pp_super_res_checkbox.isChecked() or
-            self.pp_upscale_combo.currentIndex() > 0  # Not "1x"
-        )
-
-    def _get_postproc_options(self) -> dict:
-        """Get current post-processing options from GUI."""
-        # Parse Lanczos upscale factor
-        upscale_text = self.pp_upscale_combo.currentText()
-        if "1.5x" in upscale_text:
-            upscale_factor = 1.5
-        elif "2x" in upscale_text:
-            upscale_factor = 2.0
-        elif "3x" in upscale_text:
-            upscale_factor = 3.0
-        elif "4x" in upscale_text:
-            upscale_factor = 4.0
-        else:
-            upscale_factor = 1.0
-
-        # Parse super resolution scale
-        super_res_text = self.pp_super_res_scale_combo.currentText()
-        super_res_scale = 4 if "4x" in super_res_text else 2
-
-        return {
-            'sharpen': self.pp_sharpen_checkbox.isChecked(),
-            'sharpen_amount': self.pp_sharpen_spin.value(),
-            'denoise': self.pp_denoise_checkbox.isChecked(),
-            'denoise_strength': self.pp_denoise_spin.value(),
-            'clahe': self.pp_clahe_checkbox.isChecked(),
-            'clahe_strength': self.pp_clahe_spin.value(),
-            'shadow_removal': self.pp_shadow_checkbox.isChecked(),
-            'shadow_strength': self.pp_shadow_spin.value(),
-            'deblur': self.pp_deblur_checkbox.isChecked(),
-            'deblur_radius': self.pp_deblur_spin.value(),
-            'white_balance': self.pp_white_balance_checkbox.isChecked(),
-            'vignette_removal': self.pp_vignette_checkbox.isChecked(),
-            'ai_color': self.pp_ai_color_checkbox.isChecked(),
-            'ai_denoise': self.pp_ai_denoise_checkbox.isChecked(),
-            'super_resolution': self.pp_super_res_checkbox.isChecked(),
-            'super_res_scale': super_res_scale,
-            'upscale_factor': upscale_factor,
-            'interpolation': 'lanczos'
-        }
-
-    def _apply_postprocessing(self):
-        """Apply post-processing to current result."""
-        if not hasattr(self, 'original_result') or self.original_result is None:
-            self.log("No panorama result to process")
-            return
-
-        options = self._get_postproc_options()
-        if not self._should_apply_postproc():
-            self.log("No post-processing options enabled")
-            return
-
-        try:
-            from core.post_processing import ImagePostProcessor
-            from core.autopano_features import AIPostProcessor
-
-            self.log("Applying post-processing...")
-            self.statusBar().showMessage("Applying post-processing...")
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-
-            # Start from original
-            result = self.original_result.copy()
-
-            # Apply standard post-processing
-            processor = ImagePostProcessor()
-            steps_done = 0
-            total_steps = sum([
-                options.get('shadow_removal', False),
-                options.get('denoise', False),
-                options.get('deblur', False),
-                options.get('clahe', False),
-                options.get('sharpen', False),
-                options.get('white_balance', False),
-                options.get('vignette_removal', False),
-                options.get('ai_color', False),
-                options.get('ai_denoise', False),
-                options.get('super_resolution', False),
-                options.get('upscale_factor', 1.0) > 1.0
-            ])
-            if total_steps == 0:
-                total_steps = 1
-
-            # Apply in order: shadow -> white balance -> vignette -> denoise -> deblur -> clahe -> sharpen -> ai -> upscale
-            if options.get('shadow_removal'):
-                self.log(f"  Fixing exposure (strength={options['shadow_strength']:.1f})...")
-                self.statusBar().showMessage("Fixing exposure...")
-                result = processor.apply_shadow_removal(result, options['shadow_strength'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('white_balance'):
-                self.log("  Applying white balance...")
-                self.statusBar().showMessage("Applying white balance...")
-                result = processor.apply_white_balance(result)
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('vignette_removal'):
-                self.log("  Removing vignette...")
-                self.statusBar().showMessage("Removing vignette...")
-                result = processor.apply_vignette_removal(result)
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('denoise'):
-                self.log(f"  Denoising (strength={options['denoise_strength']})...")
-                self.statusBar().showMessage("Denoising...")
-                result = processor.apply_denoise(result, options['denoise_strength'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('deblur'):
-                self.log(f"  Deblurring (radius={options['deblur_radius']:.1f})...")
-                self.statusBar().showMessage("Deblurring...")
-                result = processor.apply_deblur(result, options['deblur_radius'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('clahe'):
-                self.log(f"  Enhancing contrast (CLAHE strength={options['clahe_strength']:.1f})...")
-                self.statusBar().showMessage("Enhancing contrast...")
-                result = processor.apply_clahe(result, options['clahe_strength'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('sharpen'):
-                self.log(f"  Sharpening (amount={options['sharpen_amount']:.1f})...")
-                self.statusBar().showMessage("Sharpening...")
-                result = processor.apply_sharpen(result, options['sharpen_amount'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            # Apply AI enhancements
-            if options.get('ai_color') or options.get('ai_denoise'):
-                ai_processor = AIPostProcessor()
-                if options.get('ai_color'):
-                    self.log("  Applying AI color correction...")
-                    self.statusBar().showMessage("AI color correction...")
-                    result = ai_processor._color_correct(result)
-                    steps_done += 1
-                    self.progress_bar.setValue(int(100 * steps_done / total_steps))
-                if options.get('ai_denoise'):
-                    self.log("  Applying AI denoising...")
-                    self.statusBar().showMessage("AI denoising...")
-                    result = ai_processor._denoise(result)
-                    steps_done += 1
-                    self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            # Apply AI super resolution (before Lanczos upscaling)
-            if options.get('super_resolution'):
-                scale = options.get('super_res_scale', 2)
-                self.log(f"  Applying Real-ESRGAN super-resolution ({scale}x)...")
-                self.statusBar().showMessage(f"AI Super-Resolution {scale}x (this may take a while)...")
-
-                def sr_progress(pct, msg):
-                    self.statusBar().showMessage(f"Super-Res: {msg}")
-
-                result = processor.apply_super_resolution(
-                    result,
-                    scale=scale,
-                    model_name='realesrgan-x4plus',
-                    tile_size=512,
-                    progress_callback=sr_progress
-                )
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            # Apply Lanczos upscaling (can be used in addition to or instead of AI)
-            if options.get('upscale_factor', 1.0) > 1.0:
-                factor = options['upscale_factor']
-                self.log(f"  Upscaling {factor}x (Lanczos)...")
-                self.statusBar().showMessage(f"Upscaling {factor}x...")
-                result = processor.apply_upscale(result, factor, 'lanczos')
-                steps_done += 1
-                self.progress_bar.setValue(100)
-
-            # Update result and display
-            self.current_result = result
-            self.update_preview(result)
-
-            # Log size change
-            orig_h, orig_w = self.original_result.shape[:2]
-            new_h, new_w = result.shape[:2]
-            self.log(f"Post-processing complete! Size: {orig_w}x{orig_h} -> {new_w}x{new_h}")
-
-            self.progress_bar.setVisible(False)
-            self.statusBar().showMessage("Post-processing complete", 3000)
-
-        except ImportError as e:
-            self.log(f"Post-processing error: Missing module - {e}")
-            QMessageBox.warning(self, "Post-Processing Error", f"Missing module:\n{e}")
-        except Exception as e:
-            self.log(f"Post-processing error: {e}")
-            QMessageBox.warning(self, "Post-Processing Error", str(e))
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.progress_bar.setVisible(False)
-
-    def _reset_postprocessing(self):
-        """Reset to original panorama (before post-processing)."""
-        if not hasattr(self, 'original_result') or self.original_result is None:
-            self.log("No original result to restore")
-            return
-
-        self.current_result = self.original_result.copy()
-        self.update_preview(self.current_result)
-        self.log("Reset to original panorama (post-processing removed)")
-        self.statusBar().showMessage("Reset to original", 2000)
-
+    
     def _run_hloc(self):
         """Run HLOC pipeline on current images."""
         if not self.image_paths:
