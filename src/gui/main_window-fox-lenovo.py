@@ -10,15 +10,15 @@ import logging
 import numpy as np
 import cv2
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QLabel, QProgressBar, QTextEdit, QTabWidget,
     QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QSlider, QMessageBox, QSplitter, QListWidget, QListWidgetItem,
     QScrollArea, QLineEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QImage, QFont
+from PySide6.QtCore import Qt, QThread, Signal, QSize
+from PySide6.QtGui import QPixmap, QImage, QFont
 
 from core.stitcher import ImageStitcher
 from utils.logger import setup_logger
@@ -29,10 +29,10 @@ logger = setup_logger(__name__)
 class StitchingThread(QThread):
     """Thread for running stitching operations"""
     
-    progress = pyqtSignal(int)
-    status = pyqtSignal(str)
-    finished = pyqtSignal(object)
-    error = pyqtSignal(str)
+    progress = Signal(int)
+    status = Signal(str)
+    finished = Signal(object)
+    error = Signal(str)
     
     def __init__(self, stitcher: ImageStitcher, image_paths: List[Path], grid_only: bool = False):
         super().__init__()
@@ -83,10 +83,10 @@ class StitchingThread(QThread):
 class GridAlignmentThread(QThread):
     """Thread for running grid alignment operations with overlap threshold"""
     
-    progress = pyqtSignal(int)
-    status = pyqtSignal(str)
-    finished = pyqtSignal(object)
-    error = pyqtSignal(str)
+    progress = Signal(int)
+    status = Signal(str)
+    finished = Signal(object)
+    error = Signal(str)
     
     def __init__(self, stitcher: ImageStitcher, image_paths: List[Path], min_overlap_percent: float, max_overlap_percent: float = 100.0, spacing_factor: float = 1.3):
         super().__init__()
@@ -136,350 +136,6 @@ class GridAlignmentThread(QThread):
             self.error.emit(str(e))
 
 
-class COLMAPThread(QThread):
-    """Thread for running COLMAP pipeline operations"""
-    
-    progress = pyqtSignal(int)
-    status = pyqtSignal(str)
-    finished = pyqtSignal(object)
-    error = pyqtSignal(str)
-    
-    def __init__(self, image_paths: List[Path], output_dir: Path, transform_type: str = "homography",
-                 blend_method: str = "multiband", matching_strategy: str = "exhaustive",
-                 sequential_overlap: int = 10, gpu_indices: List[str] = None,
-                 num_threads: int = -1, max_features: int = 8192,
-                 min_inliers: int = 0, max_images: int = 0, use_source_alpha: bool = False,
-                 remove_duplicates: bool = False, duplicate_threshold: float = 0.92,
-                 warp_interpolation: str = 'lanczos',
-                 erode_border: bool = True, border_erosion_pixels: int = 5):
-        super().__init__()
-        self.image_paths = image_paths
-        self.output_dir = output_dir
-        self.transform_type = transform_type
-        self.blend_method = blend_method
-        self.matching_strategy = matching_strategy
-        self.sequential_overlap = sequential_overlap
-        self.gpu_indices = gpu_indices or ["auto"]
-        self.num_threads = num_threads
-        self.max_features = max_features
-        self.min_inliers = min_inliers
-        self.max_images = max_images
-        self.use_source_alpha = use_source_alpha
-        self.remove_duplicates = remove_duplicates
-        self.duplicate_threshold = duplicate_threshold
-        self.warp_interpolation = warp_interpolation
-        self.erode_border = erode_border
-        self.border_erosion_pixels = border_erosion_pixels
-        self._cancelled = False
-    
-    def cancel(self):
-        """Cancel the operation"""
-        self._cancelled = True
-    
-    def run(self):
-        try:
-            from external.pipelines import COLMAPPipeline
-            
-            # Progress callback that emits signals
-            # percentage=-1 means "status only, no progress change"
-            def progress_callback(percentage: int, message: str = ""):
-                if self._cancelled:
-                    raise InterruptedError("Operation cancelled")
-                if percentage >= 0:
-                    self.progress.emit(percentage)
-                if message:
-                    self.status.emit(message)
-            
-            use_affine = self.transform_type == "affine"
-
-            # Determine GPU usage
-            use_gpu = True
-            gpu_index = -1  # Auto-detect
-            if self.gpu_indices:
-                if "cpu" in self.gpu_indices:
-                    use_gpu = False
-                elif "auto" not in self.gpu_indices:
-                    # Use first specified GPU
-                    try:
-                        gpu_index = int(self.gpu_indices[0])
-                    except:
-                        gpu_index = -1
-
-            pipeline = COLMAPPipeline(
-                use_gpu=use_gpu,
-                use_affine=use_affine,
-                blend_method=self.blend_method,
-                matcher_type=self.matching_strategy,
-                sequential_overlap=self.sequential_overlap,
-                gpu_index=gpu_index,
-                num_threads=self.num_threads,
-                max_features=self.max_features,
-                min_inliers=self.min_inliers,
-                max_images=self.max_images,
-                use_source_alpha=self.use_source_alpha,
-                remove_duplicates=self.remove_duplicates,
-                duplicate_threshold=self.duplicate_threshold,
-                warp_interpolation=self.warp_interpolation,
-                erode_border=self.erode_border,
-                border_erosion_pixels=self.border_erosion_pixels,
-                progress_callback=progress_callback
-            )
-            
-            self.status.emit("Starting COLMAP 2D stitching pipeline...")
-            result = pipeline.run_2d_stitch(self.image_paths, self.output_dir)
-            
-            self.finished.emit(result)
-        except InterruptedError:
-            self.status.emit("Operation cancelled")
-            self.progress.emit(0)
-        except Exception as e:
-            logger.error(f"COLMAP error: {e}", exc_info=True)
-            self.error.emit(str(e))
-
-
-class HLOCInstallThread(QThread):
-    """Thread for installing HLOC in the background"""
-    
-    status = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)  # success, message
-    
-    def __init__(self):
-        super().__init__()
-    
-    def run(self):
-        import subprocess
-        import sys
-        import shutil
-        
-        try:
-            # Step 1: Check if pycolmap is installed
-            self.status.emit("Checking pycolmap installation...")
-            try:
-                import pycolmap
-                self.status.emit(f"pycolmap v{getattr(pycolmap, '__version__', 'unknown')} found")
-            except ImportError:
-                self.finished.emit(False, "pycolmap is required but not installed. Please install pycolmap first.")
-                return
-            
-            # Step 2: Check if Git is available
-            self.status.emit("Checking for Git...")
-            git_path = shutil.which("git")
-            if not git_path:
-                self.finished.emit(False, "Git is required to install HLOC.\n\nPlease install Git from: https://git-scm.com/download/win\nThen restart the application.")
-                return
-            self.status.emit(f"Git found at {git_path}")
-
-            # Step 3: Install PyTorch with CUDA support
-            self.status.emit("Checking PyTorch installation...")
-            try:
-                import torch
-                self.status.emit(f"PyTorch {torch.__version__} already installed")
-            except ImportError:
-                self.status.emit("PyTorch not found. Installing PyTorch with CUDA 11.8 support...")
-                self.status.emit("This may take 10-15 minutes and download ~2GB...")
-
-                # Install PyTorch with CUDA 11.8 (widely compatible)
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "torch", "torchvision",
-                     "--index-url", "https://download.pytorch.org/whl/cu118"],
-                    capture_output=True,
-                    text=True,
-                    timeout=1200  # 20 minute timeout for PyTorch with CUDA
-                )
-
-                if result.returncode != 0:
-                    error_msg = result.stderr or result.stdout
-                    self.finished.emit(False, f"PyTorch installation failed:\n{error_msg[:500]}")
-                    return
-
-                self.status.emit("PyTorch installed successfully!")
-
-            # Step 4: Install additional dependencies
-            self.status.emit("Installing additional HLOC dependencies...")
-            additional_deps = ["plotly", "h5py", "kornia>=0.6.11", "gdown"]
-
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install"] + additional_deps,
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 minute timeout
-            )
-
-            if result.returncode != 0:
-                # Non-critical, log but continue
-                self.status.emit("Warning: Some additional dependencies may have failed to install")
-            else:
-                self.status.emit("Additional dependencies installed successfully!")
-
-            # Step 5: Install HLOC + LightGlue from GitHub
-            self.status.emit("Installing HLOC and LightGlue from GitHub (this may take several minutes)...")
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install",
-                 "git+https://github.com/cvg/Hierarchical-Localization.git",
-                 "lightglue@git+https://github.com/cvg/LightGlue"],
-                capture_output=True,
-                text=True,
-                timeout=900  # 15 minute timeout
-            )
-
-            if result.returncode == 0:
-                self.status.emit("HLOC installed successfully!")
-                self.finished.emit(True, "HLOC and all dependencies installed successfully!")
-            else:
-                error_msg = result.stderr or result.stdout
-                self.finished.emit(False, f"HLOC installation failed:\n{error_msg[:500]}")
-                
-        except subprocess.TimeoutExpired:
-            self.finished.emit(False, "Installation timed out after 15 minutes. Please try again or install manually.")
-        except Exception as e:
-            self.finished.emit(False, f"Installation error: {e}")
-
-
-class COLMAPInstallThread(QThread):
-    """Thread for installing PyCOLMAP (with CUDA support) in the background"""
-
-    status = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)  # success, message
-
-    def __init__(self):
-        super().__init__()
-
-    def run(self):
-        import subprocess
-        import sys
-        import platform
-
-        try:
-            system = platform.system()
-
-            # Step 1: Check current pycolmap installation
-            self.status.emit("Checking for existing pycolmap installation...")
-            try:
-                import pycolmap
-                current_version = getattr(pycolmap, '__version__', 'unknown')
-                has_cuda = getattr(pycolmap, 'has_cuda', False)
-                self.status.emit(f"Found pycolmap v{current_version} (CUDA: {has_cuda})")
-
-                if has_cuda:
-                    self.finished.emit(True, f"PyCOLMAP v{current_version} with CUDA is already installed!")
-                    return
-            except ImportError:
-                self.status.emit("pycolmap not found, will install fresh")
-
-            # Step 2: Determine installation strategy based on OS
-            if system == "Windows":
-                # On Windows, try WSL CUDA installation
-                self.status.emit("Detected Windows - will install pycolmap and setup WSL CUDA support...")
-
-                # First install regular pycolmap for Windows
-                self.status.emit("Installing pycolmap for Windows...")
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--upgrade", "pycolmap"],
-                    capture_output=True,
-                    text=True,
-                    timeout=600  # 10 minute timeout
-                )
-
-                if result.returncode != 0:
-                    error_msg = result.stderr or result.stdout
-                    self.finished.emit(False, f"PyCOLMAP installation failed:\n{error_msg[:500]}")
-                    return
-
-                self.status.emit("pycolmap installed successfully!")
-
-                # Check if WSL is available
-                self.status.emit("Checking for WSL (Windows Subsystem for Linux)...")
-                wsl_check = subprocess.run(
-                    ["wsl", "--status"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-
-                if wsl_check.returncode == 0:
-                    self.status.emit("WSL detected! Setting up GPU-accelerated COLMAP in WSL...")
-
-                    # Install pycolmap-cuda in WSL
-                    wsl_install = subprocess.run(
-                        ["wsl", "bash", "-c", "pip3 install --upgrade pycolmap-cuda12"],
-                        capture_output=True,
-                        text=True,
-                        timeout=600
-                    )
-
-                    if wsl_install.returncode == 0:
-                        self.status.emit("WSL CUDA support configured successfully!")
-                        self.finished.emit(True,
-                            "PyCOLMAP installed with WSL GPU acceleration!\n\n"
-                            "✓ Windows: pycolmap (CPU)\n"
-                            "✓ WSL: pycolmap-cuda12 (GPU-accelerated)\n\n"
-                            "The app will automatically use GPU acceleration when available.")
-                    else:
-                        # WSL install failed, but Windows install succeeded
-                        self.status.emit("WSL CUDA setup failed, but Windows installation succeeded")
-                        self.finished.emit(True,
-                            "PyCOLMAP installed for Windows (CPU mode)!\n\n"
-                            "Note: WSL GPU setup failed. You can install it manually with:\n"
-                            "wsl bash -c 'pip3 install pycolmap-cuda12'")
-                else:
-                    self.finished.emit(True,
-                        "PyCOLMAP installed for Windows (CPU mode)!\n\n"
-                        "For GPU acceleration, install WSL2 and run:\n"
-                        "wsl bash -c 'pip3 install pycolmap-cuda12'")
-
-            elif system == "Linux":
-                # On Linux, try to install CUDA version
-                self.status.emit("Detected Linux - attempting GPU-accelerated installation...")
-
-                # Try CUDA 12 first
-                self.status.emit("Installing pycolmap-cuda12...")
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--upgrade", "pycolmap-cuda12"],
-                    capture_output=True,
-                    text=True,
-                    timeout=600
-                )
-
-                if result.returncode == 0:
-                    self.status.emit("GPU-accelerated pycolmap installed successfully!")
-                    self.finished.emit(True, "PyCOLMAP installed with CUDA 12 GPU acceleration!")
-                else:
-                    # Fall back to regular pycolmap
-                    self.status.emit("CUDA installation failed, trying CPU version...")
-                    result = subprocess.run(
-                        [sys.executable, "-m", "pip", "install", "--upgrade", "pycolmap"],
-                        capture_output=True,
-                        text=True,
-                        timeout=600
-                    )
-
-                    if result.returncode == 0:
-                        self.finished.emit(True, "PyCOLMAP installed (CPU mode)!")
-                    else:
-                        error_msg = result.stderr or result.stdout
-                        self.finished.emit(False, f"PyCOLMAP installation failed:\n{error_msg[:500]}")
-
-            else:  # macOS
-                self.status.emit("Detected macOS - installing pycolmap...")
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--upgrade", "pycolmap"],
-                    capture_output=True,
-                    text=True,
-                    timeout=600
-                )
-
-                if result.returncode == 0:
-                    self.finished.emit(True, "PyCOLMAP installed successfully!")
-                else:
-                    error_msg = result.stderr or result.stdout
-                    self.finished.emit(False, f"PyCOLMAP installation failed:\n{error_msg[:500]}")
-
-        except subprocess.TimeoutExpired:
-            self.finished.emit(False, "Installation timed out. Please try again or check your internet connection.")
-        except Exception as e:
-            self.finished.emit(False, f"Installation error: {e}")
-
-
 class MainWindow(QMainWindow):
     """Main application window"""
     
@@ -488,8 +144,6 @@ class MainWindow(QMainWindow):
         self.image_paths: List[Path] = []
         self.stitcher: Optional[ImageStitcher] = None
         self.thread: Optional[StitchingThread] = None
-        self.colmap_thread: Optional[COLMAPThread] = None
-        self.hloc_install_thread: Optional[HLOCInstallThread] = None
         self._preview_image: Optional[np.ndarray] = None
         self._preview_zoom: float = 1.0
         try:
@@ -632,10 +286,10 @@ class MainWindow(QMainWindow):
         features_layout.addWidget(self.max_features_spin)
         settings_layout.addLayout(features_layout)
         
-        # Allow scale checkbox
-        self.allow_scale_checkbox = QCheckBox("Allow Scaling")
-        self.allow_scale_checkbox.setChecked(False)
-        self.allow_scale_checkbox.setToolTip("Allow images to be scaled (stretched/shrunk) during alignment.\nDisable for flatbed scans where only rotation and translation should be applied.\nRotation is always allowed.")
+        # Allow scale/rotation checkbox
+        self.allow_scale_checkbox = QCheckBox("Allow Scale & Rotation")
+        self.allow_scale_checkbox.setChecked(True)
+        self.allow_scale_checkbox.setToolTip("Allow images to be scaled and rotated to match at overlaps.\nUseful when images have different resolutions, zoom levels, or orientations.")
         settings_layout.addWidget(self.allow_scale_checkbox)
         
         # ============================================================
@@ -855,14 +509,14 @@ class MainWindow(QMainWindow):
         self.ai_color_checkbox.setChecked(True)
         self.ai_color_checkbox.setVisible(False)
         
-        # External Pipelines - Primary stitching workflows
-        external_group = QGroupBox("🚀 Stitching Pipelines")
+        # External Pipeline Integration (for 500+ images)
+        external_group = QGroupBox("🚀 External Pipelines (Recommended for 500+ images)")
         external_layout = QVBoxLayout()
         external_layout.setSpacing(8)
-
+        
         external_info = QLabel(
-            "GPU-accelerated stitching pipelines.\n"
-            "Click 'Install' to set up, then 'Run' to stitch your images."
+            "These battle-tested tools handle large image sets much better than\n"
+            "built-in methods. Click 'Install' to set up, then 'Run' to use."
         )
         external_info.setStyleSheet("color: #555; font-size: 11px; padding: 4px;")
         external_info.setWordWrap(True)
@@ -882,7 +536,7 @@ class MainWindow(QMainWindow):
         
         self.colmap_install_btn = QPushButton("Install")
         self.colmap_install_btn.setFixedWidth(60)
-        self.colmap_install_btn.setToolTip("Automatically install PyCOLMAP with GPU support (if available)")
+        self.colmap_install_btn.setToolTip("Download and install COLMAP")
         self.colmap_install_btn.clicked.connect(self._install_colmap)
         colmap_row.addWidget(self.colmap_install_btn)
         
@@ -891,543 +545,81 @@ class MainWindow(QMainWindow):
         self.colmap_btn.setToolTip("Run COLMAP pipeline on loaded images")
         self.colmap_btn.clicked.connect(self._run_colmap)
         colmap_row.addWidget(self.colmap_btn)
-
+        
         external_layout.addLayout(colmap_row)
-
-        # Transform type selector for COLMAP
-        transform_layout = QHBoxLayout()
-        transform_layout.addWidget(QLabel("Transform:"))
-        self.colmap_transform_combo = QComboBox()
-        self.colmap_transform_combo.addItems([
-            "Homography (3D perspective)",
-            "Affine (2D planar)"
-        ])
-        self.colmap_transform_combo.setCurrentIndex(0)  # Default to homography
-        self.colmap_transform_combo.setToolTip(
-            "Homography: Full 3D perspective (8 DOF) - for photos/3D scenes\n"
-            "Affine: 2D planar only (6 DOF) - for flatbed scans"
-        )
-        transform_layout.addWidget(self.colmap_transform_combo)
-        external_layout.addLayout(transform_layout)
-
-        # Blending method selector for COLMAP
-        blend_layout = QHBoxLayout()
-        blend_layout.addWidget(QLabel("Blending:"))
-        self.colmap_blend_combo = QComboBox()
-        self.colmap_blend_combo.addItems([
-            "Multiband (Recommended)",
-            "Feather",
-            "AutoStitch",
-            "Linear"
-        ])
-        self.colmap_blend_combo.setCurrentIndex(0)  # Default to multiband
-        self.colmap_blend_combo.setToolTip(
-            "Multiband: Best quality, Laplacian pyramid blending\n"
-            "Feather: Smooth feathering, faster\n"
-            "AutoStitch: Puzzle-like selection with seam feathering\n"
-            "Linear: Simple averaging, fastest"
-        )
-        blend_layout.addWidget(self.colmap_blend_combo)
-        external_layout.addLayout(blend_layout)
-
-        # Quality preset selector for COLMAP (affects feature extraction quality, not matching)
-        preset_layout = QHBoxLayout()
-        preset_layout.addWidget(QLabel("Quality Preset:"))
-        self.colmap_preset_combo = QComboBox()
-        self.colmap_preset_combo.addItems([
-            "Original (Full Features - Slowest)",
-            "Phase 1 (Optimized - 2x Faster)",
-            "Phase 2 (Fast - 3-4x Faster)"
-        ])
-        self.colmap_preset_combo.setCurrentIndex(0)  # Default to original
-        self.colmap_preset_combo.setToolTip(
-            "Original: 8192 features, full resolution (slowest, highest quality)\n"
-            "Phase 1: 4096 features, optimized settings (2x faster extraction)\n"
-            "Phase 2: 2048 features, downsampled (3-4x faster extraction)\n\n"
-            "Note: Matching strategy is configured separately below"
-        )
-        self.colmap_preset_combo.currentIndexChanged.connect(self._on_colmap_preset_changed)
-        preset_layout.addWidget(self.colmap_preset_combo)
-        external_layout.addLayout(preset_layout)
-
-        # Advanced matching strategy selector (controlled by preset)
-        matching_layout = QHBoxLayout()
-        matching_layout.addWidget(QLabel("Matching:"))
-        self.colmap_matching_combo = QComboBox()
-        self.colmap_matching_combo.addItems([
-            "Exhaustive (All Pairs)",
-            "Sequential (Consecutive)",
-            "Vocabulary Tree (Visual Similarity)",
-            "Grid-Aware (Grid Neighbors)"
-        ])
-        self.colmap_matching_combo.setCurrentIndex(0)
-        self.colmap_matching_combo.setToolTip(
-            "Exhaustive: Test all N*(N-1)/2 pairs\n"
-            "Sequential: Match consecutive images only\n"
-            "Vocabulary Tree: Match visually similar images\n"
-            "Grid-Aware: Match detected grid neighbors"
-        )
-        matching_layout.addWidget(self.colmap_matching_combo)
-
-        # Sequential overlap parameter
-        matching_layout.addWidget(QLabel("Overlap:"))
-        self.colmap_overlap_spin = QSpinBox()
-        self.colmap_overlap_spin.setMinimum(1)
-        self.colmap_overlap_spin.setMaximum(50)
-        self.colmap_overlap_spin.setValue(10)
-        self.colmap_overlap_spin.setToolTip("For sequential matching: number of consecutive images to match")
-        matching_layout.addWidget(self.colmap_overlap_spin)
-
-        external_layout.addLayout(matching_layout)
-
-        # GPU and thread settings for COLMAP
-        perf_layout = QHBoxLayout()
-
-        # Multi-GPU selection
-        gpu_group = QVBoxLayout()
-        gpu_group.addWidget(QLabel("GPUs:"))
-        self.colmap_gpu_list = QListWidget()
-        self.colmap_gpu_list.setMaximumHeight(80)
-        self.colmap_gpu_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-
-        # Detect available GPUs
-        detected_gpus = self._detect_available_gpus()
-
-        # Always add Auto and CPU Only options
-        auto_item = QListWidgetItem("Auto (Detect Best)")
-        self.colmap_gpu_list.addItem(auto_item)
-
-        cpu_item = QListWidgetItem("CPU Only")
-        self.colmap_gpu_list.addItem(cpu_item)
-
-        # Add detected GPUs
-        if detected_gpus:
-            for gpu_info in detected_gpus:
-                item = QListWidgetItem(gpu_info)
-                self.colmap_gpu_list.addItem(item)
-        else:
-            # Fallback if detection fails
-            for i in range(4):
-                item = QListWidgetItem(f"GPU {i} (Not Verified)")
-                self.colmap_gpu_list.addItem(item)
-
-        # Select "Auto" by default
-        self.colmap_gpu_list.item(0).setSelected(True)
-        self.colmap_gpu_list.setToolTip(
-            "Select GPUs to use for COLMAP processing\n"
-            "Hold Ctrl/Cmd to select multiple GPUs\n"
-            "Auto: Automatically detect and use available GPUs\n\n"
-            f"Detected: {len(detected_gpus)} GPU(s) available" if detected_gpus else "GPU detection unavailable"
-        )
-        gpu_group.addWidget(self.colmap_gpu_list)
-        perf_layout.addLayout(gpu_group)
-
-        # Thread count and features
-        params_group = QVBoxLayout()
-
-        params_group.addWidget(QLabel("CPU Threads:"))
-        self.colmap_threads_spin = QSpinBox()
-        self.colmap_threads_spin.setMinimum(-1)  # -1 = auto
-        self.colmap_threads_spin.setMaximum(128)
-        self.colmap_threads_spin.setSpecialValueText("Auto")  # Show "Auto" for -1
-        import os
-        cpu_count = os.cpu_count() or 4
-        self.colmap_threads_spin.setValue(-1)  # Default to auto
-        self.colmap_threads_spin.setToolTip(f"Number of CPU threads for feature extraction\n-1/Auto: Use all available threads\n(System has {cpu_count} threads)")
-        params_group.addWidget(self.colmap_threads_spin)
-
-        params_group.addWidget(QLabel("Max Features:"))
-        self.colmap_features_spin = QSpinBox()
-        self.colmap_features_spin.setMinimum(512)
-        self.colmap_features_spin.setMaximum(65536)  # Increased for better alignment
-        self.colmap_features_spin.setValue(8192)
-        self.colmap_features_spin.setSingleStep(1024)
-        self.colmap_features_spin.setToolTip(
-            "Maximum SIFT features per image:\n\n"
-            "Recommended by image count:\n"
-            "• 2-50 images: 8192-16384 features\n"
-            "• 50-200 images: 4096-8192 features\n"
-            "• 200-500 images: 2048-4096 features\n"
-            "• 500-1000 images: 1024-2048 features\n"
-            "• 1000+ images: 512-1024 features\n\n"
-            "Higher counts = better alignment but slower.\n"
-            "Use Quality Preset dropdown for auto-adjustment."
-        )
-        params_group.addWidget(self.colmap_features_spin)
-
-        perf_layout.addLayout(params_group)
-
-        external_layout.addLayout(perf_layout)
-
-        # Image filtering controls to reduce overlap
-        filter_layout = QHBoxLayout()
-        filter_layout.addWidget(QLabel("Image Filtering:"))
-
-        # Minimum inliers filter
-        filter_layout.addWidget(QLabel("Min Inliers:"))
-        self.colmap_min_inliers_spin = QSpinBox()
-        self.colmap_min_inliers_spin.setMinimum(0)  # 0 = disabled
-        self.colmap_min_inliers_spin.setMaximum(500)
-        self.colmap_min_inliers_spin.setValue(0)  # Default: no filtering
-        self.colmap_min_inliers_spin.setSpecialValueText("Off")
-        self.colmap_min_inliers_spin.setToolTip(
-            "Minimum feature matches required to include an image\n"
-            "0/Off: Include all images\n"
-            "30-50: Light filtering (recommended for overlap reduction)\n"
-            "100+: Aggressive filtering (may exclude valid images)"
-        )
-        filter_layout.addWidget(self.colmap_min_inliers_spin)
-
-        # Maximum images per cluster
-        filter_layout.addWidget(QLabel("Max Images:"))
-        self.colmap_max_images_spin = QSpinBox()
-        self.colmap_max_images_spin.setMinimum(0)  # 0 = unlimited
-        self.colmap_max_images_spin.setMaximum(1000)
-        self.colmap_max_images_spin.setValue(0)  # Default: no limit
-        self.colmap_max_images_spin.setSpecialValueText("All")
-        self.colmap_max_images_spin.setToolTip(
-            "Maximum images to include in panorama\n"
-            "0/All: Include all registered images\n"
-            "Set lower to reduce overlap blur (e.g., 50-100 for large datasets)\n"
-            "Images with best quality/coverage are prioritized"
-        )
-        filter_layout.addWidget(self.colmap_max_images_spin)
-
-        external_layout.addLayout(filter_layout)
-
-        # Alpha/transparency handling for circular scans
-        alpha_layout = QHBoxLayout()
-        self.colmap_use_source_alpha = QCheckBox("Use source alpha (transparent backgrounds)")
-        self.colmap_use_source_alpha.setChecked(False)
-        self.colmap_use_source_alpha.setToolTip(
-            "Enable for images with transparent backgrounds (e.g., circular scans)\n\n"
-            "When CHECKED:\n"
-            "  - Uses the image's alpha channel to determine valid pixels\n"
-            "  - Transparent areas are excluded from the final panorama\n"
-            "  - Best for circular scans or masked images\n\n"
-            "When UNCHECKED (default):\n"
-            "  - Treats all pixels as valid content\n"
-            "  - Black areas are preserved as image content\n"
-            "  - Best for rectangular photos"
-        )
-        alpha_layout.addWidget(self.colmap_use_source_alpha)
-        alpha_layout.addStretch()
-        external_layout.addLayout(alpha_layout)
-
-        # Border erosion for circular images
-        border_layout = QHBoxLayout()
-        self.colmap_erode_border = QCheckBox("Remove black borders")
-        self.colmap_erode_border.setChecked(True)  # On by default when using alpha
-        self.colmap_erode_border.setToolTip(
-            "Erode alpha mask to remove thin black borders from circular images\n\n"
-            "When CHECKED:\n"
-            "  - Shrinks the alpha mask inward by the specified pixels\n"
-            "  - Removes dark edge artifacts from circular scans\n"
-            "  - Only applies when 'Use source alpha' is enabled\n\n"
-            "When UNCHECKED:\n"
-            "  - Uses original alpha mask without modification"
-        )
-        border_layout.addWidget(self.colmap_erode_border)
-
-        border_layout.addWidget(QLabel("Erosion:"))
-        self.colmap_border_erosion_spin = QSpinBox()
-        self.colmap_border_erosion_spin.setRange(1, 20)
-        self.colmap_border_erosion_spin.setValue(5)
-        self.colmap_border_erosion_spin.setSuffix(" px")
-        self.colmap_border_erosion_spin.setFixedWidth(70)
-        self.colmap_border_erosion_spin.setToolTip(
-            "Number of pixels to erode from the alpha mask edge\n\n"
-            "• 1-3 px: Light erosion (thin borders)\n"
-            "• 4-6 px: Medium erosion (typical borders)\n"
-            "• 7-10 px: Heavy erosion (thick borders)\n"
-            "• 10+ px: Aggressive (use if borders still visible)\n\n"
-            "Adjust based on your image resolution and border thickness"
-        )
-        border_layout.addWidget(self.colmap_border_erosion_spin)
-        border_layout.addStretch()
-        external_layout.addLayout(border_layout)
-
-        # Duplicate removal option
-        dedup_layout = QHBoxLayout()
-        self.colmap_remove_duplicates = QCheckBox("Remove duplicates before processing")
-        self.colmap_remove_duplicates.setChecked(False)
-        self.colmap_remove_duplicates.setToolTip(
-            "Scan for and remove duplicate/near-identical images before COLMAP processing\n\n"
-            "When CHECKED:\n"
-            "  - Uses perceptual hashing and NCC to detect duplicates\n"
-            "  - Removes redundant images to speed up processing\n"
-            "  - Good for burst photos or datasets with duplicates\n\n"
-            "When UNCHECKED (default):\n"
-            "  - All images are processed\n"
-            "  - Best for curated panorama image sets"
-        )
-        dedup_layout.addWidget(self.colmap_remove_duplicates)
-
-        # Threshold slider
-        dedup_layout.addWidget(QLabel("Threshold:"))
-        self.colmap_duplicate_threshold = QSlider(Qt.Orientation.Horizontal)
-        self.colmap_duplicate_threshold.setMinimum(60)
-        self.colmap_duplicate_threshold.setMaximum(98)
-        self.colmap_duplicate_threshold.setValue(92)
-        self.colmap_duplicate_threshold.setFixedWidth(100)
-        self.colmap_duplicate_threshold.setToolTip(
-            "Similarity threshold for duplicate detection (60-98%)\n\n"
-            "Higher = stricter (only near-identical images)\n"
-            "Lower = more aggressive (similar images removed)\n\n"
-            "Recommended: 92% strict, 85% moderate, 75% aggressive\n"
-            "Warning: Below 70% may remove panorama overlap images"
-        )
-        self.colmap_duplicate_threshold_label = QLabel("92%")
-        self.colmap_duplicate_threshold.valueChanged.connect(
-            lambda v: self.colmap_duplicate_threshold_label.setText(f"{v}%")
-        )
-        dedup_layout.addWidget(self.colmap_duplicate_threshold)
-        dedup_layout.addWidget(self.colmap_duplicate_threshold_label)
-        dedup_layout.addStretch()
-        external_layout.addLayout(dedup_layout)
-
-        # --- Warp Interpolation Row ---
-        interp_layout = QHBoxLayout()
-        interp_layout.setSpacing(6)
-
-        interp_layout.addWidget(QLabel("Warp Interpolation:"))
-        self.colmap_warp_interpolation = QComboBox()
-        self.colmap_warp_interpolation.addItems(['Linear', 'Cubic', 'Lanczos', 'RealESRGAN'])
-        self.colmap_warp_interpolation.setCurrentIndex(2)  # Lanczos default
-        self.colmap_warp_interpolation.setFixedWidth(120)
-        self.colmap_warp_interpolation.setToolTip(
-            "Interpolation method for warping images during stitching:\n\n"
-            "Linear (Fast):\n"
-            "  - Bilinear interpolation\n"
-            "  - Fastest but may appear slightly soft\n"
-            "  - Good for quick previews\n\n"
-            "Cubic (Balanced):\n"
-            "  - Bicubic interpolation\n"
-            "  - Good balance of speed and quality\n"
-            "  - Sharper than linear\n\n"
-            "Lanczos (Recommended):\n"
-            "  - Highest quality traditional interpolation\n"
-            "  - Best for preserving fine details\n"
-            "  - Minimal blur, sharp results\n\n"
-            "RealESRGAN (AI Enhanced):\n"
-            "  - AI super-resolution enhancement\n"
-            "  - Best quality for microscopy/scientific images\n"
-            "  - Slower but preserves maximum detail\n"
-            "  - Requires realesrgan-ncnn-vulkan installed"
-        )
-        interp_layout.addWidget(self.colmap_warp_interpolation)
-        interp_layout.addStretch()
-        external_layout.addLayout(interp_layout)
-
+        
         # --- HLOC Row ---
         hloc_row = QHBoxLayout()
         hloc_row.setSpacing(6)
-
+        
         self.hloc_status = QLabel("⬜")
         self.hloc_status.setFixedWidth(20)
         hloc_row.addWidget(self.hloc_status)
-
-        hloc_info = QLabel("<b>HLOC</b> - SuperPoint + SuperGlue (best for repetitive scenes)")
+        
+        hloc_info = QLabel("<b>HLOC</b> - SuperPoint + SuperGlue + NetVLAD (best for repetitive scenes)")
         hloc_info.setStyleSheet("font-size: 11px;")
         hloc_row.addWidget(hloc_info, 1)
-
+        
         self.hloc_install_btn = QPushButton("Install")
         self.hloc_install_btn.setFixedWidth(60)
         self.hloc_install_btn.setToolTip("Install HLOC via pip (requires PyTorch)")
         self.hloc_install_btn.clicked.connect(self._install_hloc)
         hloc_row.addWidget(self.hloc_install_btn)
-
+        
         self.hloc_btn = QPushButton("Run")
         self.hloc_btn.setFixedWidth(50)
         self.hloc_btn.setToolTip("Run HLOC pipeline on loaded images")
         self.hloc_btn.clicked.connect(self._run_hloc)
         hloc_row.addWidget(self.hloc_btn)
-
+        
         external_layout.addLayout(hloc_row)
-
-        # --- Meshroom Row (Hidden - 3D scanning, not 2D stitching) ---
+        
+        # --- Meshroom Row ---
+        meshroom_row = QHBoxLayout()
+        meshroom_row.setSpacing(6)
+        
         self.meshroom_status = QLabel("⬜")
+        self.meshroom_status.setFixedWidth(20)
+        meshroom_row.addWidget(self.meshroom_status)
+        
+        meshroom_info = QLabel("<b>Meshroom</b> - AliceVision photogrammetry (3D scanning)")
+        meshroom_info.setStyleSheet("font-size: 11px;")
+        meshroom_row.addWidget(meshroom_info, 1)
+        
         self.meshroom_install_btn = QPushButton("Install")
+        self.meshroom_install_btn.setFixedWidth(60)
+        self.meshroom_install_btn.setToolTip("Download Meshroom (includes AliceVision)")
         self.meshroom_install_btn.clicked.connect(self._install_meshroom)
+        meshroom_row.addWidget(self.meshroom_install_btn)
+        
         self.meshroom_btn = QPushButton("Run")
+        self.meshroom_btn.setFixedWidth(50)
+        self.meshroom_btn.setToolTip("Run Meshroom pipeline on loaded images")
         self.meshroom_btn.clicked.connect(self._run_meshroom)
-
-        # Install All button (Hidden)
+        meshroom_row.addWidget(self.meshroom_btn)
+        
+        external_layout.addLayout(meshroom_row)
+        
+        # Install All button
+        install_all_layout = QHBoxLayout()
+        install_all_layout.addStretch()
         self.install_all_btn = QPushButton("📦 Install All Dependencies")
+        self.install_all_btn.setToolTip(
+            "Attempt to install all external pipeline dependencies:\n"
+            "• HLOC (pip install hloc)\n"
+            "• Opens download pages for COLMAP and Meshroom"
+        )
         self.install_all_btn.clicked.connect(self._install_all_pipelines)
+        install_all_layout.addWidget(self.install_all_btn)
+        install_all_layout.addStretch()
+        external_layout.addLayout(install_all_layout)
         
         # Check availability and update button states
         self._update_external_pipeline_availability()
-
+        
         external_group.setLayout(external_layout)
-        # Store as instance variable - will be added to main layout separately
-        self.external_group = external_group
-
-        # ============================================================
-        # OUTPUT POST-PROCESSING PANEL (visible, applies to COLMAP output)
-        # ============================================================
-        postproc_output_group = QGroupBox("🎨 Output Post-Processing")
-        postproc_output_layout = QVBoxLayout()
-        postproc_output_layout.setSpacing(6)
-
-        # Auto-apply toggle
-        auto_row = QHBoxLayout()
-        self.auto_postproc_checkbox = QCheckBox("Auto-apply after stitching")
-        self.auto_postproc_checkbox.setChecked(False)
-        self.auto_postproc_checkbox.setToolTip(
-            "Automatically apply post-processing after COLMAP completes.\n"
-            "If unchecked, use 'Apply Post-Processing' button manually."
-        )
-        auto_row.addWidget(self.auto_postproc_checkbox)
-        auto_row.addStretch()
-        postproc_output_layout.addLayout(auto_row)
-
-        # Row 1: Basic corrections
-        basic_row = QHBoxLayout()
-
-        self.pp_sharpen_checkbox = QCheckBox("Sharpen")
-        self.pp_sharpen_checkbox.setToolTip("Enhance details with unsharp mask")
-        basic_row.addWidget(self.pp_sharpen_checkbox)
-
-        self.pp_sharpen_spin = QDoubleSpinBox()
-        self.pp_sharpen_spin.setRange(0.1, 3.0)
-        self.pp_sharpen_spin.setValue(1.0)
-        self.pp_sharpen_spin.setSingleStep(0.1)
-        self.pp_sharpen_spin.setFixedWidth(55)
-        self.pp_sharpen_spin.setToolTip("Sharpening strength (0.5=subtle, 1.0=normal, 2.0=strong)")
-        basic_row.addWidget(self.pp_sharpen_spin)
-
-        self.pp_denoise_checkbox = QCheckBox("Denoise")
-        self.pp_denoise_checkbox.setToolTip("Remove noise with non-local means")
-        basic_row.addWidget(self.pp_denoise_checkbox)
-
-        self.pp_denoise_spin = QSpinBox()
-        self.pp_denoise_spin.setRange(1, 20)
-        self.pp_denoise_spin.setValue(5)
-        self.pp_denoise_spin.setFixedWidth(45)
-        self.pp_denoise_spin.setToolTip("Denoise strength (3-5=subtle, 10+=aggressive)")
-        basic_row.addWidget(self.pp_denoise_spin)
-
-        basic_row.addStretch()
-        postproc_output_layout.addLayout(basic_row)
-
-        # Row 2: Contrast and color
-        contrast_row = QHBoxLayout()
-
-        self.pp_clahe_checkbox = QCheckBox("Contrast (CLAHE)")
-        self.pp_clahe_checkbox.setToolTip("Adaptive histogram equalization for local contrast")
-        contrast_row.addWidget(self.pp_clahe_checkbox)
-
-        self.pp_clahe_spin = QDoubleSpinBox()
-        self.pp_clahe_spin.setRange(1.0, 5.0)
-        self.pp_clahe_spin.setValue(2.0)
-        self.pp_clahe_spin.setSingleStep(0.5)
-        self.pp_clahe_spin.setFixedWidth(55)
-        self.pp_clahe_spin.setToolTip("CLAHE clip limit (1.0=subtle, 2.0=normal, 4.0=strong)")
-        contrast_row.addWidget(self.pp_clahe_spin)
-
-        self.pp_shadow_checkbox = QCheckBox("Fix Exposure")
-        self.pp_shadow_checkbox.setToolTip("Equalize exposure across the panorama")
-        contrast_row.addWidget(self.pp_shadow_checkbox)
-
-        self.pp_shadow_spin = QDoubleSpinBox()
-        self.pp_shadow_spin.setRange(0.1, 1.0)
-        self.pp_shadow_spin.setValue(0.5)
-        self.pp_shadow_spin.setSingleStep(0.1)
-        self.pp_shadow_spin.setFixedWidth(55)
-        self.pp_shadow_spin.setToolTip("Exposure fix strength (0.3=subtle, 0.5=moderate, 0.8=strong)")
-        contrast_row.addWidget(self.pp_shadow_spin)
-
-        contrast_row.addStretch()
-        postproc_output_layout.addLayout(contrast_row)
-
-        # Row 3: Advanced corrections
-        advanced_row = QHBoxLayout()
-
-        self.pp_deblur_checkbox = QCheckBox("Deblur")
-        self.pp_deblur_checkbox.setToolTip("Wiener deconvolution to reduce blur")
-        advanced_row.addWidget(self.pp_deblur_checkbox)
-
-        self.pp_deblur_spin = QDoubleSpinBox()
-        self.pp_deblur_spin.setRange(0.5, 5.0)
-        self.pp_deblur_spin.setValue(1.5)
-        self.pp_deblur_spin.setSingleStep(0.5)
-        self.pp_deblur_spin.setFixedWidth(55)
-        self.pp_deblur_spin.setToolTip("Estimated blur radius")
-        advanced_row.addWidget(self.pp_deblur_spin)
-
-        self.pp_white_balance_checkbox = QCheckBox("White Balance")
-        self.pp_white_balance_checkbox.setToolTip("Auto white balance correction")
-        advanced_row.addWidget(self.pp_white_balance_checkbox)
-
-        self.pp_vignette_checkbox = QCheckBox("Remove Vignette")
-        self.pp_vignette_checkbox.setToolTip("Remove lens vignetting (dark corners)")
-        advanced_row.addWidget(self.pp_vignette_checkbox)
-
-        advanced_row.addStretch()
-        postproc_output_layout.addLayout(advanced_row)
-
-        # Row 4: AI enhancements and upscale
-        ai_row = QHBoxLayout()
-
-        self.pp_ai_color_checkbox = QCheckBox("AI Color")
-        self.pp_ai_color_checkbox.setToolTip("AI-powered automatic color correction")
-        ai_row.addWidget(self.pp_ai_color_checkbox)
-
-        self.pp_ai_denoise_checkbox = QCheckBox("AI Denoise")
-        self.pp_ai_denoise_checkbox.setToolTip("AI-powered noise reduction")
-        ai_row.addWidget(self.pp_ai_denoise_checkbox)
-
-        self.pp_super_res_checkbox = QCheckBox("Super Res (AI)")
-        self.pp_super_res_checkbox.setToolTip(
-            "Real-ESRGAN AI super-resolution (2x or 4x)\n\n"
-            "• Much better quality than Lanczos upscaling\n"
-            "• Requires: pip install realesrgan\n"
-            "• GPU recommended (slow on CPU)\n"
-            "• Auto-downloads model on first use (~64MB)"
-        )
-        ai_row.addWidget(self.pp_super_res_checkbox)
-
-        self.pp_super_res_scale_combo = QComboBox()
-        self.pp_super_res_scale_combo.addItems(["2x", "4x"])
-        self.pp_super_res_scale_combo.setToolTip("Super-resolution scale factor")
-        self.pp_super_res_scale_combo.setFixedWidth(50)
-        ai_row.addWidget(self.pp_super_res_scale_combo)
-
-        ai_row.addWidget(QLabel("Lanczos:"))
-        self.pp_upscale_combo = QComboBox()
-        self.pp_upscale_combo.addItems(["1x", "1.5x", "2x", "3x", "4x"])
-        self.pp_upscale_combo.setToolTip(
-            "Traditional Lanczos upscaling (fast)\n"
-            "Use INSTEAD of AI Super Res for speed"
-        )
-        self.pp_upscale_combo.setFixedWidth(55)
-        ai_row.addWidget(self.pp_upscale_combo)
-
-        ai_row.addStretch()
-        postproc_output_layout.addLayout(ai_row)
-
-        # Row 5: Action buttons
-        button_row = QHBoxLayout()
-
-        self.apply_postproc_btn = QPushButton("Apply Post-Processing")
-        self.apply_postproc_btn.setToolTip("Apply post-processing to current result")
-        self.apply_postproc_btn.clicked.connect(self._apply_postprocessing)
-        self.apply_postproc_btn.setEnabled(False)  # Enabled when result exists
-        button_row.addWidget(self.apply_postproc_btn)
-
-        self.reset_postproc_btn = QPushButton("Reset to Original")
-        self.reset_postproc_btn.setToolTip("Revert to original panorama (before post-processing)")
-        self.reset_postproc_btn.clicked.connect(self._reset_postprocessing)
-        self.reset_postproc_btn.setEnabled(False)
-        button_row.addWidget(self.reset_postproc_btn)
-
-        button_row.addStretch()
-        postproc_output_layout.addLayout(button_row)
-
-        postproc_output_group.setLayout(postproc_output_layout)
-        self.postproc_output_group = postproc_output_group
-
+        settings_layout.addWidget(external_group)
+        
         # Feature matcher
         matcher_layout = QHBoxLayout()
         matcher_layout.addWidget(QLabel("Feature Matcher:"))
@@ -1796,14 +988,6 @@ class MainWindow(QMainWindow):
         # Note: upscale not in live preview (too slow for large images)
         
         settings_group.setLayout(settings_layout)
-
-        # Add external pipelines group BEFORE settings (it was moved out of settings_group)
-        layout.addWidget(self.external_group)
-
-        # Add post-processing group after external pipelines
-        layout.addWidget(self.postproc_output_group)
-
-        # Legacy settings group (hidden by default - see end of function)
         layout.addWidget(settings_group)
         
         # Processing
@@ -1834,26 +1018,9 @@ class MainWindow(QMainWindow):
         
         process_group.setLayout(process_layout)
         layout.addWidget(process_group)
-
+        
         layout.addStretch()
-
-        # ============================================================
-        # HIDE LEGACY/NON-PIPELINE FEATURES
-        # The COLMAP pipeline is now the primary workflow.
-        # Legacy internal stitching features are hidden but preserved
-        # for backward compatibility with existing code.
-        # ============================================================
-
-        # Hide legacy settings (kept visible: Image Selection, External Pipelines, Processing)
-        settings_group.setVisible(False)  # Quality, GPU, Feature Detector, etc.
-
-        # Hide legacy processing buttons (keep Stop button visible via process_group)
-        self.btn_grid.setVisible(False)  # Grid Alignment button
-        self.btn_stitch.setVisible(False)  # Legacy Stitch button
-
-        # Rename process group to be clearer
-        process_group.setTitle("Controls")
-
+        
         # Set panel as scroll area content
         scroll_area.setWidget(panel)
         return scroll_area
@@ -1969,8 +1136,7 @@ class MainWindow(QMainWindow):
         
         self.output_path: Optional[Path] = None
         self.current_result = None
-        self.original_result = None  # Store original for post-processing reset
-
+        
         return panel
     
     def init_stitcher(self):
@@ -2166,7 +1332,7 @@ class MainWindow(QMainWindow):
                 added_count += 1
         
         self.log(f"Added {added_count} image(s) from folder. Total: {len(self.image_paths)}")
-
+        
         if added_count < len(image_files):
             QMessageBox.information(
                 self,
@@ -2181,7 +1347,7 @@ class MainWindow(QMainWindow):
             self.image_paths.pop(current)
             self.image_list.takeItem(current)
             self.log("Removed image from list")
-
+    
     def clear_images(self):
         """Clear all images"""
         self.image_paths.clear()
@@ -2397,16 +1563,11 @@ class MainWindow(QMainWindow):
                 raise ValueError(f"Invalid panorama shape: {panorama.shape}")
             
             self.current_result = panorama
-            self.original_result = panorama.copy()  # Store for post-processing reset
             self.update_preview(panorama)
-
-            # Enable post-processing buttons
-            self.apply_postproc_btn.setEnabled(True)
-            self.reset_postproc_btn.setEnabled(True)
-
+            
             self.reset_ui_after_processing()
             self.btn_save.setEnabled(True)
-
+            
             QMessageBox.information(self, "Success", "Stitching completed successfully!")
         except Exception as e:
             logger.error(f"Error handling stitching completion: {e}", exc_info=True)
@@ -2839,74 +2000,118 @@ class MainWindow(QMainWindow):
                 self.log(f"External pipelines module not available: {e}")
     
     def _install_colmap(self):
-        """Install PyCOLMAP automatically in background."""
-        # Disable button during installation
-        self.colmap_install_btn.setEnabled(False)
-        self.colmap_install_btn.setText("...")
-
-        self.log("Starting PyCOLMAP installation...")
-        self.statusBar().showMessage("Installing PyCOLMAP...")
-
-        # Start background installation thread
-        self.colmap_install_thread = COLMAPInstallThread()
-        self.colmap_install_thread.status.connect(self._on_colmap_install_status)
-        self.colmap_install_thread.finished.connect(self._on_colmap_install_finished)
-        self.colmap_install_thread.start()
-
-    def _on_colmap_install_status(self, message: str):
-        """Handle COLMAP installation status updates."""
-        self.log(f"COLMAP Install: {message}")
-        self.statusBar().showMessage(f"COLMAP: {message}")
-
-    def _on_colmap_install_finished(self, success: bool, message: str):
-        """Handle COLMAP installation completion."""
-        self.statusBar().showMessage("Ready")
-
-        if success:
-            self.log(f"✓ {message}")
-            QMessageBox.information(self, "COLMAP Installed", message)
-            self._update_external_pipeline_availability()
-        else:
-            self.log(f"✗ COLMAP installation failed: {message}")
-            QMessageBox.critical(self, "COLMAP Installation Failed", message)
-            # Re-enable button on failure
-            self.colmap_install_btn.setEnabled(True)
-            self.colmap_install_btn.setText("Install")
+        """Open COLMAP download page or run installer."""
+        import webbrowser
+        import platform
+        
+        system = platform.system()
+        
+        if system == "Windows":
+            # Direct download link for Windows
+            reply = QMessageBox.question(
+                self, "Install COLMAP",
+                "COLMAP needs to be downloaded and installed manually on Windows.\n\n"
+                "Steps:\n"
+                "1. Download COLMAP from the official website\n"
+                "2. Extract the ZIP file\n"
+                "3. Add the folder to your PATH\n\n"
+                "Open the COLMAP download page?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                webbrowser.open("https://github.com/colmap/colmap/releases")
+        elif system == "Darwin":  # macOS
+            reply = QMessageBox.question(
+                self, "Install COLMAP",
+                "Install COLMAP using Homebrew?\n\n"
+                "Command: brew install colmap\n\n"
+                "This will open a terminal to run the command.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                import subprocess
+                subprocess.Popen(["open", "-a", "Terminal", "brew install colmap"])
+        else:  # Linux
+            reply = QMessageBox.question(
+                self, "Install COLMAP",
+                "Install COLMAP using apt?\n\n"
+                "Command: sudo apt install colmap\n\n"
+                "You may need to enter your password.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                import subprocess
+                try:
+                    subprocess.run(["pkexec", "apt", "install", "-y", "colmap"], check=True)
+                    QMessageBox.information(self, "Success", "COLMAP installed successfully!")
+                    self._update_external_pipeline_availability()
+                except Exception as e:
+                    QMessageBox.warning(self, "Install Failed", f"Failed to install: {e}")
     
     def _install_hloc(self):
-        """Install HLOC automatically in background using pre-existing pycolmap."""
-        # Disable button during installation
-        self.hloc_install_btn.setEnabled(False)
-        self.hloc_install_btn.setText("...")
+        """Install HLOC via pip from GitHub."""
+        reply = QMessageBox.question(
+            self, "Install HLOC",
+            "Install HLOC (Hierarchical Localization)?\n\n"
+            "HLOC must be installed from GitHub:\n"
+            "  pip install git+https://github.com/cvg/Hierarchical-Localization.git\n\n"
+            "HLOC requires:\n"
+            "• Git (must be installed)\n"
+            "• PyTorch (will be installed if missing)\n"
+            "• COLMAP (for reconstruction backend)\n\n"
+            "This may take several minutes.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
         
-        self.log("Starting HLOC installation...")
-        self.statusBar().showMessage("Installing HLOC...")
-        
-        # Start background installation thread
-        self.hloc_install_thread = HLOCInstallThread()
-        self.hloc_install_thread.status.connect(self._on_hloc_install_status)
-        self.hloc_install_thread.finished.connect(self._on_hloc_install_finished)
-        self.hloc_install_thread.start()
-    
-    def _on_hloc_install_status(self, message: str):
-        """Handle HLOC installation status updates."""
-        self.log(f"HLOC Install: {message}")
-        self.statusBar().showMessage(f"HLOC: {message}")
-    
-    def _on_hloc_install_finished(self, success: bool, message: str):
-        """Handle HLOC installation completion."""
-        self.statusBar().showMessage("Ready")
-        
-        if success:
-            self.log(f"✓ {message}")
-            QMessageBox.information(self, "HLOC Installed", message)
-            self._update_external_pipeline_availability()
-        else:
-            self.log(f"✗ HLOC installation failed: {message}")
-            # Re-enable button on failure
-            self.hloc_install_btn.setEnabled(True)
-            self.hloc_install_btn.setText("Install")
-            QMessageBox.warning(self, "HLOC Installation Failed", message)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.log("Installing HLOC from GitHub... This may take a few minutes.")
+            self.statusBar().showMessage("Installing HLOC...")
+            
+            import subprocess
+            import sys
+            
+            try:
+                # Install HLOC from GitHub (not PyPI)
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", 
+                     "git+https://github.com/cvg/Hierarchical-Localization.git"],
+                    capture_output=True,
+                    text=True,
+                    timeout=900  # 15 minute timeout for git clone + install
+                )
+                
+                if result.returncode == 0:
+                    self.log("HLOC installed successfully!")
+                    QMessageBox.information(self, "Success", "HLOC installed successfully!")
+                    self._update_external_pipeline_availability()
+                else:
+                    error_msg = result.stderr or result.stdout
+                    self.log(f"HLOC installation failed: {error_msg}")
+                    
+                    # Check for common errors
+                    if "git" in error_msg.lower() and "not found" in error_msg.lower():
+                        QMessageBox.warning(
+                            self, "Git Required",
+                            "Git is required to install HLOC.\n\n"
+                            "Please install Git from: https://git-scm.com/download/win\n"
+                            "Then restart this application and try again."
+                        )
+                    else:
+                        QMessageBox.warning(
+                            self, "Install Failed",
+                            f"Failed to install HLOC:\n{error_msg[:500]}\n\n"
+                            "Try manually:\n"
+                            "pip install git+https://github.com/cvg/Hierarchical-Localization.git"
+                        )
+            except subprocess.TimeoutExpired:
+                QMessageBox.warning(self, "Timeout", "Installation timed out. Please try manually:\n\n"
+                    "pip install git+https://github.com/cvg/Hierarchical-Localization.git")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Installation error: {e}\n\n"
+                    "Try manually:\n"
+                    "pip install git+https://github.com/cvg/Hierarchical-Localization.git")
+            
+            self.statusBar().showMessage("Ready")
     
     def _install_meshroom(self):
         """Open Meshroom download page."""
@@ -3052,109 +2257,9 @@ class MainWindow(QMainWindow):
                 return
         
         self.log(f"Preset '{preset_name}' applied successfully")
-
-    def _detect_available_gpus(self):
-        """Detect available CUDA GPUs using multiple methods"""
-        detected = []
-
-        # Helper to log safely (log_text may not exist yet during init)
-        def safe_log(msg):
-            if hasattr(self, 'log_text'):
-                self.log(msg)
-            else:
-                logger.info(msg)
-
-        # Method 1: Try PyTorch (most reliable, gives full info)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    name = torch.cuda.get_device_name(i)
-                    memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)
-                    detected.append(f"GPU {i}: {name} ({memory:.1f}GB)")
-                safe_log(f"Detected {len(detected)} GPU(s) via PyTorch")
-                return detected
-        except Exception as e:
-            safe_log(f"PyTorch GPU detection failed: {e}")
-
-        # Method 2: Try nvidia-smi directly (works on Linux/Windows with CUDA)
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=3
-            )
-            if result.returncode == 0 and result.stdout:
-                for line in result.stdout.strip().split('\n'):
-                    if line:
-                        parts = line.split(',')
-                        if len(parts) >= 3:
-                            idx = parts[0].strip()
-                            name = parts[1].strip()
-                            mem = parts[2].strip()
-                            detected.append(f"GPU {idx}: {name} ({mem})")
-                if detected:
-                    safe_log(f"Detected {len(detected)} GPU(s) via nvidia-smi")
-                    return detected
-        except Exception as e:
-            safe_log(f"nvidia-smi GPU detection failed: {e}")
-
-        # Method 3: Try WSL nvidia-smi for Windows
-        try:
-            import platform
-            import subprocess
-            if platform.system() == "Windows":
-                result = subprocess.run(
-                    ["wsl", "bash", "-c", "nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader"],
-                    capture_output=True,
-                    text=True,
-                    timeout=3
-                )
-                if result.returncode == 0 and result.stdout:
-                    for line in result.stdout.strip().split('\n'):
-                        if line:
-                            parts = line.split(',')
-                            if len(parts) >= 3:
-                                idx = parts[0].strip()
-                                name = parts[1].strip()
-                                mem = parts[2].strip()
-                                detected.append(f"GPU {idx} (WSL): {name} ({mem})")
-                    if detected:
-                        safe_log(f"Detected {len(detected)} GPU(s) via WSL")
-                        return detected
-        except Exception as e:
-            safe_log(f"WSL GPU detection failed: {e}")
-
-        # Method 4: Try checking if pycolmap has CUDA (fallback, no specific GPU info)
-        try:
-            import pycolmap
-            if hasattr(pycolmap, 'has_cuda') and pycolmap.has_cuda:
-                detected.append("GPU 0 (CUDA Available)")
-                safe_log("CUDA available via pycolmap but cannot detect specific GPUs")
-                return detected
-        except:
-            pass
-
-        # No GPUs detected
-        safe_log("No GPUs detected, CPU-only mode")
-        return []
-
-    def _on_colmap_preset_changed(self, index):
-        """Handle COLMAP quality preset changes (only affects feature extraction, not matching)"""
-        if index == 0:  # Original
-            self.colmap_features_spin.setValue(8192)  # Full features
-            self.log("COLMAP Quality: Original (8192 features, full resolution)")
-        elif index == 1:  # Phase 1 - Optimized
-            self.colmap_features_spin.setValue(4096)  # Reduced features
-            self.log("COLMAP Quality: Phase 1 (4096 features, 2x faster extraction)")
-        elif index == 2:  # Phase 2 - Fast
-            self.colmap_features_spin.setValue(2048)  # Minimal features
-            self.log("COLMAP Quality: Phase 2 (2048 features, 3-4x faster extraction)")
-
+    
     def _run_colmap(self):
-        """Run COLMAP pipeline on current images to create a 2D panorama."""
+        """Run COLMAP pipeline on current images."""
         if not self.image_paths:
             QMessageBox.warning(self, "No Images", "Please load images first.")
             return
@@ -3162,449 +2267,50 @@ class MainWindow(QMainWindow):
         try:
             from external.pipelines import COLMAPPipeline
             
-            # Quick availability check (runs on main thread, fast)
-            pipeline = COLMAPPipeline()
+            pipeline = COLMAPPipeline(progress_callback=self._update_progress_slot)
             
             if not pipeline.is_available():
                 reply = QMessageBox.question(
-                    self, "PyCOLMAP Not Found",
-                    "PyCOLMAP is not installed.\n\n" + pipeline.get_install_instructions() + 
-                    "\n\nWould you like to install it now?",
+                    self, "COLMAP Not Found",
+                    "COLMAP is not installed.\n\n" + pipeline.get_install_instructions() + 
+                    "\n\nWould you like to open the COLMAP website?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                 )
                 if reply == QMessageBox.StandardButton.Yes:
                     import webbrowser
-                    webbrowser.open("https://pypi.org/project/pycolmap/")
+                    webbrowser.open("https://colmap.github.io/install.html")
                 return
             
             # Get output directory
             output_dir = QFileDialog.getExistingDirectory(
-                self, "Select Output Directory for COLMAP Panorama"
+                self, "Select Output Directory for COLMAP"
             )
             if not output_dir:
                 return
             
-            # Get transform type from dropdown
-            transform_idx = self.colmap_transform_combo.currentIndex()
-            transform_type = "affine" if transform_idx == 1 else "homography"
-
-            # Get blending method from dropdown
-            blend_map = {
-                "Multiband (Recommended)": "multiband",
-                "Feather": "feather",
-                "AutoStitch": "autostitch",
-                "Linear": "linear"
-            }
-            blend_text = self.colmap_blend_combo.currentText()
-            blend_method = blend_map.get(blend_text, "multiband")
-
-            # Get matching strategy
-            matching_idx = self.colmap_matching_combo.currentIndex()
-            matching_strategies = ["exhaustive", "sequential", "vocab_tree", "grid"]
-            matching_strategy = matching_strategies[matching_idx]
-
-            # Get sequential overlap
-            sequential_overlap = self.colmap_overlap_spin.value()
-
-            # Get GPU selection
-            selected_gpus = []
-            for item in self.colmap_gpu_list.selectedItems():
-                gpu_text = item.text()
-                if "Auto" in gpu_text:
-                    selected_gpus = ["auto"]
-                    break
-                elif "CPU Only" in gpu_text:
-                    selected_gpus = ["cpu"]
-                    break
-                elif "GPU" in gpu_text:
-                    # Extract GPU index from text like "GPU 0: RTX 3090" or "GPU 1 (WSL): Tesla"
-                    import re
-                    match = re.search(r'GPU (\d+)', gpu_text)
-                    if match:
-                        selected_gpus.append(match.group(1))
-
-            if not selected_gpus:
-                selected_gpus = ["auto"]
-
-            # Get thread count and max features
-            num_threads = self.colmap_threads_spin.value()
-            max_features = self.colmap_features_spin.value()
-
-            # Get image filtering parameters
-            min_inliers = self.colmap_min_inliers_spin.value()
-            max_images = self.colmap_max_images_spin.value()
-
-            # Get alpha handling option
-            use_source_alpha = self.colmap_use_source_alpha.isChecked()
-
-            # Get duplicate removal settings
-            remove_duplicates = self.colmap_remove_duplicates.isChecked()
-            duplicate_threshold = self.colmap_duplicate_threshold.value() / 100.0
-
-            # Get warp interpolation setting
-            warp_interpolation = self.colmap_warp_interpolation.currentText().lower()
-
-            # Get border erosion settings
-            erode_border = self.colmap_erode_border.isChecked()
-            border_erosion_pixels = self.colmap_border_erosion_spin.value()
-
-            self.log("Starting COLMAP 2D stitching pipeline...")
-            self.log(f"Processing {len(self.image_paths)} images...")
-            self.log(f"Transform: {transform_type}")
-            self.log(f"Blending: {blend_method}")
-            self.log(f"Matching: {matching_strategy} (overlap={sequential_overlap if matching_strategy == 'sequential' else 'N/A'})")
-            self.log(f"GPUs: {', '.join(selected_gpus)}")
-            self.log(f"Threads: {num_threads}, Max Features: {max_features}")
-            if min_inliers > 0:
-                self.log(f"Filtering: Min inliers={min_inliers}")
-            if max_images > 0:
-                self.log(f"Filtering: Max images={max_images}")
-            if use_source_alpha:
-                self.log("Alpha: Using source image alpha (transparent backgrounds)")
-                if erode_border:
-                    self.log(f"Border erosion: {border_erosion_pixels}px")
-            if remove_duplicates:
-                self.log(f"Duplicate removal: Enabled (threshold={duplicate_threshold:.0%})")
-            self.log(f"Warp interpolation: {warp_interpolation.capitalize()}")
+            self.log("Starting COLMAP pipeline...")
             self.progress_bar.setValue(0)
-
-            # Run in background thread to keep GUI responsive
-            self.colmap_thread = COLMAPThread(
-                self.image_paths,
-                Path(output_dir),
-                transform_type=transform_type,
-                blend_method=blend_method,
-                matching_strategy=matching_strategy,
-                sequential_overlap=sequential_overlap,
-                gpu_indices=selected_gpus,
-                num_threads=num_threads,
-                max_features=max_features,
-                min_inliers=min_inliers,
-                max_images=max_images,
-                use_source_alpha=use_source_alpha,
-                remove_duplicates=remove_duplicates,
-                duplicate_threshold=duplicate_threshold,
-                warp_interpolation=warp_interpolation,
-                erode_border=erode_border,
-                border_erosion_pixels=border_erosion_pixels
-            )
-            self.colmap_thread.progress.connect(self._on_colmap_progress)
-            self.colmap_thread.status.connect(self._on_colmap_status)
-            self.colmap_thread.finished.connect(self._on_colmap_finished)
-            self.colmap_thread.error.connect(self._on_colmap_error)
-            self.colmap_thread.start()
             
-            # Disable buttons during processing
-            self.colmap_btn.setEnabled(False)
-            self.btn_stitch.setEnabled(False)
+            # Run in thread (TODO: proper threading)
+            result = pipeline.run(self.image_paths, Path(output_dir))
+            
+            if result.get("success"):
+                self.log(f"COLMAP complete! {result.get('n_images', 0)} images, "
+                        f"{result.get('n_points3d', 0)} 3D points")
+                QMessageBox.information(
+                    self, "COLMAP Complete",
+                    f"Reconstruction complete!\n\n"
+                    f"Images: {result.get('n_images', 0)}\n"
+                    f"3D Points: {result.get('n_points3d', 0)}\n"
+                    f"Output: {result.get('workspace', '')}"
+                )
+            else:
+                self.log(f"COLMAP failed: {result.get('error', 'Unknown error')}")
                 
         except Exception as e:
             logger.error(f"COLMAP error: {e}", exc_info=True)
             QMessageBox.critical(self, "COLMAP Error", str(e))
     
-    def _on_colmap_progress(self, percentage: int):
-        """Handle COLMAP progress updates."""
-        self.progress_bar.setValue(percentage)
-    
-    def _on_colmap_status(self, message: str):
-        """Handle COLMAP status updates."""
-        self.log(message)
-        self.statusBar().showMessage(message)
-    
-    def _on_colmap_finished(self, result: dict):
-        """Handle COLMAP completion."""
-        # Re-enable buttons
-        self.colmap_btn.setEnabled(True)
-        self.btn_stitch.setEnabled(True)
-
-        if result.get("success"):
-            panorama = result.get("panorama")
-            output_path = result.get("output_path", "")
-            size = result.get("size", (0, 0))
-            gpu_used = result.get("gpu_used", False)
-            n_images = result.get("n_images", 0)
-            n_images_original = result.get("n_images_original", 0)
-            n_duplicates_removed = result.get("n_duplicates_removed", 0)
-
-            mode = "GPU" if gpu_used else "CPU"
-            self.log(f"COLMAP panorama complete ({mode})! Size: {size[1]}x{size[0]} pixels")
-
-            # Report image filtering stats
-            if n_duplicates_removed > 0:
-                filter_msg = f"Processed {n_images}/{n_images_original} images ({n_duplicates_removed} duplicates removed)"
-                self.log(filter_msg)
-
-            self.log(f"Saved to: {output_path}")
-
-            # Store result for display/saving
-            if panorama is not None:
-                self.current_result = panorama
-                self.original_result = panorama.copy()  # Store original for reset
-                self.output_path = Path(output_path)
-
-                # Enable post-processing buttons
-                self.apply_postproc_btn.setEnabled(True)
-                self.reset_postproc_btn.setEnabled(True)
-
-                # Auto-apply post-processing if enabled
-                if self.auto_postproc_checkbox.isChecked() and self._should_apply_postproc():
-                    self.log("Auto-applying post-processing...")
-                    self._apply_postprocessing()
-                else:
-                    self.update_preview(panorama)
-
-            QMessageBox.information(
-                self, "COLMAP Panorama Complete",
-                f"Panorama created successfully!\n\n"
-                f"Mode: {mode}\n"
-                f"Images stitched: {result.get('n_images', 0)}\n"
-                f"Size: {size[1]} x {size[0]} pixels\n"
-                f"Output: {output_path}"
-            )
-        else:
-            error_msg = result.get('error', 'Unknown error')
-            self.log(f"COLMAP stitching failed: {error_msg}")
-            QMessageBox.warning(self, "COLMAP Failed", f"Stitching failed:\n{error_msg}")
-    
-    def _on_colmap_error(self, error_msg: str):
-        """Handle COLMAP errors."""
-        # Re-enable buttons
-        self.colmap_btn.setEnabled(True)
-        self.btn_stitch.setEnabled(True)
-
-        self.log(f"COLMAP error: {error_msg}")
-        QMessageBox.critical(self, "COLMAP Error", error_msg)
-
-    # ============================================================
-    # POST-PROCESSING METHODS
-    # ============================================================
-
-    def _should_apply_postproc(self) -> bool:
-        """Check if any post-processing option is enabled."""
-        return (
-            self.pp_sharpen_checkbox.isChecked() or
-            self.pp_denoise_checkbox.isChecked() or
-            self.pp_clahe_checkbox.isChecked() or
-            self.pp_shadow_checkbox.isChecked() or
-            self.pp_deblur_checkbox.isChecked() or
-            self.pp_white_balance_checkbox.isChecked() or
-            self.pp_vignette_checkbox.isChecked() or
-            self.pp_ai_color_checkbox.isChecked() or
-            self.pp_ai_denoise_checkbox.isChecked() or
-            self.pp_super_res_checkbox.isChecked() or
-            self.pp_upscale_combo.currentIndex() > 0  # Not "1x"
-        )
-
-    def _get_postproc_options(self) -> dict:
-        """Get current post-processing options from GUI."""
-        # Parse Lanczos upscale factor
-        upscale_text = self.pp_upscale_combo.currentText()
-        if "1.5x" in upscale_text:
-            upscale_factor = 1.5
-        elif "2x" in upscale_text:
-            upscale_factor = 2.0
-        elif "3x" in upscale_text:
-            upscale_factor = 3.0
-        elif "4x" in upscale_text:
-            upscale_factor = 4.0
-        else:
-            upscale_factor = 1.0
-
-        # Parse super resolution scale
-        super_res_text = self.pp_super_res_scale_combo.currentText()
-        super_res_scale = 4 if "4x" in super_res_text else 2
-
-        return {
-            'sharpen': self.pp_sharpen_checkbox.isChecked(),
-            'sharpen_amount': self.pp_sharpen_spin.value(),
-            'denoise': self.pp_denoise_checkbox.isChecked(),
-            'denoise_strength': self.pp_denoise_spin.value(),
-            'clahe': self.pp_clahe_checkbox.isChecked(),
-            'clahe_strength': self.pp_clahe_spin.value(),
-            'shadow_removal': self.pp_shadow_checkbox.isChecked(),
-            'shadow_strength': self.pp_shadow_spin.value(),
-            'deblur': self.pp_deblur_checkbox.isChecked(),
-            'deblur_radius': self.pp_deblur_spin.value(),
-            'white_balance': self.pp_white_balance_checkbox.isChecked(),
-            'vignette_removal': self.pp_vignette_checkbox.isChecked(),
-            'ai_color': self.pp_ai_color_checkbox.isChecked(),
-            'ai_denoise': self.pp_ai_denoise_checkbox.isChecked(),
-            'super_resolution': self.pp_super_res_checkbox.isChecked(),
-            'super_res_scale': super_res_scale,
-            'upscale_factor': upscale_factor,
-            'interpolation': 'lanczos'
-        }
-
-    def _apply_postprocessing(self):
-        """Apply post-processing to current result."""
-        if not hasattr(self, 'original_result') or self.original_result is None:
-            self.log("No panorama result to process")
-            return
-
-        options = self._get_postproc_options()
-        if not self._should_apply_postproc():
-            self.log("No post-processing options enabled")
-            return
-
-        try:
-            from core.post_processing import ImagePostProcessor
-            from core.autopano_features import AIPostProcessor
-
-            self.log("Applying post-processing...")
-            self.statusBar().showMessage("Applying post-processing...")
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-
-            # Start from original
-            result = self.original_result.copy()
-
-            # Apply standard post-processing
-            processor = ImagePostProcessor()
-            steps_done = 0
-            total_steps = sum([
-                options.get('shadow_removal', False),
-                options.get('denoise', False),
-                options.get('deblur', False),
-                options.get('clahe', False),
-                options.get('sharpen', False),
-                options.get('white_balance', False),
-                options.get('vignette_removal', False),
-                options.get('ai_color', False),
-                options.get('ai_denoise', False),
-                options.get('super_resolution', False),
-                options.get('upscale_factor', 1.0) > 1.0
-            ])
-            if total_steps == 0:
-                total_steps = 1
-
-            # Apply in order: shadow -> white balance -> vignette -> denoise -> deblur -> clahe -> sharpen -> ai -> upscale
-            if options.get('shadow_removal'):
-                self.log(f"  Fixing exposure (strength={options['shadow_strength']:.1f})...")
-                self.statusBar().showMessage("Fixing exposure...")
-                result = processor.apply_shadow_removal(result, options['shadow_strength'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('white_balance'):
-                self.log("  Applying white balance...")
-                self.statusBar().showMessage("Applying white balance...")
-                result = processor.apply_white_balance(result)
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('vignette_removal'):
-                self.log("  Removing vignette...")
-                self.statusBar().showMessage("Removing vignette...")
-                result = processor.apply_vignette_removal(result)
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('denoise'):
-                self.log(f"  Denoising (strength={options['denoise_strength']})...")
-                self.statusBar().showMessage("Denoising...")
-                result = processor.apply_denoise(result, options['denoise_strength'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('deblur'):
-                self.log(f"  Deblurring (radius={options['deblur_radius']:.1f})...")
-                self.statusBar().showMessage("Deblurring...")
-                result = processor.apply_deblur(result, options['deblur_radius'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('clahe'):
-                self.log(f"  Enhancing contrast (CLAHE strength={options['clahe_strength']:.1f})...")
-                self.statusBar().showMessage("Enhancing contrast...")
-                result = processor.apply_clahe(result, options['clahe_strength'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            if options.get('sharpen'):
-                self.log(f"  Sharpening (amount={options['sharpen_amount']:.1f})...")
-                self.statusBar().showMessage("Sharpening...")
-                result = processor.apply_sharpen(result, options['sharpen_amount'])
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            # Apply AI enhancements
-            if options.get('ai_color') or options.get('ai_denoise'):
-                ai_processor = AIPostProcessor()
-                if options.get('ai_color'):
-                    self.log("  Applying AI color correction...")
-                    self.statusBar().showMessage("AI color correction...")
-                    result = ai_processor._color_correct(result)
-                    steps_done += 1
-                    self.progress_bar.setValue(int(100 * steps_done / total_steps))
-                if options.get('ai_denoise'):
-                    self.log("  Applying AI denoising...")
-                    self.statusBar().showMessage("AI denoising...")
-                    result = ai_processor._denoise(result)
-                    steps_done += 1
-                    self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            # Apply AI super resolution (before Lanczos upscaling)
-            if options.get('super_resolution'):
-                scale = options.get('super_res_scale', 2)
-                self.log(f"  Applying Real-ESRGAN super-resolution ({scale}x)...")
-                self.statusBar().showMessage(f"AI Super-Resolution {scale}x (this may take a while)...")
-
-                def sr_progress(pct, msg):
-                    self.statusBar().showMessage(f"Super-Res: {msg}")
-
-                result = processor.apply_super_resolution(
-                    result,
-                    scale=scale,
-                    model_name='realesrgan-x4plus',
-                    tile_size=512,
-                    progress_callback=sr_progress
-                )
-                steps_done += 1
-                self.progress_bar.setValue(int(100 * steps_done / total_steps))
-
-            # Apply Lanczos upscaling (can be used in addition to or instead of AI)
-            if options.get('upscale_factor', 1.0) > 1.0:
-                factor = options['upscale_factor']
-                self.log(f"  Upscaling {factor}x (Lanczos)...")
-                self.statusBar().showMessage(f"Upscaling {factor}x...")
-                result = processor.apply_upscale(result, factor, 'lanczos')
-                steps_done += 1
-                self.progress_bar.setValue(100)
-
-            # Update result and display
-            self.current_result = result
-            self.update_preview(result)
-
-            # Log size change
-            orig_h, orig_w = self.original_result.shape[:2]
-            new_h, new_w = result.shape[:2]
-            self.log(f"Post-processing complete! Size: {orig_w}x{orig_h} -> {new_w}x{new_h}")
-
-            self.progress_bar.setVisible(False)
-            self.statusBar().showMessage("Post-processing complete", 3000)
-
-        except ImportError as e:
-            self.log(f"Post-processing error: Missing module - {e}")
-            QMessageBox.warning(self, "Post-Processing Error", f"Missing module:\n{e}")
-        except Exception as e:
-            self.log(f"Post-processing error: {e}")
-            QMessageBox.warning(self, "Post-Processing Error", str(e))
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.progress_bar.setVisible(False)
-
-    def _reset_postprocessing(self):
-        """Reset to original panorama (before post-processing)."""
-        if not hasattr(self, 'original_result') or self.original_result is None:
-            self.log("No original result to restore")
-            return
-
-        self.current_result = self.original_result.copy()
-        self.update_preview(self.current_result)
-        self.log("Reset to original panorama (post-processing removed)")
-        self.statusBar().showMessage("Reset to original", 2000)
-
     def _run_hloc(self):
         """Run HLOC pipeline on current images."""
         if not self.image_paths:

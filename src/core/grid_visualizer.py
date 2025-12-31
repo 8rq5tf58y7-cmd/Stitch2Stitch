@@ -83,7 +83,7 @@ class GridVisualizer:
             rotated = cv2.warpAffine(img, M, (new_w, new_h), 
                                       borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(255, 255, 255))
-                else:
+        else:
             rotated = cv2.warpAffine(img, M, (new_w, new_h),
                                       borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=255)
@@ -240,7 +240,7 @@ class GridVisualizer:
             # Convert to RGB if needed
             if len(img.shape) == 2:
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                    else:
+            else:
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
             # Place image (handle white background from rotation as transparent)

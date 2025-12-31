@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile:*)",
+      "Bash(git add:*)",
+      "Bash(git config:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd COLMAP pipeline integration with blending options and auto-installer\n\nMajor features:\n- COLMAP 2D stitching pipeline with affine/homography transform options\n- WSL GPU-accelerated COLMAP support for Windows\n- Blending method selection \\(Multiband, Feather, AutoStitch, Linear\\)\n- One-click automatic COLMAP installer with GPU support\n- HLOC pipeline integration for advanced feature matching\n- Improved error reporting and progress feedback\n\nCOLMAP Pipeline Features:\n- Support for both affine \\(2D planar\\) and homography \\(3D perspective\\) transforms\n- Automatic GPU detection and fallback to CPU\n- WSL bridge for GPU acceleration on Windows\n- PINHOLE camera model for flatbed scans \\(no lens distortion\\)\n- Configurable blending methods using existing ImageBlender\n\nBlending Options:\n- Multiband: Laplacian pyramid blending \\(recommended, best quality\\)\n- Feather: Smooth feathering \\(faster\\)\n- AutoStitch: Puzzle-like pixel selection \\(crisp seams\\)\n- Linear: Simple averaging \\(fastest\\)\n- Graceful fallback to simple blending if ImageBlender unavailable\n\nAuto-Installer:\n- Detects OS and installs appropriate pycolmap version\n- Windows: Installs pycolmap + optionally pycolmap-cuda12 in WSL\n- Linux: Attempts GPU version first, falls back to CPU\n- macOS: Installs CPU version\n- Real-time progress updates and detailed success/failure messages\n\nUI Improvements:\n- Transform type dropdown \\(Homography vs Affine\\)\n- Blending method dropdown with tooltips\n- Status indicators for external pipelines\n- Better progress messages during feature extraction\n- Informative error messages with context\n\nBug Fixes:\n- Fixed HLOC image discovery by passing image_list parameter\n- Fixed WSL COLMAP error reporting \\(now shows full error context\\)\n- Added fallback blending for WSL when ImageBlender import fails\n- Improved feature extraction progress feedback\n\nTechnical Details:\n- Created src/external/ module for pipeline integrations\n- COLMAPPipeline class with native and WSL execution modes\n- HLOCPipeline class for SuperPoint + SuperGlue matching\n- Background installation threads for non-blocking UI\n- Comprehensive debug logging for troubleshooting\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push)",
+      "Bash(images have different dimensions.\"\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(cat:*)",
+      "Bash(find:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(wsl cat:*)",
+      "Bash(wsl.exe bash -c \"cat /tmp/colmap_bbox_debug.txt\")",
+      "Bash(wsl.exe bash -c \"find /tmp -name ''*colmap*'' -o -name ''*stitch*'' 2>/dev/null | head -20\")",
+      "Bash(wsl.exe bash -c \"cat /tmp/colmap_extraction_debug.log\")",
+      "Bash(wsl.exe bash:*)",
+      "Bash(wsl.exe cat:*)",
+      "Bash(wsl.exe --shutdown)",
+      "Bash(timeout /t 2)",
+      "Bash(findstr:*)",
+      "Bash(dir:*)",
+      "Bash(python:*)",
+      "Bash(tasklist:*)"
+    ]
+  }
+}
