@@ -785,3 +785,69 @@ def apply_post_processing(
         interpolation=options.get('interpolation', 'lanczos')
     )
 
+
+# Convenience wrapper for external callers (e.g., WSL bridge) to run Real-ESRGAN.
+def upscale_with_realesrgan(
+    image: np.ndarray,
+    scale: int = 2,
+    model_name: str = "realesrgan-x4plus",
+    tile_size: int = 512,
+    progress_callback: Optional[Callable] = None,
+) -> np.ndarray:
+    """
+    Upscale an image using Real-ESRGAN. Falls back to Lanczos on failure.
+
+    Args:
+        image: Input BGR image.
+        scale: Target scale factor (2 or 4).
+        model_name: Real-ESRGAN model name.
+        tile_size: Tile size for tiled inference (reduces GPU memory).
+        progress_callback: Optional callback(percent, message).
+    """
+    processor = ImagePostProcessor()
+    try:
+        scale_int = int(scale) if scale else 2
+        scale_int = 4 if scale_int >= 4 else 2
+    except Exception:
+        scale_int = 2
+
+    return processor.apply_super_resolution(
+        image,
+        scale=scale_int,
+        model_name=model_name,
+        tile_size=tile_size,
+        progress_callback=progress_callback,
+    )
+
+# Convenience wrapper for external callers (e.g., WSL bridge) to run Real-ESRGAN.
+def upscale_with_realesrgan(
+    image: np.ndarray,
+    scale: int = 2,
+    model_name: str = "realesrgan-x4plus",
+    tile_size: int = 512,
+    progress_callback: Optional[Callable] = None,
+) -> np.ndarray:
+    """
+    Upscale an image using Real-ESRGAN. Falls back to Lanczos on failure.
+
+    Args:
+        image: Input BGR image.
+        scale: Target scale factor (2 or 4).
+        model_name: Real-ESRGAN model name.
+        tile_size: Tile size for tiled inference (reduces GPU memory).
+        progress_callback: Optional callback(percent, message).
+    """
+    processor = ImagePostProcessor()
+    try:
+        scale_int = int(scale) if scale else 2
+        scale_int = 4 if scale_int >= 4 else 2
+    except Exception:
+        scale_int = 2
+
+    return processor.apply_super_resolution(
+        image,
+        scale=scale_int,
+        model_name=model_name,
+        tile_size=tile_size,
+        progress_callback=progress_callback,
+    )

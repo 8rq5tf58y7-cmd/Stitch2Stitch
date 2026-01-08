@@ -21,6 +21,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QImage, QFont
 
 from core.stitcher import ImageStitcher
+from external.wsl_colmap_bridge import compute_cache_key
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -651,7 +652,7 @@ class MainWindow(QMainWindow):
         
         preset_buttons = QHBoxLayout()
         
-        self.preset_few_btn = QPushButton("📷 Few Images\n(2-50)")
+        self.preset_few_btn = QPushButton("ðŸ“· Few Images\n(2-50)")
         self.preset_few_btn.setToolTip(
             "Best for: 2-50 high-quality photos\n\n"
             "Settings:\n"
@@ -663,7 +664,7 @@ class MainWindow(QMainWindow):
         self.preset_few_btn.clicked.connect(lambda: self._apply_preset("few"))
         preset_buttons.addWidget(self.preset_few_btn)
         
-        self.preset_medium_btn = QPushButton("🖼️ Medium Set\n(50-200)")
+        self.preset_medium_btn = QPushButton("ðŸ–¼ï¸ Medium Set\n(50-200)")
         self.preset_medium_btn.setToolTip(
             "Best for: 50-200 images\n\n"
             "Settings:\n"
@@ -675,7 +676,7 @@ class MainWindow(QMainWindow):
         self.preset_medium_btn.clicked.connect(lambda: self._apply_preset("medium"))
         preset_buttons.addWidget(self.preset_medium_btn)
         
-        self.preset_large_btn = QPushButton("🗺️ Large Set\n(200-500)")
+        self.preset_large_btn = QPushButton("ðŸ—ºï¸ Large Set\n(200-500)")
         self.preset_large_btn.setToolTip(
             "Best for: 200-500 images\n\n"
             "Settings:\n"
@@ -687,10 +688,10 @@ class MainWindow(QMainWindow):
         self.preset_large_btn.clicked.connect(lambda: self._apply_preset("large"))
         preset_buttons.addWidget(self.preset_large_btn)
         
-        self.preset_gigapixel_btn = QPushButton("🌍 Gigapixel\n(500+)")
+        self.preset_gigapixel_btn = QPushButton("ðŸŒ Gigapixel\n(500+)")
         self.preset_gigapixel_btn.setToolTip(
             "Best for: 500+ images (gigapixel panoramas)\n\n"
-            "⚠️ RECOMMENDED: Use External Pipelines\n"
+            "âš ï¸ RECOMMENDED: Use External Pipelines\n"
             "(COLMAP or HLOC below)\n\n"
             "Built-in settings:\n"
             "• SuperPoint + MAGSAC++\n"
@@ -872,7 +873,7 @@ class MainWindow(QMainWindow):
         colmap_row = QHBoxLayout()
         colmap_row.setSpacing(6)
         
-        self.colmap_status = QLabel("⬜")
+        self.colmap_status = QLabel("?")
         self.colmap_status.setFixedWidth(20)
         colmap_row.addWidget(self.colmap_status)
         
@@ -891,6 +892,13 @@ class MainWindow(QMainWindow):
         self.colmap_btn.setToolTip("Run COLMAP pipeline on loaded images")
         self.colmap_btn.clicked.connect(self._run_colmap)
         colmap_row.addWidget(self.colmap_btn)
+
+        self.reblend_btn = QPushButton("Reblend")
+        self.reblend_btn.setFixedWidth(60)
+        self.reblend_btn.setToolTip("Re-stitch last run with different blend/interpolation (fast, no re-matching)")
+        self.reblend_btn.clicked.connect(self._reblend_last)
+        self.reblend_btn.setEnabled(False)
+        colmap_row.addWidget(self.reblend_btn)
 
         external_layout.addLayout(colmap_row)
 
@@ -918,13 +926,15 @@ class MainWindow(QMainWindow):
             "Multiband (Recommended)",
             "Feather",
             "AutoStitch",
+            "Mosaic",
             "Linear"
         ])
         self.colmap_blend_combo.setCurrentIndex(0)  # Default to multiband
         self.colmap_blend_combo.setToolTip(
             "Multiband: Best quality, Laplacian pyramid blending\n"
             "Feather: Smooth feathering, faster\n"
-            "AutoStitch: Puzzle-like selection with seam feathering\n"
+            "AutoStitch: Puzzle-like selection (edge-distance priority)\n"
+            "Mosaic: Puzzle-like selection (center-distance priority)\n"
             "Linear: Simple averaging, fastest"
         )
         blend_layout.addWidget(self.colmap_blend_combo)
@@ -957,25 +967,31 @@ class MainWindow(QMainWindow):
         self.colmap_matching_combo.addItems([
             "Exhaustive (All Pairs)",
             "Sequential (Consecutive)",
+            "Neighbor (Flatbed Scans)",
             "Vocabulary Tree (Visual Similarity)",
             "Grid-Aware (Grid Neighbors)"
         ])
         self.colmap_matching_combo.setCurrentIndex(0)
         self.colmap_matching_combo.setToolTip(
-            "Exhaustive: Test all N*(N-1)/2 pairs\n"
+            "Exhaustive: Test all N*(N-1)/2 pairs (slow but thorough)\n"
             "Sequential: Match consecutive images only\n"
+            "Neighbor: K nearest neighbors + skip connections (fast, ideal for flatbed scans)\n"
             "Vocabulary Tree: Match visually similar images\n"
             "Grid-Aware: Match detected grid neighbors"
         )
         matching_layout.addWidget(self.colmap_matching_combo)
 
-        # Sequential overlap parameter
-        matching_layout.addWidget(QLabel("Overlap:"))
+        # Sequential overlap / neighbor K parameter
+        matching_layout.addWidget(QLabel("Neighbors:"))
         self.colmap_overlap_spin = QSpinBox()
         self.colmap_overlap_spin.setMinimum(1)
-        self.colmap_overlap_spin.setMaximum(50)
-        self.colmap_overlap_spin.setValue(10)
-        self.colmap_overlap_spin.setToolTip("For sequential matching: number of consecutive images to match")
+        self.colmap_overlap_spin.setMaximum(100)
+        self.colmap_overlap_spin.setValue(20)
+        self.colmap_overlap_spin.setToolTip(
+            "Number of nearby images to match:\n"
+            "• Sequential: consecutive images to check\n"
+            "• Neighbor: K nearest neighbors (20-30 recommended for flatbed scans)"
+        )
         matching_layout.addWidget(self.colmap_overlap_spin)
 
         external_layout.addLayout(matching_layout)
@@ -1039,9 +1055,9 @@ class MainWindow(QMainWindow):
         params_group.addWidget(QLabel("Max Features:"))
         self.colmap_features_spin = QSpinBox()
         self.colmap_features_spin.setMinimum(512)
-        self.colmap_features_spin.setMaximum(65536)  # Increased for better alignment
-        self.colmap_features_spin.setValue(8192)
-        self.colmap_features_spin.setSingleStep(1024)
+        self.colmap_features_spin.setMaximum(65536)
+        self.colmap_features_spin.setValue(2048)  # Reduced from 8192 for faster matching
+        self.colmap_features_spin.setSingleStep(512)
         self.colmap_features_spin.setToolTip(
             "Maximum SIFT features per image:\n\n"
             "Recommended by image count:\n"
@@ -1223,7 +1239,7 @@ class MainWindow(QMainWindow):
         hloc_row = QHBoxLayout()
         hloc_row.setSpacing(6)
 
-        self.hloc_status = QLabel("⬜")
+        self.hloc_status = QLabel("â¬œ")
         self.hloc_status.setFixedWidth(20)
         hloc_row.addWidget(self.hloc_status)
 
@@ -1246,14 +1262,14 @@ class MainWindow(QMainWindow):
         external_layout.addLayout(hloc_row)
 
         # --- Meshroom Row (Hidden - 3D scanning, not 2D stitching) ---
-        self.meshroom_status = QLabel("⬜")
+        self.meshroom_status = QLabel("â¬œ")
         self.meshroom_install_btn = QPushButton("Install")
         self.meshroom_install_btn.clicked.connect(self._install_meshroom)
         self.meshroom_btn = QPushButton("Run")
         self.meshroom_btn.clicked.connect(self._run_meshroom)
 
         # Install All button (Hidden)
-        self.install_all_btn = QPushButton("📦 Install All Dependencies")
+        self.install_all_btn = QPushButton("ðŸ“¦ Install All Dependencies")
         self.install_all_btn.clicked.connect(self._install_all_pipelines)
         
         # Check availability and update button states
@@ -1452,6 +1468,7 @@ class MainWindow(QMainWindow):
             "Semantic (Foreground-Aware)",
             "PixelStitch (Structure-Preserving)",
             "AutoStitch (Simple & Fast)",
+            "Mosaic (Center Priority)",
             "Generative AI (Best Quality)"
         ])
         blend_layout.addWidget(self.blend_combo)
@@ -1506,7 +1523,62 @@ class MainWindow(QMainWindow):
         
         blend_options_group.setLayout(blend_options_layout)
         settings_layout.addWidget(blend_options_group)
-        
+
+        # Alpha Channel & Border Handling (for AutoStitch edge fix)
+        alpha_group = QGroupBox("Alpha Channel & Border Handling")
+        alpha_layout = QVBoxLayout()
+
+        # Enable alpha channels checkbox
+        self.create_alpha_checkbox = QCheckBox("Create alpha channels for warped images")
+        self.create_alpha_checkbox.setChecked(True)  # On by default
+        self.create_alpha_checkbox.setToolTip(
+            "Create alpha channels to mark transformation borders\n\n"
+            "FIXES AUTOSTITCH EDGE ISSUES:\n"
+            "• Prevents black transformation borders from appearing in output\n"
+            "• Eliminates edge misalignment and duplication\n"
+            "• Essential for AutoStitch blending method\n\n"
+            "Recommended: Keep ON (especially with AutoStitch)"
+        )
+        alpha_layout.addWidget(self.create_alpha_checkbox)
+
+        # Auto-detect circular images checkbox
+        self.auto_detect_circular_checkbox = QCheckBox("Auto-detect circular/round images")
+        self.auto_detect_circular_checkbox.setChecked(True)  # On by default
+        self.auto_detect_circular_checkbox.setToolTip(
+            "Automatically detect and mask circular/round images\n\n"
+            "Useful for:\n"
+            "• Microscope images with circular apertures\n"
+            "• Round scans with dark borders\n"
+            "• Images with non-rectangular content\n\n"
+            "Creates smooth geometric masks using ellipse fitting"
+        )
+        alpha_layout.addWidget(self.auto_detect_circular_checkbox)
+
+        # Border erosion control
+        border_erosion_layout = QHBoxLayout()
+        border_erosion_layout.addWidget(QLabel("Border erosion:"))
+        self.border_erosion_spin = QSpinBox()
+        self.border_erosion_spin.setRange(0, 20)
+        self.border_erosion_spin.setValue(5)
+        self.border_erosion_spin.setSuffix(" px")
+        self.border_erosion_spin.setFixedWidth(70)
+        self.border_erosion_spin.setToolTip(
+            "Pixels to erode from alpha mask edges\n\n"
+            "Removes thin dark borders from image edges:\n"
+            "• 0 px: No erosion\n"
+            "• 1-3 px: Light erosion (thin borders)\n"
+            "• 4-6 px: Medium erosion (typical borders)\n"
+            "• 7-10 px: Heavy erosion (thick borders)\n"
+            "• 10+ px: Aggressive (use if borders still visible)\n\n"
+            "Adjust based on your image resolution and border thickness"
+        )
+        border_erosion_layout.addWidget(self.border_erosion_spin)
+        border_erosion_layout.addStretch()
+        alpha_layout.addLayout(border_erosion_layout)
+
+        alpha_group.setLayout(alpha_layout)
+        settings_layout.addWidget(alpha_group)
+
         # Semantic blending options (shown only when Semantic is selected)
         self.semantic_options_group = QGroupBox("Semantic Options")
         semantic_layout = QVBoxLayout()
@@ -1671,7 +1743,7 @@ class MainWindow(QMainWindow):
         self.max_panorama_spin.setRange(0, 2000)
         self.max_panorama_spin.setValue(500)  # 500MP = ~22000x22000 (generous gigapixel)
         self.max_panorama_spin.setSuffix("MP")
-        self.max_panorama_spin.setSpecialValueText("∞ (No Limit)")
+        self.max_panorama_spin.setSpecialValueText("âˆž (No Limit)")
         self.max_panorama_spin.setToolTip(
             "Maximum final panorama size in megapixels.\n"
             "500MP = ~22000x22000 pixels (default)\n"
@@ -1697,7 +1769,7 @@ class MainWindow(QMainWindow):
         self.max_warp_spin.setRange(0, 500)
         self.max_warp_spin.setValue(0)  # Let blender handle scaling globally
         self.max_warp_spin.setSuffix("MP")
-        self.max_warp_spin.setSpecialValueText("∞ (Full Res)")
+        self.max_warp_spin.setSpecialValueText("âˆž (Full Res)")
         self.max_warp_spin.setToolTip(
             "Maximum size for individual warped images.\n"
             "0 = No limit (recommended for quality)\n"
@@ -1877,7 +1949,7 @@ class MainWindow(QMainWindow):
         zoom_label = QLabel("Zoom:")
         preview_controls.addWidget(zoom_label)
         
-        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out = QPushButton("âˆ’")
         self.btn_zoom_out.setFixedWidth(30)
         self.btn_zoom_out.setToolTip("Zoom out (Ctrl+-)")
         self.btn_zoom_out.clicked.connect(self.zoom_out)
@@ -1941,7 +2013,7 @@ class MainWindow(QMainWindow):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Courier", 9))
+        self.log_text.setFont(QFont("Segoe UI Emoji", 9))  # Emoji-capable font
         logs_layout.addWidget(self.log_text)
         
         tabs.addTab(logs_tab, "Logs")
@@ -2003,6 +2075,7 @@ class MainWindow(QMainWindow):
                 "Semantic (Foreground-Aware)": "semantic",
                 "PixelStitch (Structure-Preserving)": "pixelstitch",
                 "AutoStitch (Simple & Fast)": "autostitch",
+                "Mosaic (Center Priority)": "mosaic",
                 "Generative AI (Best Quality)": "generative"
             }
             
@@ -2103,6 +2176,10 @@ class MainWindow(QMainWindow):
                 remove_duplicates=remove_duplicates,
                 duplicate_threshold=duplicate_threshold,
                 optimize_alignment=self.optimize_alignment_checkbox.isChecked(),
+                # Alpha channel and border handling (autostitch edge fix)
+                create_alpha_channels=self.create_alpha_checkbox.isChecked(),
+                auto_detect_circular=self.auto_detect_circular_checkbox.isChecked(),
+                border_erosion_pixels=self.border_erosion_spin.value(),
                 alignment_optimization_level=self.optimization_level_combo.currentText().lower(),
                 # AutoPano Giga-inspired features
                 use_grid_topology=self.grid_topology_checkbox.isChecked(),
@@ -2763,23 +2840,23 @@ class MainWindow(QMainWindow):
             if colmap_info.get("available", False):
                 info_text = colmap_info.get("info", "COLMAP")
                 path_text = colmap_info.get("path", "")
-                self.colmap_status.setText("✅")
+                self.colmap_status.setText("[OK]")
                 self.colmap_status.setToolTip(f"COLMAP is installed and ready\n{info_text}\nPath: {path_text}")
                 self.colmap_btn.setEnabled(True)
                 self.colmap_btn.setStyleSheet("background-color: #4CAF50; color: white;")
-                self.colmap_install_btn.setText("✓")
+                self.colmap_install_btn.setText("OK")
                 self.colmap_install_btn.setEnabled(False)
                 if can_log:
-                    self.log(f"  ✅ COLMAP: {info_text}")
+                    self.log(f"  [OK] COLMAP: {info_text}")
             else:
-                self.colmap_status.setText("❌")
+                self.colmap_status.setText("[X]")
                 self.colmap_status.setToolTip("COLMAP is not installed\nChecked: PATH, conda envs, common locations")
                 self.colmap_btn.setEnabled(False)
                 self.colmap_btn.setStyleSheet("")
                 self.colmap_install_btn.setText("Install")
                 self.colmap_install_btn.setEnabled(True)
                 if can_log:
-                    self.log("  ❌ COLMAP: Not found")
+                    self.log("  [X] COLMAP: Not found")
             
             # HLOC status
             hloc_info = available.get("hloc", {})
@@ -2793,46 +2870,46 @@ class MainWindow(QMainWindow):
                 if hloc_info.get("has_netvlad"):
                     components.append("NetVLAD")
                     
-                self.hloc_status.setText("✅")
+                self.hloc_status.setText("[OK]")
                 self.hloc_status.setToolTip(f"HLOC is installed and ready\n{info_text}")
                 self.hloc_btn.setEnabled(True)
                 self.hloc_btn.setStyleSheet("background-color: #4CAF50; color: white;")
-                self.hloc_install_btn.setText("✓")
+                self.hloc_install_btn.setText("OK")
                 self.hloc_install_btn.setEnabled(False)
                 if can_log:
                     self.log(f"  ✅ HLOC: {info_text}")
             else:
-                self.hloc_status.setText("❌")
+                self.hloc_status.setText("[X]")
                 self.hloc_status.setToolTip("HLOC is not installed\nInstall with: pip install hloc")
                 self.hloc_btn.setEnabled(False)
                 self.hloc_btn.setStyleSheet("")
                 self.hloc_install_btn.setText("Install")
                 self.hloc_install_btn.setEnabled(True)
                 if can_log:
-                    self.log("  ❌ HLOC: Not found (pip install hloc)")
+                    self.log("  [X] HLOC: Not found (pip install hloc)")
             
             # Meshroom/AliceVision status
             alice_info = available.get("alicevision", {})
             if alice_info.get("available", False):
                 info_text = alice_info.get("info", "AliceVision")
                 path_text = alice_info.get("path", "")
-                self.meshroom_status.setText("✅")
+                self.meshroom_status.setText("[OK]")
                 self.meshroom_status.setToolTip(f"AliceVision/Meshroom is installed\n{info_text}\nPath: {path_text}")
                 self.meshroom_btn.setEnabled(True)
                 self.meshroom_btn.setStyleSheet("background-color: #4CAF50; color: white;")
-                self.meshroom_install_btn.setText("✓")
+                self.meshroom_install_btn.setText("OK")
                 self.meshroom_install_btn.setEnabled(False)
                 if can_log:
                     self.log(f"  ✅ AliceVision: {info_text}")
             else:
-                self.meshroom_status.setText("❌")
+                self.meshroom_status.setText("[X]")
                 self.meshroom_status.setToolTip("AliceVision/Meshroom is not installed\nDownload from alicevision.org")
                 self.meshroom_btn.setEnabled(False)
                 self.meshroom_btn.setStyleSheet("")
                 self.meshroom_install_btn.setText("Install")
                 self.meshroom_install_btn.setEnabled(True)
                 if can_log:
-                    self.log("  ❌ AliceVision: Not found")
+                    self.log("  [X] AliceVision: Not found")
                 
         except ImportError as e:
             if hasattr(self, 'log_text') and self.log_text is not None:
@@ -2863,7 +2940,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
         if success:
-            self.log(f"✓ {message}")
+            self.log(f"âœ“ {message}")
             QMessageBox.information(self, "COLMAP Installed", message)
             self._update_external_pipeline_availability()
         else:
@@ -2898,7 +2975,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
         
         if success:
-            self.log(f"✓ {message}")
+            self.log(f"âœ“ {message}")
             QMessageBox.information(self, "HLOC Installed", message)
             self._update_external_pipeline_availability()
         else:
@@ -3144,7 +3221,7 @@ class MainWindow(QMainWindow):
     def _on_colmap_preset_changed(self, index):
         """Handle COLMAP quality preset changes (only affects feature extraction, not matching)"""
         if index == 0:  # Original
-            self.colmap_features_spin.setValue(8192)  # Full features
+            self.colmap_features_spin.setValue(4096)  # Good features
             self.log("COLMAP Quality: Original (8192 features, full resolution)")
         elif index == 1:  # Phase 1 - Optimized
             self.colmap_features_spin.setValue(4096)  # Reduced features
@@ -3193,6 +3270,7 @@ class MainWindow(QMainWindow):
                 "Multiband (Recommended)": "multiband",
                 "Feather": "feather",
                 "AutoStitch": "autostitch",
+                "Mosaic": "mosaic",
                 "Linear": "linear"
             }
             blend_text = self.colmap_blend_combo.currentText()
@@ -3200,7 +3278,7 @@ class MainWindow(QMainWindow):
 
             # Get matching strategy
             matching_idx = self.colmap_matching_combo.currentIndex()
-            matching_strategies = ["exhaustive", "sequential", "vocab_tree", "grid"]
+            matching_strategies = ["exhaustive", "sequential", "neighbor", "vocab_tree", "grid"]
             matching_strategy = matching_strategies[matching_idx]
 
             # Get sequential overlap
@@ -3292,8 +3370,24 @@ class MainWindow(QMainWindow):
             self.colmap_thread.status.connect(self._on_colmap_status)
             self.colmap_thread.finished.connect(self._on_colmap_finished)
             self.colmap_thread.error.connect(self._on_colmap_error)
+
+            # Store parameters for reblend feature
+            self._last_run_params = {
+                "transform_type": transform_type,
+                "blend_method": blend_method,
+                "matching_strategy": matching_strategy,
+                "sequential_overlap": sequential_overlap,
+                "max_features": max_features,
+                "min_inliers": min_inliers,
+                "max_images": max_images,
+                "warp_interpolation": warp_interpolation,
+                "output_dir": Path(output_dir),
+                "erode_border": erode_border,
+                "border_erosion_pixels": border_erosion_pixels,
+            }
+
             self.colmap_thread.start()
-            
+
             # Disable buttons during processing
             self.colmap_btn.setEnabled(False)
             self.btn_stitch.setEnabled(False)
@@ -3337,22 +3431,15 @@ class MainWindow(QMainWindow):
             self.log(f"Saved to: {output_path}")
 
             # Store result for display/saving
+            # Load panorama from disk if not in result (WSL can't pass large arrays)
             if panorama is None and output_path:
-                # WSL bridge typically returns only an output path; load it for preview/post-processing.
                 try:
-                    import cv2
-                    loaded = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
-                    if loaded is None:
-                        self.log(f"[WARNING] Could not load panorama from disk for preview: {output_path}")
-                    else:
-                        # Normalize to BGR for the rest of the app
-                        if loaded.ndim == 3 and loaded.shape[2] == 4:
-                            loaded = cv2.cvtColor(loaded, cv2.COLOR_BGRA2BGR)
-                        panorama = loaded
+                    panorama = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+                    if panorama is not None:
                         self.log("Loaded panorama from disk for preview.")
                 except Exception as e:
-                    self.log(f"[WARNING] Failed to load panorama from disk for preview: {e}")
-
+                    self.log(f"Failed to load panorama from disk: {e}")
+            
             if panorama is not None:
                 self.current_result = panorama
                 self.original_result = panorama.copy()  # Store original for reset
@@ -3368,6 +3455,23 @@ class MainWindow(QMainWindow):
                     self._apply_postprocessing()
                 else:
                     self.update_preview(panorama)
+
+                # Enable reblend and store cache info for reuse
+                try:
+                    use_affine = self._last_run_params.get("transform_type") == "affine"
+                    self._last_cache_key = compute_cache_key(
+                        self.image_paths,
+                        self._last_run_params.get("max_features", 8192),
+                        matcher_type=self._last_run_params.get("matching_strategy", "exhaustive"),
+                        use_affine=use_affine,
+                        blend_method=self._last_run_params.get("blend_method", "multiband"),
+                        warp_interpolation=self._last_run_params.get("warp_interpolation", "linear"),
+                    )
+                    self._last_image_paths = list(self.image_paths)
+                    self._last_output_dir = self._last_run_params.get("output_dir", Path(output_path).parent)
+                    self.reblend_btn.setEnabled(True)
+                except Exception as e:
+                    self.log(f'Reblend setup failed: {e}')  # Log but don't fail
 
             QMessageBox.information(
                 self, "COLMAP Panorama Complete",
@@ -3390,6 +3494,63 @@ class MainWindow(QMainWindow):
 
         self.log(f"COLMAP error: {error_msg}")
         QMessageBox.critical(self, "COLMAP Error", error_msg)
+
+    def _reblend_last(self):
+        """Reblend using the last cached database (no feature extraction/matching)."""
+        if not self._last_cache_key or not self._last_image_paths:
+            QMessageBox.information(self, "Reblend", "No previous COLMAP run available to reblend.\nRun a full stitch first.")
+            return
+        try:
+            from external.pipelines import COLMAPPipeline
+
+            self.colmap_btn.setEnabled(False)
+            self.btn_stitch.setEnabled(False)
+            self.reblend_btn.setEnabled(False)
+            self.statusBar().showMessage("Reblending panorama...")
+            self.log("Starting reblend of last COLMAP run...")
+
+            blend_text = self.colmap_blend_combo.currentText().split()[0].lower()
+            blend_method = "multiband" if blend_text == "multiband" else ("feather" if blend_text == "feather" else ("autostitch" if blend_text == "autostitch" else "linear"))
+            warp_text = self.warp_interp_combo.currentText().split()[0].lower()
+
+            pipeline = COLMAPPipeline(
+                use_gpu=True,
+                use_affine=self._last_run_params.get("transform_type") == "affine",
+                blend_method=blend_method,
+                warp_interpolation=warp_text,
+                erode_border=self._last_run_params.get("erode_border", True),
+                border_erosion_pixels=self._last_run_params.get("border_erosion_pixels", 5),
+                progress_callback=self._update_progress_slot,
+            )
+            pipeline._last_cache_key = self._last_cache_key
+            out_dir = self._last_output_dir or (self.output_path.parent if hasattr(self, "output_path") and self.output_path else Path.home())
+            result = pipeline.reblend_last(self._last_image_paths, out_dir)
+
+            self.colmap_btn.setEnabled(True)
+            self.btn_stitch.setEnabled(True)
+            self.reblend_btn.setEnabled(True)
+
+            if result.get("success") and result.get("output_path"):
+                pano_path = Path(result["output_path"])
+                img = cv2.imread(str(pano_path), cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    self.current_result = img
+                    self.original_result = img.copy()
+                    self.update_preview(img)
+                    self.log(f"Reblend complete. Saved to: {pano_path}")
+                    self.statusBar().showMessage("Reblend complete!")
+                    return
+            error_msg = result.get("error", "Unknown error")
+            self.log(f"Reblend failed: {error_msg}")
+            QMessageBox.warning(self, "Reblend Failed", error_msg)
+            self.statusBar().showMessage("Reblend failed")
+        except Exception as e:
+            self.colmap_btn.setEnabled(True)
+            self.btn_stitch.setEnabled(True)
+            self.reblend_btn.setEnabled(True)
+            self.log(f"Reblend error: {e}")
+            QMessageBox.warning(self, "Reblend Error", str(e))
+            self.statusBar().showMessage("Reblend error")
 
     # ============================================================
     # POST-PROCESSING METHODS
@@ -3644,6 +3805,381 @@ class MainWindow(QMainWindow):
                     webbrowser.open("https://github.com/cvg/Hierarchical-Localization")
                 return
             
+            # Get output directory
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for HLOC"
+            )
+            if not output_dir:
+                return
+            
+            self.log("Starting HLOC pipeline (SuperPoint + SuperGlue)...")
+            self.progress_bar.setValue(0)
+            
+            result = pipeline.run(self.image_paths, Path(output_dir))
+            
+            if result.get("success"):
+                self.log(f"HLOC complete! {result.get('n_images', 0)} images processed")
+                QMessageBox.information(
+                    self, "HLOC Complete",
+                    f"Reconstruction complete!\n\n"
+                    f"Images: {result.get('n_images', 0)}\n"
+                    f"Output: {result.get('workspace', '')}"
+                )
+            else:
+                self.log(f"HLOC failed: {result.get('message', 'Unknown error')}")
+                
+        except Exception as e:
+            logger.error(f"HLOC error: {e}", exc_info=True)
+            QMessageBox.critical(self, "HLOC Error", str(e))
+    
+    def _run_meshroom(self):
+        """Run AliceVision/Meshroom pipeline or open Meshroom GUI."""
+        if not self.image_paths:
+            QMessageBox.warning(self, "No Images", "Please load images first.")
+            return
+        
+        try:
+            from external.pipelines import AliceVisionPipeline
+            
+            pipeline = AliceVisionPipeline()
+            
+            if not pipeline.is_available():
+                reply = QMessageBox.question(
+                    self, "Meshroom Not Found",
+                    "Meshroom/AliceVision is not installed.\n\n" + 
+                    pipeline.get_install_instructions() +
+                    "\n\nWould you like to open the Meshroom download page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open("https://alicevision.org/#meshroom")
+                return
+            
+            # For now, suggest using Meshroom GUI directly
+            QMessageBox.information(
+                self, "Meshroom",
+                "For best results, please use Meshroom GUI directly:\n\n"
+                "1. Open Meshroom\n"
+                "2. Drag your images into the Images panel\n"
+                "3. Click 'Start' to begin reconstruction\n\n"
+                "Meshroom provides a visual pipeline editor and\n"
+                "real-time progress monitoring."
+            )
+            
+        except Exception as e:
+            logger.error(f"Meshroom error: {e}", exc_info=True)
+            QMessageBox.critical(self, "Meshroom Error", str(e))
+    
+    def _update_progress_slot(self, percent: int, message: str):
+        """Progress callback for external pipelines."""
+        self.progress_bar.setValue(percent)
+        if message:
+            self.log(message)
+
+    def run_hloc_pipeline(self):
+        """Run HLOC pipeline for reconstruction."""
+        try:
+            # Get output directory
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for HLOC"
+            )
+            if not output_dir:
+                return
+            
+            self.log("Starting HLOC pipeline (SuperPoint + SuperGlue)...")
+            self.progress_bar.setValue(0)
+            
+            result = pipeline.run(self.image_paths, Path(output_dir))
+            
+            if result.get("success"):
+                self.log(f"HLOC complete! {result.get('n_images', 0)} images processed")
+                QMessageBox.information(
+                    self, "HLOC Complete",
+                    f"Reconstruction complete!\n\n"
+                    f"Images: {result.get('n_images', 0)}\n"
+                    f"Output: {result.get('workspace', '')}"
+                )
+            else:
+                self.log(f"HLOC failed: {result.get('message', 'Unknown error')}")
+                
+        except Exception as e:
+            logger.error(f"HLOC error: {e}", exc_info=True)
+            QMessageBox.critical(self, "HLOC Error", str(e))
+    
+    def _run_meshroom(self):
+        """Run AliceVision/Meshroom pipeline or open Meshroom GUI."""
+        if not self.image_paths:
+            QMessageBox.warning(self, "No Images", "Please load images first.")
+            return
+        
+        try:
+            from external.pipelines import AliceVisionPipeline
+            
+            pipeline = AliceVisionPipeline()
+            
+            if not pipeline.is_available():
+                reply = QMessageBox.question(
+                    self, "Meshroom Not Found",
+                    "Meshroom/AliceVision is not installed.\n\n" + 
+                    pipeline.get_install_instructions() +
+                    "\n\nWould you like to open the Meshroom download page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open("https://alicevision.org/#meshroom")
+                return
+            
+            # For now, suggest using Meshroom GUI directly
+            QMessageBox.information(
+                self, "Meshroom",
+                "For best results, please use Meshroom GUI directly:\n\n"
+                "1. Open Meshroom\n"
+                "2. Drag your images into the Images panel\n"
+                "3. Click 'Start' to begin reconstruction\n\n"
+                "Meshroom provides a visual pipeline editor and\n"
+                "real-time progress monitoring."
+            )
+            
+        except Exception as e:
+            logger.error(f"Meshroom error: {e}", exc_info=True)
+            QMessageBox.critical(self, "Meshroom Error", str(e))
+    
+    def _update_progress_slot(self, percent: int, message: str):
+        """Progress callback for external pipelines."""
+        self.progress_bar.setValue(percent)
+        if message:
+            self.log(message)
+
+    def run_hloc_pipeline(self):
+        """Run HLOC pipeline for reconstruction."""
+        try:
+            # Get output directory
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for HLOC"
+            )
+            if not output_dir:
+                return
+            
+            self.log("Starting HLOC pipeline (SuperPoint + SuperGlue)...")
+            self.progress_bar.setValue(0)
+            
+            result = pipeline.run(self.image_paths, Path(output_dir))
+            
+            if result.get("success"):
+                self.log(f"HLOC complete! {result.get('n_images', 0)} images processed")
+                QMessageBox.information(
+                    self, "HLOC Complete",
+                    f"Reconstruction complete!\n\n"
+                    f"Images: {result.get('n_images', 0)}\n"
+                    f"Output: {result.get('workspace', '')}"
+                )
+            else:
+                self.log(f"HLOC failed: {result.get('message', 'Unknown error')}")
+                
+        except Exception as e:
+            logger.error(f"HLOC error: {e}", exc_info=True)
+            QMessageBox.critical(self, "HLOC Error", str(e))
+    
+    def _run_meshroom(self):
+        """Run AliceVision/Meshroom pipeline or open Meshroom GUI."""
+        if not self.image_paths:
+            QMessageBox.warning(self, "No Images", "Please load images first.")
+            return
+        
+        try:
+            from external.pipelines import AliceVisionPipeline
+            
+            pipeline = AliceVisionPipeline()
+            
+            if not pipeline.is_available():
+                reply = QMessageBox.question(
+                    self, "Meshroom Not Found",
+                    "Meshroom/AliceVision is not installed.\n\n" + 
+                    pipeline.get_install_instructions() +
+                    "\n\nWould you like to open the Meshroom download page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open("https://alicevision.org/#meshroom")
+                return
+            
+            # For now, suggest using Meshroom GUI directly
+            QMessageBox.information(
+                self, "Meshroom",
+                "For best results, please use Meshroom GUI directly:\n\n"
+                "1. Open Meshroom\n"
+                "2. Drag your images into the Images panel\n"
+                "3. Click 'Start' to begin reconstruction\n\n"
+                "Meshroom provides a visual pipeline editor and\n"
+                "real-time progress monitoring."
+            )
+            
+        except Exception as e:
+            logger.error(f"Meshroom error: {e}", exc_info=True)
+            QMessageBox.critical(self, "Meshroom Error", str(e))
+    
+    def _update_progress_slot(self, percent: int, message: str):
+        """Progress callback for external pipelines."""
+        self.progress_bar.setValue(percent)
+        if message:
+            self.log(message)
+
+    def run_hloc_pipeline(self):
+        """Run HLOC pipeline for reconstruction."""
+        try:
+            # Get output directory
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for HLOC"
+            )
+            if not output_dir:
+                return
+            
+            self.log("Starting HLOC pipeline (SuperPoint + SuperGlue)...")
+            self.progress_bar.setValue(0)
+            
+            result = pipeline.run(self.image_paths, Path(output_dir))
+            
+            if result.get("success"):
+                self.log(f"HLOC complete! {result.get('n_images', 0)} images processed")
+                QMessageBox.information(
+                    self, "HLOC Complete",
+                    f"Reconstruction complete!\n\n"
+                    f"Images: {result.get('n_images', 0)}\n"
+                    f"Output: {result.get('workspace', '')}"
+                )
+            else:
+                self.log(f"HLOC failed: {result.get('message', 'Unknown error')}")
+                
+        except Exception as e:
+            logger.error(f"HLOC error: {e}", exc_info=True)
+            QMessageBox.critical(self, "HLOC Error", str(e))
+    
+    def _run_meshroom(self):
+        """Run AliceVision/Meshroom pipeline or open Meshroom GUI."""
+        if not self.image_paths:
+            QMessageBox.warning(self, "No Images", "Please load images first.")
+            return
+        
+        try:
+            from external.pipelines import AliceVisionPipeline
+            
+            pipeline = AliceVisionPipeline()
+            
+            if not pipeline.is_available():
+                reply = QMessageBox.question(
+                    self, "Meshroom Not Found",
+                    "Meshroom/AliceVision is not installed.\n\n" + 
+                    pipeline.get_install_instructions() +
+                    "\n\nWould you like to open the Meshroom download page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open("https://alicevision.org/#meshroom")
+                return
+            
+            # For now, suggest using Meshroom GUI directly
+            QMessageBox.information(
+                self, "Meshroom",
+                "For best results, please use Meshroom GUI directly:\n\n"
+                "1. Open Meshroom\n"
+                "2. Drag your images into the Images panel\n"
+                "3. Click 'Start' to begin reconstruction\n\n"
+                "Meshroom provides a visual pipeline editor and\n"
+                "real-time progress monitoring."
+            )
+            
+        except Exception as e:
+            logger.error(f"Meshroom error: {e}", exc_info=True)
+            QMessageBox.critical(self, "Meshroom Error", str(e))
+    
+    def _update_progress_slot(self, percent: int, message: str):
+        """Progress callback for external pipelines."""
+        self.progress_bar.setValue(percent)
+        if message:
+            self.log(message)
+
+    def run_hloc_pipeline(self):
+        """Run HLOC pipeline for reconstruction."""
+        try:
+            # Get output directory
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for HLOC"
+            )
+            if not output_dir:
+                return
+            
+            self.log("Starting HLOC pipeline (SuperPoint + SuperGlue)...")
+            self.progress_bar.setValue(0)
+            
+            result = pipeline.run(self.image_paths, Path(output_dir))
+            
+            if result.get("success"):
+                self.log(f"HLOC complete! {result.get('n_images', 0)} images processed")
+                QMessageBox.information(
+                    self, "HLOC Complete",
+                    f"Reconstruction complete!\n\n"
+                    f"Images: {result.get('n_images', 0)}\n"
+                    f"Output: {result.get('workspace', '')}"
+                )
+            else:
+                self.log(f"HLOC failed: {result.get('message', 'Unknown error')}")
+                
+        except Exception as e:
+            logger.error(f"HLOC error: {e}", exc_info=True)
+            QMessageBox.critical(self, "HLOC Error", str(e))
+    
+    def _run_meshroom(self):
+        """Run AliceVision/Meshroom pipeline or open Meshroom GUI."""
+        if not self.image_paths:
+            QMessageBox.warning(self, "No Images", "Please load images first.")
+            return
+        
+        try:
+            from external.pipelines import AliceVisionPipeline
+            
+            pipeline = AliceVisionPipeline()
+            
+            if not pipeline.is_available():
+                reply = QMessageBox.question(
+                    self, "Meshroom Not Found",
+                    "Meshroom/AliceVision is not installed.\n\n" + 
+                    pipeline.get_install_instructions() +
+                    "\n\nWould you like to open the Meshroom download page?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open("https://alicevision.org/#meshroom")
+                return
+            
+            # For now, suggest using Meshroom GUI directly
+            QMessageBox.information(
+                self, "Meshroom",
+                "For best results, please use Meshroom GUI directly:\n\n"
+                "1. Open Meshroom\n"
+                "2. Drag your images into the Images panel\n"
+                "3. Click 'Start' to begin reconstruction\n\n"
+                "Meshroom provides a visual pipeline editor and\n"
+                "real-time progress monitoring."
+            )
+            
+        except Exception as e:
+            logger.error(f"Meshroom error: {e}", exc_info=True)
+            QMessageBox.critical(self, "Meshroom Error", str(e))
+    
+    def _update_progress_slot(self, percent: int, message: str):
+        """Progress callback for external pipelines."""
+        self.progress_bar.setValue(percent)
+        if message:
+            self.log(message)
+
+    def run_hloc_pipeline(self):
+        """Run HLOC pipeline for reconstruction."""
+        try:
             # Get output directory
             output_dir = QFileDialog.getExistingDirectory(
                 self, "Select Output Directory for HLOC"

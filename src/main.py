@@ -146,7 +146,7 @@ def main():
         return 0
     else:
         # GUI mode
-        from PySide6.QtWidgets import QApplication, QMessageBox
+        from PyQt6.QtWidgets import QApplication, QMessageBox
         
         try:
             app = QApplication(sys.argv)

@@ -2,7 +2,22 @@
 
 import logging
 import sys
+import io
 from pathlib import Path
+
+# Fix Windows console encoding for Unicode characters
+if sys.platform == 'win32':
+    try:
+        # Try to set console to UTF-8
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        # Reconfigure stdout/stderr with UTF-8 encoding and error handling
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 # Global variable to store log file path
 _log_file_path = None
@@ -49,8 +64,14 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.setLevel(level)
     
     if not logger.handlers:
-        # Console handler
-        console_handler = logging.StreamHandler(sys.stdout)
+        # Console handler with UTF-8 encoding
+        try:
+            # Use a wrapper that handles encoding errors gracefully
+            stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+            console_handler = logging.StreamHandler(stream)
+        except (AttributeError, TypeError):
+            # Fallback for environments without buffer access
+            console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(level)
         
         formatter = logging.Formatter(

@@ -90,6 +90,8 @@ class ImageBlender:
         
         if self.method == 'autostitch':
             return self._autostitch_blend(aligned_images, blend_options)
+        elif self.method == 'mosaic':
+            return self._mosaic_blend(aligned_images, blend_options)
         elif self.method == 'multiband':
             return self._multiband_blend(aligned_images, blend_options)
         elif self.method == 'feather':
@@ -182,11 +184,20 @@ class ImageBlender:
             img = img_data['image']
             alpha = img_data.get('alpha')
             was_warped = img_data.get('warped', False)
-            
+
             h, w = img.shape[:2]
-            
+
             # Create content mask - use alpha channel if provided
             if alpha is not None:
+                # CRITICAL: Validate alpha dimensions match image
+                # Dimension mismatch causes 100+ pixel shift artifacts!
+                alpha_h, alpha_w = alpha.shape[:2]
+                if alpha_h != h or alpha_w != w:
+                    logger.warning(f"Image {idx}: Alpha dimension mismatch! "
+                                  f"img={w}x{h}, alpha={alpha_w}x{alpha_h}")
+                    # Resize alpha to match (emergency fix)
+                    alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_NEAREST)
+
                 # Trust the provided alpha channel completely
                 # It already correctly distinguishes content from transformation borders
                 alpha_mask = alpha > 127
@@ -241,8 +252,9 @@ class ImageBlender:
             src_region = img[src_y_start:src_y_end, src_x_start:src_x_end]
             src_alpha = alpha_mask[src_y_start:src_y_end, src_x_start:src_x_end]
             dst_filled = filled_mask[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
-            
-            # Write mask: valid alpha and not already filled
+
+            # Edge duplication prevention for warped images
+            # Standard autostitch: write where alpha is valid AND destination is empty
             write_mask = src_alpha & (dst_filled == 0)
             
             if np.any(write_mask):
@@ -322,7 +334,191 @@ class ImageBlender:
             logger.info(f"Auto-cropped: {panorama.shape[1]}x{panorama.shape[0]} -> {cropped.shape[1]}x{cropped.shape[0]} ({reduction:.1f}% reduction)")
         
         return cropped
-    
+
+    def _mosaic_blend(self, aligned_images: List[Dict], options: Dict) -> np.ndarray:
+        """
+        Mosaic-style blending: center-priority winner-takes-all.
+
+        Unlike autostitch which uses distance from alpha boundary,
+        this method uses distance from image center. Pixels closer to
+        their source image's center have higher priority.
+
+        This fundamentally different approach avoids edge-based calculations
+        that may cause alignment issues with alpha channels.
+
+        Options:
+            padding: Extra pixels around edges (default 50)
+            zoom: Output scale factor (default 1.0)
+            fit_all: Ensure all images fit completely (default True)
+        """
+        if not aligned_images:
+            raise ValueError("No images to blend")
+
+        # Get options
+        padding = options.get('padding', 50)
+        zoom = options.get('zoom', 1.0)
+        fit_all = options.get('fit_all', True)
+
+        # Calculate bounding box with padding
+        bbox = self._calculate_bbox(aligned_images, padding=padding if fit_all else 0)
+        x_min, y_min, x_max, y_max = bbox
+
+        output_h = y_max - y_min
+        output_w = x_max - x_min
+
+        if output_h <= 0 or output_w <= 0:
+            logger.error(f"Invalid bounding box dimensions: {bbox}")
+            return aligned_images[0]['image'].copy()
+
+        # Sanity check alignment
+        aligned_images, bbox = self._check_and_fix_exploded_alignment(aligned_images, bbox)
+        x_min, y_min, x_max, y_max = bbox
+        output_h = y_max - y_min
+        output_w = x_max - x_min
+
+        # Apply zoom factor
+        if zoom != 1.0 and zoom > 0:
+            center_x = (x_min + x_max) / 2
+            center_y = (y_min + y_max) / 2
+            half_w = output_w / 2 / zoom
+            half_h = output_h / 2 / zoom
+            x_min = int(center_x - half_w)
+            y_min = int(center_y - half_h)
+            x_max = int(center_x + half_w)
+            y_max = int(center_y + half_h)
+            output_w = x_max - x_min
+            output_h = y_max - y_min
+            logger.info(f"Zoom {zoom}x applied: canvas size {output_w}x{output_h}")
+
+        total_pixels = output_h * output_w
+        scale_factor = 1.0
+
+        max_blend_pixels = 200_000_000
+        if total_pixels > max_blend_pixels:
+            scale_factor = np.sqrt(max_blend_pixels / total_pixels)
+            output_h = int(output_h * scale_factor)
+            output_w = int(output_w * scale_factor)
+            logger.info(f"Blending at reduced size to save memory: {output_w}x{output_h}")
+
+        logger.info(f"Creating mosaic panorama canvas: {output_w}x{output_h} ({output_w*output_h/1e6:.1f}MP)")
+
+        # Create output canvas with white background
+        panorama = np.ones((output_h, output_w, 3), dtype=np.uint8) * 255
+        # Track center-distance priority for each pixel (higher = better)
+        priority_map = np.full((output_h, output_w), -np.inf, dtype=np.float32)
+
+        # Sort images by quality (best first for tie-breaking)
+        sorted_images = sorted(
+            aligned_images,
+            key=lambda x: x.get('quality', 0.5),
+            reverse=True
+        )
+
+        # Process each image
+        for idx, img_data in enumerate(sorted_images):
+            logger.debug(f"Mosaic blending image {idx+1}/{len(sorted_images)}")
+
+            img = img_data['image']
+            alpha = img_data.get('alpha')
+
+            h, w = img.shape[:2]
+
+            # Create content mask from alpha if available
+            if alpha is not None:
+                alpha_h, alpha_w = alpha.shape[:2]
+                if alpha_h != h or alpha_w != w:
+                    logger.warning(f"Image {idx}: Alpha dimension mismatch! "
+                                  f"img={w}x{h}, alpha={alpha_w}x{alpha_h}")
+                    alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_NEAREST)
+                alpha_mask = alpha > 127
+            else:
+                alpha_mask = np.ones((h, w), dtype=bool)
+
+            bbox_img = img_data.get('bbox', (0, 0, w, h))
+
+            # Apply scale factor if needed
+            if scale_factor != 1.0:
+                x_off = int((bbox_img[0] - x_min) * scale_factor)
+                y_off = int((bbox_img[1] - y_min) * scale_factor)
+                scaled_w = max(1, int(w * scale_factor))
+                scaled_h = max(1, int(h * scale_factor))
+                img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+                alpha_mask = cv2.resize(alpha_mask.astype(np.uint8), (scaled_w, scaled_h),
+                                       interpolation=cv2.INTER_NEAREST).astype(bool)
+                h, w = scaled_h, scaled_w
+            else:
+                x_off = bbox_img[0] - x_min
+                y_off = bbox_img[1] - y_min
+
+            # Calculate center-distance priority for this image
+            # Distance from center normalized to [0, 1], then inverted so center = highest
+            cy, cx = h / 2, w / 2
+            y_coords, x_coords = np.ogrid[:h, :w]
+            # Normalized distance from center (0 at center, 1 at corners)
+            dist_from_center = np.sqrt(((x_coords - cx) / cx) ** 2 + ((y_coords - cy) / cy) ** 2)
+            # Convert to priority: center = 1.0, corners = 0.0
+            center_priority = 1.0 - np.clip(dist_from_center / np.sqrt(2), 0, 1)
+
+            # Only valid (alpha > 0) pixels get priority
+            center_priority = np.where(alpha_mask, center_priority, -np.inf).astype(np.float32)
+
+            # Calculate valid region
+            src_x_start = max(0, -x_off)
+            src_y_start = max(0, -y_off)
+            dst_x_start = max(0, x_off)
+            dst_y_start = max(0, y_off)
+
+            src_x_end = min(w, output_w - x_off)
+            src_y_end = min(h, output_h - y_off)
+            dst_x_end = min(output_w, x_off + w)
+            dst_y_end = min(output_h, y_off + h)
+
+            if src_x_end <= src_x_start or src_y_end <= src_y_start:
+                logger.warning(f"Image {idx} completely outside canvas, skipping")
+                continue
+
+            # Get regions
+            src_region = img[src_y_start:src_y_end, src_x_start:src_x_end]
+            src_priority = center_priority[src_y_start:src_y_end, src_x_start:src_x_end]
+            dst_priority = priority_map[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
+
+            # Winner-takes-all based on center priority
+            # This image wins where its center-priority is higher than current
+            better_mask = src_priority > dst_priority
+
+            if np.any(better_mask):
+                dst_region = panorama[dst_y_start:dst_y_end, dst_x_start:dst_x_end]
+                dst_region[better_mask] = src_region[better_mask]
+
+                # Update priority map
+                priority_map[dst_y_start:dst_y_end, dst_x_start:dst_x_end][better_mask] = src_priority[better_mask]
+
+            del alpha_mask, center_priority
+
+        # Auto-crop to remove unfilled areas
+        filled_mask = (priority_map > -np.inf).astype(np.uint8)
+        panorama = self._autocrop_panorama(panorama, filled_mask)
+
+        del priority_map, filled_mask
+        gc.collect()
+
+        # Scale to target if needed
+        scale_to_target = options.get('scale_to_target', True)
+        if self.max_panorama_pixels and scale_to_target:
+            h, w = panorama.shape[:2]
+            current_pixels = h * w
+            if current_pixels > 0:
+                target_scale = np.sqrt(self.max_panorama_pixels / current_pixels)
+                if abs(target_scale - 1.0) > 0.01:
+                    new_w = int(w * target_scale)
+                    new_h = int(h * target_scale)
+                    interp = cv2.INTER_CUBIC if target_scale > 1.0 else cv2.INTER_AREA
+                    panorama = cv2.resize(panorama, (new_w, new_h), interpolation=interp)
+                    logger.info(f"Scaled to target: {w}x{h} -> {new_w}x{new_h} ({new_w*new_h/1e6:.1f}MP)")
+
+        logger.info("Mosaic blending complete")
+        return panorama
+
     def _multiband_blend(self, aligned_images: List[Dict], options: Dict) -> np.ndarray:
         """Multi-band blending for seamless transitions (memory-optimized)"""
         if not aligned_images:
@@ -418,7 +614,10 @@ class ImageBlender:
                 y_off = bbox_img[1] - y_min
             
             # Create weight mask (distance from edges)
-            weight = self._create_weight_mask((h, w), alpha_f)
+            # Smaller feather_size = sharper blends (less blur with many images)
+            # Larger feather_size = smoother transitions (better for few images)
+            feather_size = options.get('feather_size', 30)  # Default 30px for sharper blends
+            weight = self._create_weight_mask((h, w), alpha_f, feather_size=feather_size)
             
             # Calculate valid region
             src_x_start = max(0, -x_off)
@@ -1001,11 +1200,6 @@ class ImageBlender:
     ) -> np.ndarray:
         """Create weight mask for blending"""
         h, w = shape
-        weight = np.ones((h, w), dtype=np.float32)
-        
-        # Create distance transform from edges
-        # Apply alpha mask
-        weight = weight * alpha
         
         # Distance from edges
         dist_y = np.minimum(
@@ -1016,14 +1210,16 @@ class ImageBlender:
             np.arange(w)[None, :],
             np.arange(w)[None, ::-1]
         )
-        dist = np.minimum(dist_y, dist_x)
+        dist = np.minimum(dist_y, dist_x).astype(np.float32)
         
-        # Feather edges (avoid division by zero)
+        # Sharp feathering: center stays at 1.0, only ramp near edges
         if feather_size > 0:
-            dist = np.clip(dist / feather_size, 0, 1)
+            weight = np.clip(dist / feather_size, 0, 1)
         else:
-            dist = np.ones_like(dist)
-        weight = weight * dist
+            weight = np.ones_like(dist)
+            
+        # Apply alpha mask
+        weight = weight * alpha
         
         return weight
 

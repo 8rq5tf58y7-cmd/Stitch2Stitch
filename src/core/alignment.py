@@ -192,18 +192,126 @@ def filter_matches_by_cluster(pts1: np.ndarray, pts2: np.ndarray,
 DEFAULT_MAX_WARP_PIXELS = None
 
 
+def detect_circular_content_mask(image: np.ndarray, threshold: int = 15) -> np.ndarray:
+    """
+    Detect content mask for circular/round images (e.g., microscope images).
+
+    Uses ellipse fitting to create smooth geometric mask for images with dark borders.
+
+    Args:
+        image: BGR source image
+        threshold: Brightness threshold for content detection (default 15)
+
+    Returns:
+        Binary mask (uint8) where 255 = content, 0 = border
+    """
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+
+    # Threshold to find content region
+    _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+
+    # Morphological operations to clean up mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    # Find contours
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        logger.debug("No contours found for circular detection, returning full mask")
+        return np.ones((h, w), dtype=np.uint8) * 255
+
+    # Get largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+
+    # Fit ellipse if enough points, otherwise use convex hull
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if len(largest_contour) >= 5:
+        ellipse = cv2.fitEllipse(largest_contour)
+        cv2.ellipse(mask, ellipse, 255, -1)
+        logger.debug(f"Fitted ellipse: center={ellipse[0]}, axes={ellipse[1]}, angle={ellipse[2]:.1f}")
+    else:
+        hull = cv2.convexHull(largest_contour)
+        cv2.fillPoly(mask, [hull], 255)
+        logger.debug(f"Used convex hull ({len(largest_contour)} points)")
+
+    mask_coverage = 100.0 * np.sum(mask > 0) / (h * w)
+    logger.debug(f"Content mask coverage: {mask_coverage:.1f}%")
+
+    return mask
+
+
+def create_content_mask(
+    image: np.ndarray,
+    auto_detect: bool = True,
+    erosion_pixels: int = 0
+) -> np.ndarray:
+    """
+    Create content mask for images, auto-detecting circular/round images.
+
+    For rectangular content: returns full white mask (fast path)
+    For round/circular content: detects and masks the valid region
+
+    Args:
+        image: Source image (BGR)
+        auto_detect: If True, auto-detect circular/non-rectangular content
+        erosion_pixels: Pixels to erode from mask edges (0 = no erosion)
+
+    Returns:
+        Mask (uint8) where 255 = valid content, 0 = border
+    """
+    h, w = image.shape[:2]
+
+    if not auto_detect:
+        mask = np.ones((h, w), dtype=np.uint8) * 255
+    else:
+        # Check if corners are dark (indicator of round/circular image)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        corner_size = max(10, min(h, w) // 10)  # Sample 10% from each corner, min 10px
+
+        corners = [
+            gray[:corner_size, :corner_size],           # top-left
+            gray[:corner_size, -corner_size:],          # top-right
+            gray[-corner_size:, :corner_size],          # bottom-left
+            gray[-corner_size:, -corner_size:],         # bottom-right
+        ]
+        corner_means = [float(c.mean()) for c in corners]
+
+        # If 3+ corners are dark (mean < 20), it's likely a round image
+        if sum(m < 20 for m in corner_means) >= 3:
+            logger.debug(f"Detected circular content (corner means: {corner_means})")
+            mask = detect_circular_content_mask(image)
+        else:
+            # Rectangular content - full mask
+            logger.debug(f"Rectangular content (corner means: {corner_means})")
+            mask = np.ones((h, w), dtype=np.uint8) * 255
+
+    # Apply erosion if requested (removes thin dark borders)
+    if erosion_pixels > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erosion_pixels, erosion_pixels))
+        mask = cv2.erode(mask, kernel, iterations=2)
+        logger.debug(f"Applied {erosion_pixels}px erosion to mask")
+
+    return mask
+
+
 class ImageAligner:
     """Align flat images using similarity transforms (translation + scale)"""
     
     def __init__(
-        self, 
-        use_gpu: bool = False, 
+        self,
+        use_gpu: bool = False,
         allow_scale: bool = True,
-        max_warp_pixels: Optional[int] = DEFAULT_MAX_WARP_PIXELS
+        max_warp_pixels: Optional[int] = DEFAULT_MAX_WARP_PIXELS,
+        create_alpha_channels: bool = True,
+        auto_detect_circular: bool = True,
+        border_erosion_pixels: int = 0
     ):
         """
         Initialize aligner
-        
+
         Args:
             use_gpu: Enable GPU acceleration
             allow_scale: Allow uniform scaling to match image sizes (default True)
@@ -211,11 +319,19 @@ class ImageAligner:
                 Memory guidelines:
                 - 50MP: ~150MB per image
                 - 100MP: ~300MB per image
+            create_alpha_channels: Create alpha channels for warped images to mark transformation borders (default True)
+            auto_detect_circular: Auto-detect circular/round images and create content masks (default True)
+            border_erosion_pixels: Pixels to erode from alpha mask edges to remove dark borders (0 = no erosion)
         """
         self.use_gpu = use_gpu
         self.allow_scale = allow_scale
         self.max_warp_pixels = max_warp_pixels if max_warp_pixels else None
-        logger.info(f"Image aligner initialized (allow_scale={allow_scale}, max_warp_pixels={self.max_warp_pixels or 'unlimited'})")
+        self.create_alpha_channels = create_alpha_channels
+        self.auto_detect_circular = auto_detect_circular
+        self.border_erosion_pixels = border_erosion_pixels
+        logger.info(f"Image aligner initialized (allow_scale={allow_scale}, max_warp_pixels={self.max_warp_pixels or 'unlimited'}, "
+                   f"create_alpha={create_alpha_channels}, auto_detect_circular={auto_detect_circular}, "
+                   f"border_erosion={border_erosion_pixels}px)")
     
     def align_images(
         self,
@@ -1402,19 +1518,91 @@ class ImageAligner:
                 aligned_images.append(aligned_data)
             else:
                 # Need to warp the image
-                warped_img, bbox = self._warp_image(img, transform)
-                
+                # CRITICAL: Only create transformation alpha if NO source alpha exists
+                # Double-masking (source + transform alpha) amplifies misalignment
+                has_source_alpha = img_data.get('alpha') is not None
+
+                warped_img, img_alpha, bbox = self._warp_image(
+                    img,
+                    transform,
+                    create_alpha=self.create_alpha_channels and not has_source_alpha
+                )
+
                 aligned_data = img_data.copy()
                 aligned_data['image'] = warped_img
                 aligned_data['transform'] = transform
                 aligned_data['bbox'] = bbox
                 aligned_data['warped'] = True
-                
-                # Warp alpha if present
-                if img_data.get('alpha') is not None:
-                    warped_alpha, _ = self._warp_image(img_data['alpha'], transform)
-                    aligned_data['alpha'] = warped_alpha
-                
+
+                # Handle alpha channels - up to THREE sources:
+                # 1. Source alpha (from PNG/TIFF with transparency) - USE THIS ALONE if present
+                # 2. Content mask (circular image detection + erosion) - only if no source alpha
+                # 3. Transformation border alpha (marks warp borders) - only if no source alpha
+
+                # Start with source alpha if present (takes priority over all others)
+                if has_source_alpha:
+                    # SIMPLEST FIX: Ignore source alpha content, just use transformation bounds
+                    # This guarantees perfect RGB/alpha alignment (both from same warp)
+                    #
+                    # Create a transformation-based alpha by warping a white mask
+                    # This marks which pixels are valid after the warp transformation
+                    white_mask = np.ones((img.shape[0], img.shape[1]), dtype=np.uint8) * 255
+                    warped_mask, _, _ = self._warp_image(white_mask, transform, create_alpha=False)
+
+                    # The warped mask shows valid (non-border) regions
+                    # Threshold to get hard edges
+                    final_alpha = np.where(warped_mask > 127, 255, 0).astype(np.uint8)
+
+                    logger.debug(f"Image {i}: Using transformation-based alpha "
+                                f"(ignoring source alpha to prevent misalignment)")
+                else:
+                    final_alpha = None
+
+                # Only apply content mask/border erosion if NO source alpha
+                # (source alpha already knows what's valid)
+                if not has_source_alpha:
+                    # Create and warp content mask if auto-detection is enabled
+                    if self.auto_detect_circular or self.border_erosion_pixels > 0:
+                        # Create content mask (detects circular images, applies erosion)
+                        content_mask = create_content_mask(
+                            img,
+                            auto_detect=self.auto_detect_circular,
+                            erosion_pixels=self.border_erosion_pixels
+                        )
+
+                        # Warp the content mask
+                        warped_content_mask, _, _ = self._warp_image(content_mask, transform, create_alpha=False)
+
+                        # Combine with existing alpha
+                        if final_alpha is not None:
+                            final_alpha = cv2.bitwise_and(final_alpha, warped_content_mask)
+                        else:
+                            final_alpha = warped_content_mask
+
+                    # Combine with transformation border alpha (only if no source alpha)
+                    if img_alpha is not None:
+                        # CRITICAL FIX: Erode img_alpha to exclude RGB interpolation edges
+                        # RGB warp uses INTER_LINEAR which darkens edge pixels
+                        # img_alpha uses INTER_NEAREST so doesn't know about this
+                        edge_erosion_px = max(1, self.border_erosion_pixels)
+                        if edge_erosion_px > 0:
+                            kernel = cv2.getStructuringElement(
+                                cv2.MORPH_ELLIPSE,
+                                (edge_erosion_px * 2 + 1, edge_erosion_px * 2 + 1)
+                            )
+                            img_alpha = cv2.erode(img_alpha, kernel, iterations=1)
+
+                        if final_alpha is not None:
+                            # Both content mask AND transformation borders
+                            final_alpha = cv2.bitwise_and(final_alpha, img_alpha)
+                        else:
+                            # Only transformation border alpha
+                            final_alpha = img_alpha
+
+                # Store final combined alpha
+                if final_alpha is not None:
+                    aligned_data['alpha'] = final_alpha
+
                 aligned_images.append(aligned_data)
             
             # Periodic garbage collection for large batches
@@ -1426,17 +1614,24 @@ class ImageAligner:
     def _warp_image(
         self,
         img: np.ndarray,
-        transform: np.ndarray
-    ) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        transform: np.ndarray,
+        create_alpha: bool = False
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Tuple[int, int, int, int]]:
         """
         Warp image using similarity transform.
-        
+
         Note: This method does NOT apply size limits. Size limits are handled
         globally by the blender to ensure consistent scaling across all images.
-        
+
+        Args:
+            img: Input image to warp
+            transform: 3x3 transformation matrix
+            create_alpha: If True, create alpha channel marking valid (non-border) regions
+
         Returns:
-            Tuple of (warped_image, bbox)
+            Tuple of (warped_image, warped_alpha, bbox)
             - warped_image: The transformed image
+            - warped_alpha: Alpha channel (255=valid, 0=transformation border) or None
             - bbox: (x_min, y_min, x_max, y_max) in global coordinates
         """
         h, w = img.shape[:2]
@@ -1494,11 +1689,77 @@ class ImageAligner:
             adjusted[:2, :].astype(np.float32),
             (output_w, output_h),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0)  # Explicit black borders for transformation regions
         )
-        
-        return warped, (x_min, y_min, x_max, y_max)
-    
+
+        # Create alpha channel to mark valid (non-transformation-border) regions
+        warped_alpha = None
+        if create_alpha:
+            # Create full-white alpha for original image (all pixels valid)
+            alpha_src = np.ones((h, w), dtype=np.uint8) * 255
+
+            # Warp alpha using NEAREST interpolation to preserve hard edges
+            # This marks transformation borders (outside original image bounds) as 0
+            warped_alpha = cv2.warpAffine(
+                alpha_src,
+                adjusted[:2, :].astype(np.float32),
+                (output_w, output_h),
+                flags=cv2.INTER_NEAREST,  # Hard edges, no interpolation
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0  # Mark transformation borders as invalid (0 = transparent)
+            )
+
+        return warped, warped_alpha, (x_min, y_min, x_max, y_max)
+
+    def _warp_alpha_nearest(
+        self,
+        alpha: np.ndarray,
+        transform: np.ndarray,
+        target_bbox: Tuple[int, int, int, int]
+    ) -> np.ndarray:
+        """
+        Warp alpha channel using INTER_NEAREST to preserve hard edges.
+
+        Uses a pre-computed bbox to ensure perfect pixel alignment with the
+        corresponding RGB warp (which uses INTER_LINEAR).
+
+        This prevents the autostitch duplication/shift artifact caused by
+        semi-transparent edge pixels from INTER_LINEAR interpolation.
+
+        Args:
+            alpha: Source alpha channel (uint8, 0-255)
+            transform: 3x3 transformation matrix
+            target_bbox: (x_min, y_min, x_max, y_max) from the RGB warp
+
+        Returns:
+            Warped alpha channel with hard edges (uint8)
+        """
+        x_min, y_min, x_max, y_max = target_bbox
+        output_w = max(1, x_max - x_min)
+        output_h = max(1, y_max - y_min)
+
+        # Create adjusted transform that accounts for output offset
+        # Must match _warp_image exactly for pixel-perfect alignment
+        offset = np.array([
+            [1, 0, -x_min],
+            [0, 1, -y_min],
+            [0, 0, 1]
+        ], dtype=np.float64)
+        adjusted = offset @ transform
+
+        # Warp alpha with INTER_NEAREST - no interpolation, hard edges
+        warped_alpha = cv2.warpAffine(
+            alpha,
+            adjusted[:2, :].astype(np.float32),
+            (output_w, output_h),
+            flags=cv2.INTER_NEAREST,  # Critical: hard edges, no semi-transparency
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0  # Transparent outside original bounds
+        )
+
+        return warped_alpha
+
     def _place_images_at_origin(self, images_data: List[Dict]) -> List[Dict]:
         """Place all images at origin when no matches found"""
         aligned_images = []

@@ -431,7 +431,7 @@ class BundleAdjuster:
             }
             
             logger.info(f"Bundle adjustment complete: {improvement:.1f}% improvement, "
-                       f"cost {initial_cost:.2f} → {final_cost:.2f}")
+                       f"cost {initial_cost:.2f} -> {final_cost:.2f}")
             
             return optimized_transforms, stats
             

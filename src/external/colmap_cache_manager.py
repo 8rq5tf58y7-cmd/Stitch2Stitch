@@ -789,3 +789,139 @@ class COLMAPCacheManager:
 
         except Exception as e:
             logger.error(f"Error enforcing cache size limit: {e}")
+
+    # =========================================================================
+    # Match run tracking methods (for progress reporting during incremental matching)
+    # =========================================================================
+
+    def note_match_run_start(self):
+        """Initialize counters for a new match run."""
+        self._match_run_start_time = time.time()
+        self._match_hits = 0
+        self._match_computed = 0
+        self._match_skipped = 0
+
+    def note_match_hit(self, count: int = 1):
+        """Record cache hits during matching."""
+        self._match_hits = getattr(self, '_match_hits', 0) + count
+
+    def note_match_computed(self, count: int = 1):
+        """Record newly computed matches."""
+        self._match_computed = getattr(self, '_match_computed', 0) + count
+
+    def note_match_skipped(self, count: int = 1):
+        """Record skipped pairs (insufficient features/matches)."""
+        self._match_skipped = getattr(self, '_match_skipped', 0) + count
+
+    def get_match_lookup_summary(self) -> Dict:
+        """Return summary of match run statistics."""
+        elapsed = time.time() - getattr(self, '_match_run_start_time', time.time())
+        return {
+            'hit': getattr(self, '_match_hits', 0),
+            'computed': getattr(self, '_match_computed', 0),
+            'skipped': getattr(self, '_match_skipped', 0),
+            'time': elapsed,
+        }
+
+    def cleanup_old_entries(self, max_age_days: int = 30):
+        """
+        Remove cache entries older than max_age_days.
+
+        Args:
+            max_age_days: Maximum age in days
+        """
+        cutoff_time = time.time() - (max_age_days * 24 * 3600)
+
+        try:
+            conn = sqlite3.connect(str(self.index_db_path))
+            cursor = conn.cursor()
+
+            # Get old feature cache entries
+            cursor.execute("""
+                SELECT cache_key FROM feature_cache
+                WHERE last_used < ?
+            """, (cutoff_time,))
+
+            old_features = [row[0] for row in cursor.fetchall()]
+
+            # Delete them
+            for cache_key in old_features:
+                self._delete_feature_cache_entry(cache_key)
+
+            logger.info(f"Cleaned up {len(old_features)} old feature cache entries")
+
+            conn.close()
+
+        except Exception as e:
+            logger.error(f"Error cleaning up old cache: {e}")
+
+    def enforce_size_limit(self):
+        """Enforce cache size limit using LRU eviction."""
+        stats = self.get_cache_stats()
+        current_size_mb = stats.get('total_size_mb', 0)
+        max_size_mb = self.max_cache_size_gb * 1024
+
+        if current_size_mb <= max_size_mb:
+            return
+
+        logger.info(f"Cache size {current_size_mb:.1f}MB exceeds limit {max_size_mb:.1f}MB, cleaning up...")
+
+        try:
+            conn = sqlite3.connect(str(self.index_db_path))
+            cursor = conn.cursor()
+
+            # Get entries sorted by last_used (LRU)
+            cursor.execute("""
+                SELECT cache_key FROM feature_cache
+                ORDER BY last_used ASC
+            """)
+
+            lru_entries = [row[0] for row in cursor.fetchall()]
+            conn.close()
+
+            # Delete until under limit
+            for cache_key in lru_entries:
+                self._delete_feature_cache_entry(cache_key)
+
+                # Check size again
+                stats = self.get_cache_stats()
+                if stats.get('total_size_mb', 0) <= max_size_mb:
+                    break
+
+            logger.info(f"Cache cleanup complete, new size: {stats.get('total_size_mb', 0):.1f}MB")
+
+        except Exception as e:
+            logger.error(f"Error enforcing cache size limit: {e}")
+
+    # =========================================================================
+    # Match run tracking methods (for progress reporting during incremental matching)
+    # =========================================================================
+
+    def note_match_run_start(self):
+        """Initialize counters for a new match run."""
+        self._match_run_start_time = time.time()
+        self._match_hits = 0
+        self._match_computed = 0
+        self._match_skipped = 0
+
+    def note_match_hit(self, count: int = 1):
+        """Record cache hits during matching."""
+        self._match_hits = getattr(self, '_match_hits', 0) + count
+
+    def note_match_computed(self, count: int = 1):
+        """Record newly computed matches."""
+        self._match_computed = getattr(self, '_match_computed', 0) + count
+
+    def note_match_skipped(self, count: int = 1):
+        """Record skipped pairs (insufficient features/matches)."""
+        self._match_skipped = getattr(self, '_match_skipped', 0) + count
+
+    def get_match_lookup_summary(self) -> Dict:
+        """Return summary of match run statistics."""
+        elapsed = time.time() - getattr(self, '_match_run_start_time', time.time())
+        return {
+            'hit': getattr(self, '_match_hits', 0),
+            'computed': getattr(self, '_match_computed', 0),
+            'skipped': getattr(self, '_match_skipped', 0),
+            'time': elapsed,
+        }

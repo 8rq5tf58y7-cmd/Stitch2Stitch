@@ -246,21 +246,21 @@ if __name__ == '__main__':
         print("\nAvailable models:")
         print("-" * 60)
         for name, info in list_available_models().items():
-            status = "✓ Downloaded" if info['downloaded'] else "✗ Not downloaded"
+            status = "[OK] Downloaded" if info['downloaded'] else "[X] Not downloaded"
             print(f"  {name}: {info['description']} ({info['size_mb']} MB) [{status}]")
         print()
     
     elif args.download:
         path = download_model(args.download, force=args.force)
         if path:
-            print(f"\n✓ Model downloaded: {path}\n")
+            print(f"\n[OK] Model downloaded: {path}\n")
         else:
-            print(f"\n✗ Failed to download model\n")
+            print(f"\n[FAILED] Failed to download model\n")
     
     elif args.download_recommended:
         print("\nDownloading recommended models...")
         downloaded = download_recommended_models()
-        print(f"\n✓ Downloaded {len(downloaded)} models\n")
+        print(f"\n[OK] Downloaded {len(downloaded)} models\n")
     
     else:
         parser.print_help()

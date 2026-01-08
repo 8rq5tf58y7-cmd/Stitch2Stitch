@@ -136,7 +136,7 @@ class GlobalImageRetrieval:
                 pairs.add(pair)
         
         pairs_list = list(pairs)
-        logger.info(f"Global retrieval: {n_images} images → {len(pairs_list)} candidate pairs "
+        logger.info(f"Global retrieval: {n_images} images -> {len(pairs_list)} candidate pairs "
                    f"(reduced from {n_images*(n_images-1)//2})")
         
         return pairs_list
@@ -303,7 +303,7 @@ class FeatureTrackBuilder:
                 filtered_match['track_filtered'] = True
                 filtered_matches.append(filtered_match)
         
-        logger.info(f"Track filtering: {len(matches)} → {len(filtered_matches)} match pairs "
+        logger.info(f"Track filtering: {len(matches)} -> {len(filtered_matches)} match pairs "
                    f"({len(filtered_matches)/len(matches)*100:.1f}% retained)")
         
         return filtered_matches
@@ -379,7 +379,7 @@ class MutualConsistencyFilter:
         filtered = [m for m, keep in zip(matches, consistent_mask) if keep]
         
         if len(filtered) < len(matches):
-            logger.debug(f"Mutual consistency: {len(matches)} → {len(filtered)} matches")
+            logger.debug(f"Mutual consistency: {len(matches)} -> {len(filtered)} matches")
         
         return filtered
 

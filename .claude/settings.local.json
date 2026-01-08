@@ -21,7 +21,24 @@
       "Bash(findstr:*)",
       "Bash(dir:*)",
       "Bash(python:*)",
-      "Bash(tasklist:*)"
+      "Bash(tasklist:*)",
+      "WebFetch(domain:registry.modelcontextprotocol.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:mcpservers.org)",
+      "Bash(claude mcp add:*)",
+      "Bash(claude mcp list:*)",
+      "Bash(npx:*)",
+      "Bash(npm search:*)",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(sh:*)",
+      "Bash(claude mcp remove:*)",
+      "Bash(python3:*)",
+      "Bash(git stash:*)",
+      "Bash(ls:*)",
+      "Bash(sqlite3:*)",
+      "Bash(ln:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }

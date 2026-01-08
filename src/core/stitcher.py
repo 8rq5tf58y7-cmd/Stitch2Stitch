@@ -63,7 +63,11 @@ class ImageStitcher:
         use_hierarchical_stitching: bool = False,
         use_enhanced_detection: bool = False,
         # Unsorted image handling
-        exhaustive_matching: bool = True
+        exhaustive_matching: bool = True,
+        # Alpha channel and border handling (autostitch fix)
+        create_alpha_channels: bool = True,
+        auto_detect_circular: bool = True,
+        border_erosion_pixels: int = 5
     ):
         """
         Initialize the stitcher
@@ -118,6 +122,12 @@ class ImageStitcher:
                 Stitches clusters independently, then merges
             use_enhanced_detection: Use enhanced feature detection for low-texture areas
                 Better for skies, walls, water, repetitive patterns
+            create_alpha_channels: Create alpha channels for warped images to mark transformation borders (default True)
+                Fixes autostitch edge misalignment by masking out black transformation borders
+            auto_detect_circular: Auto-detect circular/round images and create content masks (default True)
+                Handles microscope images, circular scans, etc. with dark borders
+            border_erosion_pixels: Pixels to erode from alpha mask edges to remove dark borders (default 5)
+                0 = no erosion, 1-3 = light, 4-6 = medium, 7-10 = heavy
         """
         self.use_gpu = use_gpu
         self.quality_threshold = quality_threshold
@@ -140,6 +150,9 @@ class ImageStitcher:
         self.use_hierarchical_stitching = use_hierarchical_stitching
         self.use_enhanced_detection = use_enhanced_detection
         self.exhaustive_matching = exhaustive_matching
+        self.create_alpha_channels = create_alpha_channels
+        self.auto_detect_circular = auto_detect_circular
+        self.border_erosion_pixels = border_erosion_pixels
         self.memory_manager = MemoryManager(memory_limit_gb=memory_limit_gb)
         
         # AutoPano-inspired features (lazy loaded)
@@ -171,9 +184,12 @@ class ImageStitcher:
         
         # Initialize aligner
         self.aligner = ImageAligner(
-            use_gpu=use_gpu, 
+            use_gpu=use_gpu,
             allow_scale=allow_scale,
-            max_warp_pixels=max_warp_pixels
+            max_warp_pixels=max_warp_pixels,
+            create_alpha_channels=create_alpha_channels,
+            auto_detect_circular=auto_detect_circular,
+            border_erosion_pixels=border_erosion_pixels
         )
         
         # Initialize control point manager (PTGui-style)
@@ -1448,7 +1464,7 @@ class ImageStitcher:
                 progress = 15 + int(7 * (i / total_to_load))
                 status = f"Quality check ({i+1}/{total_to_load}): {proxy.path.name}"
                 if accepted_count > 0 or rejected_count > 0:
-                    status += f" [✓{accepted_count} ✗{rejected_count}]"
+                    status += f" [OK:{accepted_count} X:{rejected_count}]"
                 self._update_progress(progress, status)
             
             if proxy.shape is None:
@@ -1893,7 +1909,7 @@ class ImageStitcher:
             if images_for_retrieval:
                 hierarchical_matcher.compute_global_descriptors(images_for_retrieval)
                 pairs_to_match = hierarchical_matcher.get_matching_pairs(n_images)
-                logger.info(f"Hierarchical retrieval: {all_pairs_count} → {len(pairs_to_match)} pairs "
+                logger.info(f"Hierarchical retrieval: {all_pairs_count} -> {len(pairs_to_match)} pairs "
                            f"({100*len(pairs_to_match)/max(all_pairs_count,1):.1f}% reduction)")
             else:
                 # Fallback to smart matching
@@ -2057,7 +2073,7 @@ class ImageStitcher:
             matches = hierarchical_matcher.post_process_matches(matches, features_data)
             
             track_stats = hierarchical_matcher.get_track_statistics()
-            logger.info(f"Track filtering: {original_count} → {len(matches)} matches "
+            logger.info(f"Track filtering: {original_count} -> {len(matches)} matches "
                        f"({track_stats.get('n_tracks', 0)} tracks, "
                        f"avg length {track_stats.get('avg_track_length', 0):.1f})")
         
@@ -2583,7 +2599,7 @@ class ImageStitcher:
         # Log statistics
         all_pairs = n_images * (n_images - 1) // 2
         coverage = len(result) / max(all_pairs, 1) * 100
-        logger.info(f"Smart matching (unsorted): {n_images} images → {len(result)} pairs ({coverage:.1f}% of all pairs)")
+        logger.info(f"Smart matching (unsorted): {n_images} images -> {len(result)} pairs ({coverage:.1f}% of all pairs)")
         
         # Warn if we might need more matching
         if len(result) < n_images * 3:

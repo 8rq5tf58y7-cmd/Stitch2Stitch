@@ -163,11 +163,11 @@ def check_and_install_dependencies(
         if check_package_installed(import_name):
             results[pip_name] = True
             version = get_package_version(import_name)
-            logger.debug(f"  ✓ {pip_name} ({version or 'installed'})")
+            logger.debug(f"  [OK] {pip_name} ({version or 'installed'})")
         else:
             results[pip_name] = False
             missing_core.append(pip_name)
-            logger.warning(f"  ✗ {pip_name} (missing)")
+            logger.warning(f"  [MISSING] {pip_name} (missing)")
     
     # Check optional dependencies
     if install_optional:
@@ -176,11 +176,11 @@ def check_and_install_dependencies(
             if check_package_installed(import_name):
                 results[pip_name] = True
                 version = get_package_version(import_name)
-                logger.debug(f"  ✓ {pip_name} ({version or 'installed'})")
+                logger.debug(f"  [OK] {pip_name} ({version or 'installed'})")
             else:
                 results[pip_name] = False
                 missing_optional.append(pip_name)
-                logger.debug(f"  ○ {pip_name} (optional, not installed)")
+                logger.debug(f"  [-] {pip_name} (optional, not installed)")
     
     # Install missing core dependencies
     if missing_core:
@@ -284,18 +284,18 @@ def get_install_report() -> str:
     for pip_name, import_name, min_version in CORE_DEPENDENCIES:
         if check_package_installed(import_name):
             version = get_package_version(import_name)
-            lines.append(f"  ✓ {pip_name}: {version or 'installed'}")
+            lines.append(f"  [OK] {pip_name}: {version or 'installed'}")
         else:
-            lines.append(f"  ✗ {pip_name}: MISSING")
+            lines.append(f"  [MISSING] {pip_name}: MISSING")
     
     lines.append("")
     lines.append("Optional Dependencies:")
     for pip_name, import_name, min_version in OPTIONAL_DEPENDENCIES:
         if check_package_installed(import_name):
             version = get_package_version(import_name)
-            lines.append(f"  ✓ {pip_name}: {version or 'installed'}")
+            lines.append(f"  [OK] {pip_name}: {version or 'installed'}")
         else:
-            lines.append(f"  ○ {pip_name}: not installed")
+            lines.append(f"  [-] {pip_name}: not installed")
     
     # OpenCV features
     lines.append("")
@@ -305,7 +305,7 @@ def get_install_report() -> str:
         if feature == 'version':
             lines.append(f"  Version: {available}")
         else:
-            status = "✓" if available else "✗"
+            status = "[OK]" if available else "[X]"
             lines.append(f"  {status} {feature}")
     
     # GPU status
